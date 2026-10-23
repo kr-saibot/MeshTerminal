@@ -73,9 +73,15 @@ namespace Meshtastic.Client
             try
             {
                 var botByToken = new Dictionary<string, TelegramBotClient>(StringComparer.Ordinal);
-                foreach (var setting in _settings.Where(x => x.Enabled))
+                foreach (var setting in _settings.Where(x => x.Enabled && x.Protocol == _mesh.Protocol && x.ChannelIndex >= 0 && x.ChannelIndex < _mesh.ChannelSlotCount))
                 {
                     var status = new TelegramGatewayStatus { ChannelIndex = setting.ChannelIndex, Enabled = true, ChatId = setting.ChatId, State = TelegramConnectionState.Stopped };
+                    if (_mesh.IsConnected && !_mesh.Channels.Any(channel => channel.Index == setting.ChannelIndex && channel.Role != Meshtastic.Protobufs.Channel.Types.Role.Disabled))
+                    {
+                        status.LastError = "This channel is not configured on the connected device.";
+                        AddRoute(new Route { Settings = setting, Status = status });
+                        continue;
+                    }
                     if (String.IsNullOrWhiteSpace(setting.BotToken) || setting.ChatId == 0)
                     {
                         status.LastError = "Bot token and chat ID are required.";
@@ -137,15 +143,21 @@ namespace Meshtastic.Client
             foreach (var route in routes) _ = ForwardMeshtasticToTelegramAsync(route, e.Message);
         }
 
+        internal static string FormatTelegramMessage(MeshMessage message, IEnumerable<MeshNode> nodes)
+        {
+            var node = nodes.FirstOrDefault(candidate => candidate.Number == message.From);
+            var name = message.SenderName;
+            if (String.IsNullOrWhiteSpace(name) && node != null)
+                name = !String.IsNullOrWhiteSpace(node.LongName) ? node.LongName : node.ShortName;
+            var source = !String.IsNullOrWhiteSpace(name) ? name :
+                (node != null && !String.IsNullOrWhiteSpace(node.Id) ? node.Id : "!" + message.From.ToString("x8"));
+            return "[" + source + "]\n" + message.Text;
+        }
         private async Task ForwardMeshtasticToTelegramAsync(Route route, MeshMessage message)
         {
             try
             {
-                var node = _mesh.Nodes.FirstOrDefault(candidate => candidate.Number == message.From);
-                var id = node == null || String.IsNullOrWhiteSpace(node.Id) ? "!" + message.From.ToString("x8") : node.Id;
-                var name = node == null ? null : (!String.IsNullOrWhiteSpace(node.LongName) ? node.LongName : node.ShortName);
-                var source = String.IsNullOrWhiteSpace(name) ? id : name + " (" + id + ")";
-                await route.Bot.SendTextAsync(route.Settings.ChatId, "[" + source + "]\n" + message.Text).ConfigureAwait(false);
+                await route.Bot.SendTextAsync(route.Settings.ChatId, FormatTelegramMessage(message, _mesh.Nodes)).ConfigureAwait(false);
                 lock (_gate) { route.Status.ForwardedToTelegramCount++; route.Status.LastError = null; AppendServerFeedback(route.Status, "Telegram accepted sendMessage for chat " + route.Settings.ChatId + "."); RaiseStatus(route.Status); }
             }
             catch (Exception ex) { SetRouteError(route, ex); }
@@ -161,10 +173,10 @@ namespace Meshtastic.Client
                 {
                     lock (_gate) { route.Status.ReceivedFromTelegramCount++; RaiseStatus(route.Status); }
                     var user = !String.IsNullOrWhiteSpace(message.FromUsername) ? "@" + message.FromUsername : (message.FromName ?? "unknown user");
-                    var deviceId = _mesh.Device.NodeId ?? (_mesh.Device.MyNode == null ? "unknown device" : "!" + _mesh.Device.MyNode.MyNodeNum.ToString("x8"));
+                    var deviceId = String.IsNullOrWhiteSpace(_mesh.Device.NodeName) ? "mesh" : _mesh.Device.NodeName;
                     var text = "[" + user + " via " + deviceId + "] " + message.Text;
                     var packetId = await _mesh.SendTextToChannelWithIdAsync(route.Settings.ChannelIndex, text).ConfigureAwait(false);
-                    lock (_gate) { route.Status.ForwardedToMeshtasticCount++; route.Status.LastError = null; AppendServerFeedback(route.Status, "Telegram message was forwarded to Meshtastic channel " + route.Settings.ChannelIndex + "."); RaiseStatus(route.Status); }
+                    lock (_gate) { route.Status.ForwardedToMeshtasticCount++; route.Status.LastError = null; AppendServerFeedback(route.Status, "Telegram message was forwarded to " + _mesh.Protocol + " channel " + route.Settings.ChannelIndex + "."); RaiseStatus(route.Status); }
                     var forwarded = TelegramMessageForwarded;
                     if (forwarded != null) forwarded(this, new TelegramGatewayMessageForwardedEventArgs(route.Settings.ChannelIndex, packetId, text));
                 }

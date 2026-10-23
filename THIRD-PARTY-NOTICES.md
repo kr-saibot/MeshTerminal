@@ -7,6 +7,9 @@ The following components are used by the source code and/or distributed builds.
 | --- | --- | --- | --- |
 | Meshtastic Protobuf definitions | included source | GPL-3.0 | https://github.com/meshtastic/protobufs |
 | Google.Protobuf | 3.25.8 | BSD-3-Clause | https://github.com/protocolbuffers/protobuf |
+| QRCoder | 1.6.0 | MIT | https://github.com/codebude/QRCoder |
+| InTheHand.BluetoothLE | 4.0.45 | MIT | https://github.com/inthehand/32feet |
+| Tmds.DBus | 0.95.1 | MIT | https://github.com/tmds/Tmds.DBus |
 | Terminal.Gui | 1.18.1 | MIT | https://github.com/gui-cs/Terminal.Gui |
 | Microsoft.Data.Sqlite.Core | 8.0.8 | MIT | https://github.com/dotnet/efcore |
 | SQLitePCLRaw.provider.sqlite3 | 2.1.6 | Apache-2.0 | https://github.com/ericsink/SQLitePCL.raw |
@@ -14,7 +17,7 @@ The following components are used by the source code and/or distributed builds.
 
 `LICENSE` contains the complete GPLv3 text. `LICENSE-Meshtastic-Protobufs.txt`
 is retained as the original license copy that accompanied the Meshtastic
-protobuf definitions.
+protobuf definitions. `LICENSE-QRCoder.txt` contains the QRCoder MIT license.
 
 When publishing binary release archives, include this file, `LICENSE`, and the
 license/notice files supplied with any third-party binary packages included in

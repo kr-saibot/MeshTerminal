@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
@@ -18,11 +19,14 @@ namespace Meshtastic.Client
         public string LongName { get; internal set; }
         public string ShortName { get; internal set; }
         public DateTime LastReceivedUtc { get; internal set; }
+        public byte? MeshCoreContactType { get; internal set; }
         public bool IsFavorite { get; internal set; }
         public double? Latitude { get; internal set; }
         public double? Longitude { get; internal set; }
         public uint? BatteryLevel { get; internal set; }
         public uint? HopsAway { get; internal set; }
+        public int? LastRssi { get; internal set; }
+        public float? LastSnr { get; internal set; }
     }
 
     public sealed class StoredTelemetry
@@ -64,6 +68,7 @@ namespace Meshtastic.Client
 
     public sealed class StoredMeshMessage
     {
+        public string SenderName { get; internal set; }
         public Guid Id { get; internal set; }
         public DateTime OccurredUtc { get; internal set; }
         public DateTime CreatedUtc { get; internal set; }
@@ -81,12 +86,31 @@ namespace Meshtastic.Client
         public double? Latitude { get; internal set; }
         public double? Longitude { get; internal set; }
         public string RawMetadata { get; internal set; }
+        public uint? ReceivedHops { get; internal set; }
+        public int? ReceivedRssi { get; internal set; }
+        public float? ReceivedSnr { get; internal set; }
+        public bool IsMeshCoreMessage { get { return RawMetadata != null && RawMetadata.StartsWith("MeshCore;", StringComparison.Ordinal); } }
+        public uint? MeshCoreHops
+        {
+            get
+            {
+                if (ReceivedHops.HasValue) return ReceivedHops;
+                if (!IsMeshCoreMessage) return null;
+                var match = System.Text.RegularExpressions.Regex.Match(RawMetadata, @"^MeshCore; path=(\d+);");
+                byte path;
+                return match.Success && Byte.TryParse(match.Groups[1].Value, out path) ? MeshtasticClient.DecodeMeshCoreHops(path) : null;
+            }
+        }
     }
 
     /// <summary>Persists Meshtastic text messages through SQLite or any ADO.NET provider (for example SQL Server).</summary>
     public sealed class MeshtasticMessageStore : IDisposable
     {
+        public event Action<StoredMeshMessage> MessageStored;
         private readonly object _sync = new object();
+        private Dictionary<string, uint> _identityCache;
+        private readonly Dictionary<string, uint> _pendingIdentities = new Dictionary<string, uint>();
+        private uint _nextCachedIdentity;
         private readonly DbProviderFactory _factory;
         private readonly string _connectionString;
         private readonly bool _sqlite;
@@ -107,29 +131,111 @@ namespace Meshtastic.Client
             return new MeshtasticMessageStore(DbProviderFactories.GetFactory("System.Data.SqlClient"), connectionString, false);
         }
 
+        /// <summary>Persistent, collision-free local numbers for full MeshCore identities.
+        /// Use a separate MeshCore database; these numbers are never radio addresses.</summary>
+        public void EnableDeferredMeshCoreIdentities()
+        {
+            lock (_sync)
+            {
+                if (_identityCache != null) return;
+                Execute("CREATE TABLE IF NOT EXISTS MeshCoreIdentities (NodeNumber INTEGER PRIMARY KEY AUTOINCREMENT, Identity TEXT NOT NULL UNIQUE)", null);
+                var cache = new Dictionary<string, uint>(StringComparer.Ordinal);
+                uint maximum = 0;
+                using (var connection = Open())
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = "SELECT Identity,NodeNumber FROM MeshCoreIdentities";
+                    using (var reader = command.ExecuteReader())
+                        while (reader.Read()) { var number = Convert.ToUInt32(reader.GetValue(1)); cache.Add(reader.GetString(0), number); maximum = Math.Max(maximum, number); }
+                    command.CommandText = "SELECT COALESCE(MAX(seq),0) FROM sqlite_sequence WHERE name='MeshCoreIdentities'";
+                    maximum = Math.Max(maximum, Convert.ToUInt32(command.ExecuteScalar()));
+                }
+                _nextCachedIdentity = checked(maximum + 1);
+                _identityCache = cache;
+            }
+        }
+        public void FlushDeferredMeshCoreIdentities()
+        {
+            lock (_sync)
+            {
+                if (_pendingIdentities.Count == 0) return;
+                using (var connection = Open())
+                using (var transaction = connection.BeginTransaction())
+                {
+                    foreach (var pair in _pendingIdentities)
+                    using (var command = connection.CreateCommand())
+                    {
+                        command.Transaction = transaction;
+                        command.CommandText = "INSERT INTO MeshCoreIdentities (NodeNumber,Identity) VALUES (@number,@identity)";
+                        Add(command, "@number", pair.Value); Add(command, "@identity", pair.Key);
+                        command.ExecuteNonQuery();
+                    }
+                    transaction.Commit();
+                }
+                _pendingIdentities.Clear();
+            }
+        }
+        public uint GetOrCreateMeshCoreIdentity(string identity)
+        {
+            if (!_sqlite) throw new NotSupportedException("MeshCore identity storage currently requires SQLite.");
+            if (String.IsNullOrEmpty(identity)) throw new ArgumentException("An identity is required.", "identity");
+            lock (_sync)
+            {
+                if (_identityCache != null)
+                {
+                    uint cached;
+                    if (_identityCache.TryGetValue(identity, out cached)) return cached;
+                    if (_nextCachedIdentity == 0 || _nextCachedIdentity == UInt32.MaxValue) throw new InvalidOperationException("MeshCore identity registry is full.");
+                    cached = _nextCachedIdentity++;
+                    _identityCache.Add(identity, cached); _pendingIdentities.Add(identity, cached);
+                    return cached;
+                }
+                Execute("CREATE TABLE IF NOT EXISTS MeshCoreIdentities (NodeNumber INTEGER PRIMARY KEY AUTOINCREMENT, Identity TEXT NOT NULL UNIQUE)", null);
+                Execute("INSERT OR IGNORE INTO MeshCoreIdentities (Identity) VALUES (@identity)", c => Add(c, "@identity", identity));
+                using (var connection = Open())
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = "SELECT NodeNumber FROM MeshCoreIdentities WHERE Identity=@identity";
+                    Add(command, "@identity", identity);
+                    var number = Convert.ToUInt32(command.ExecuteScalar());
+                    if (number == 0 || number == UInt32.MaxValue) throw new InvalidOperationException("MeshCore identity registry is full.");
+                    return number;
+                }
+            }
+        }
+
         public void Initialize()
         {
             // WAL permits readers (the UI) and writers (incoming packets) to run concurrently.
             // It is persistent per database file and is safe to execute for existing databases.
-            if (_sqlite) Execute("PRAGMA journal_mode=WAL", null);
+            if (_sqlite) { Execute("PRAGMA journal_mode=WAL", null); Execute("CREATE TABLE IF NOT EXISTS MeshCoreIdentities (NodeNumber INTEGER PRIMARY KEY AUTOINCREMENT, Identity TEXT NOT NULL UNIQUE)", null); }
             var sql = _sqlite
                 ? "CREATE TABLE IF NOT EXISTS MeshtasticMessages (Id TEXT PRIMARY KEY, OccurredUtc TEXT NOT NULL, CreatedUtc TEXT NOT NULL, Direction TEXT NOT NULL, Kind TEXT NOT NULL, PacketId INTEGER NULL, FromNode INTEGER NULL, ToNode INTEGER NULL, ChannelIndex INTEGER NULL, ChannelName TEXT NULL, Text TEXT NULL, DeliveryStatus TEXT NULL, DeliveryError TEXT NULL, IsNew INTEGER NOT NULL DEFAULT 1, Latitude REAL NULL, Longitude REAL NULL, RawMetadata TEXT NULL)"
                 : "IF OBJECT_ID('MeshtasticMessages','U') IS NULL CREATE TABLE MeshtasticMessages (Id UNIQUEIDENTIFIER PRIMARY KEY, OccurredUtc DATETIME2 NOT NULL, CreatedUtc DATETIME2 NOT NULL, Direction NVARCHAR(16) NOT NULL, Kind NVARCHAR(16) NOT NULL, PacketId BIGINT NULL, FromNode BIGINT NULL, ToNode BIGINT NULL, ChannelIndex INT NULL, ChannelName NVARCHAR(256) NULL, Text NVARCHAR(MAX) NULL, DeliveryStatus NVARCHAR(32) NULL, DeliveryError NVARCHAR(128) NULL, IsNew BIT NOT NULL DEFAULT 1, Latitude FLOAT NULL, Longitude FLOAT NULL, RawMetadata NVARCHAR(MAX) NULL)";
             Execute(sql, null);
             // Migration for databases created by an earlier version of this class.
             Execute(_sqlite ? "ALTER TABLE MeshtasticMessages ADD COLUMN IsNew INTEGER NOT NULL DEFAULT 1" : "ALTER TABLE MeshtasticMessages ADD IsNew BIT NOT NULL DEFAULT 1", null, ignoreFailure: true);
+            Execute(_sqlite ? "ALTER TABLE MeshtasticMessages ADD COLUMN SenderName TEXT NULL" : "ALTER TABLE MeshtasticMessages ADD SenderName NVARCHAR(256) NULL", null, ignoreFailure: true);
             // Older database files received IsNew=1 as the column default. Sent messages are
             // never unread, including existing rows after the schema migration.
+            if (!_sqlite) Execute("IF COL_LENGTH('MeshtasticMessages','StorageOrder') IS NULL ALTER TABLE MeshtasticMessages ADD StorageOrder BIGINT IDENTITY(1,1) NOT NULL", null);
             Execute("UPDATE MeshtasticMessages SET IsNew=0 WHERE Direction='Outgoing'", null);
             Execute("UPDATE MeshtasticMessages SET DeliveryStatus='Sent' WHERE Direction='Outgoing' AND Kind='Channel' AND DeliveryStatus='QueuedAtDevice'", null);
             Execute("CREATE INDEX " + (_sqlite ? "IF NOT EXISTS " : "") + "IX_MeshtasticMessages_Time ON MeshtasticMessages(OccurredUtc)", null, ignoreFailure: !_sqlite);
             Execute("CREATE INDEX " + (_sqlite ? "IF NOT EXISTS " : "") + "IX_MeshtasticMessages_ChannelTime ON MeshtasticMessages(Kind,ChannelIndex,OccurredUtc)", null, ignoreFailure: !_sqlite);
             Execute("CREATE INDEX " + (_sqlite ? "IF NOT EXISTS " : "") + "IX_MeshtasticMessages_FromTime ON MeshtasticMessages(Kind,FromNode,OccurredUtc)", null, ignoreFailure: !_sqlite);
             Execute("CREATE INDEX " + (_sqlite ? "IF NOT EXISTS " : "") + "IX_MeshtasticMessages_ToTime ON MeshtasticMessages(Kind,ToNode,OccurredUtc)", null, ignoreFailure: !_sqlite);
+            Execute(_sqlite ? "ALTER TABLE MeshtasticMessages ADD COLUMN ReceivedHops INTEGER NULL" : "ALTER TABLE MeshtasticMessages ADD ReceivedHops INT NULL", null, ignoreFailure: true);
+            Execute(_sqlite ? "ALTER TABLE MeshtasticMessages ADD COLUMN ReceivedRssi INTEGER NULL" : "ALTER TABLE MeshtasticMessages ADD ReceivedRssi INT NULL", null, ignoreFailure: true);
+            Execute(_sqlite ? "ALTER TABLE MeshtasticMessages ADD COLUMN ReceivedSnr REAL NULL" : "ALTER TABLE MeshtasticMessages ADD ReceivedSnr FLOAT NULL", null, ignoreFailure: true);
             var nodeSql = _sqlite
                 ? "CREATE TABLE IF NOT EXISTS MeshtasticNodes (NodeNumber INTEGER PRIMARY KEY, NodeId TEXT NULL, LongName TEXT NULL, ShortName TEXT NULL, LastReceivedUtc TEXT NOT NULL, IsFavorite INTEGER NOT NULL DEFAULT 0, Latitude REAL NULL, Longitude REAL NULL, BatteryLevel INTEGER NULL, HopsAway INTEGER NULL)"
                 : "IF OBJECT_ID('MeshtasticNodes','U') IS NULL CREATE TABLE MeshtasticNodes (NodeNumber BIGINT PRIMARY KEY, NodeId NVARCHAR(32) NULL, LongName NVARCHAR(256) NULL, ShortName NVARCHAR(32) NULL, LastReceivedUtc DATETIME2 NOT NULL, IsFavorite BIT NOT NULL DEFAULT 0, Latitude FLOAT NULL, Longitude FLOAT NULL, BatteryLevel INT NULL, HopsAway INT NULL)";
             Execute(nodeSql, null);
+            Execute(_sqlite ? "ALTER TABLE MeshtasticNodes ADD COLUMN MeshCoreContactType INTEGER NULL" : "ALTER TABLE MeshtasticNodes ADD MeshCoreContactType INT NULL", null, ignoreFailure: true);
+            Execute(_sqlite ? "ALTER TABLE MeshtasticNodes ADD COLUMN LastRssi INTEGER NULL" : "ALTER TABLE MeshtasticNodes ADD LastRssi INT NULL", null, ignoreFailure: true);
+            Execute(_sqlite ? "ALTER TABLE MeshtasticNodes ADD COLUMN LastSnr REAL NULL" : "ALTER TABLE MeshtasticNodes ADD LastSnr FLOAT NULL", null, ignoreFailure: true);
+            if (_sqlite) Execute("ALTER TABLE MeshtasticNodes ADD COLUMN LocalReceptionVerified INTEGER NOT NULL DEFAULT 0", null, ignoreFailure: true);
             Execute(_sqlite ? "ALTER TABLE MeshtasticNodes ADD COLUMN HopsAway INTEGER NULL" : "ALTER TABLE MeshtasticNodes ADD HopsAway INT NULL", null, ignoreFailure: true);
             Execute("CREATE INDEX " + (_sqlite ? "IF NOT EXISTS " : "") + "IX_MeshtasticNodes_LastReceived ON MeshtasticNodes(LastReceivedUtc)", null, ignoreFailure: !_sqlite);
             var telemetrySql = _sqlite
@@ -148,11 +254,12 @@ namespace Meshtastic.Client
             if (message == null) throw new ArgumentNullException("message");
             return Insert(new StoredMeshMessage
             {
-                Id = Guid.NewGuid(), OccurredUtc = message.ReceivedAtUtc, CreatedUtc = DateTime.UtcNow,
+                Id = Guid.NewGuid(), OccurredUtc = message.Protocol == MeshProtocol.MeshCore && message.Packet.RxTime != 0 ? new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(message.Packet.RxTime) : message.ReceivedAtUtc, CreatedUtc = DateTime.UtcNow,
                 Direction = MessageDirection.Incoming, Kind = message.IsChannelMessage ? StoredMessageKind.Channel : StoredMessageKind.Direct,
                 PacketId = message.Packet.Id == 0 ? (uint?)null : message.Packet.Id, FromNode = message.From, ToNode = message.To,
-                ChannelIndex = message.ChannelIndex.HasValue ? (int?)message.ChannelIndex.Value : null, Text = message.Text,
-                IsNew = isNew, Latitude = latitude, Longitude = longitude, RawMetadata = message.Packet.ToString()
+                ChannelIndex = message.ChannelIndex.HasValue ? (int?)message.ChannelIndex.Value : null, Text = message.Text, SenderName = message.SenderName,
+                ReceivedHops = message.Protocol == MeshProtocol.MeshCore ? message.MeshCoreHops : null, ReceivedSnr = message.Protocol == MeshProtocol.MeshCore ? message.MeshCoreSnr : (message.Packet.RxSnr != 0 ? (float?)message.Packet.RxSnr : null), ReceivedRssi = message.Packet.RxRssi != 0 ? (int?)message.Packet.RxRssi : null,
+                IsNew = isNew, Latitude = latitude, Longitude = longitude, RawMetadata = message.Protocol == MeshProtocol.MeshCore ? "MeshCore; path=" + message.MeshCorePathLength + "; author=" + message.MeshCoreSenderPrefix + "; " + message.Packet.ToString() : message.Packet.ToString()
             });
         }
 
@@ -169,13 +276,28 @@ namespace Meshtastic.Client
 
         public void UpdateDeliveryStatus(uint packetId, MessageDeliveryState state, string error = null)
         {
-            Execute("UPDATE MeshtasticMessages SET DeliveryStatus=@status, DeliveryError=@error WHERE PacketId=@packetId", delegate(DbCommand c) { Add(c, "@status", state.ToString()); Add(c, "@error", error); Add(c, "@packetId", (long)packetId); });
+            Execute("UPDATE MeshtasticMessages SET DeliveryStatus=CASE WHEN Kind='Channel' AND @status='QueuedAtDevice' THEN 'Sent' ELSE @status END, DeliveryError=@error WHERE PacketId=@packetId AND Direction='Outgoing' AND (DeliveryStatus IS NULL OR DeliveryStatus NOT IN ('Delivered','Failed') OR @status='Delivered')", delegate(DbCommand c) { Add(c, "@status", state.ToString()); Add(c, "@error", error); Add(c, "@packetId", (long)packetId); });
         }
         public void Delete(Guid id) { Execute("DELETE FROM MeshtasticMessages WHERE Id=@id", delegate(DbCommand c) { Add(c, "@id", IdValue(id)); }); }
-        public IList<StoredMeshMessage> GetDirectMessages(uint node) { return Query("SELECT * FROM MeshtasticMessages WHERE Kind='Direct' AND (FromNode=@node OR ToNode=@node) ORDER BY OccurredUtc", delegate(DbCommand c) { Add(c, "@node", (long)node); }); }
+        // The sender timestamp is display data. Equal write times retain database insertion order.
+        private string MessageStorageOrder(bool descending = false)
+        {
+            var direction = descending ? " DESC" : "";
+            return "CreatedUtc" + direction + "," + (_sqlite ? "rowid" : "StorageOrder") + direction;
+        }
+        public IList<StoredMeshMessage> GetDirectMessages(uint node) { return Query("SELECT * FROM MeshtasticMessages WHERE Kind='Direct' AND (FromNode=@node OR ToNode=@node) ORDER BY " + MessageStorageOrder(), delegate(DbCommand c) { Add(c, "@node", (long)node); }); }
         public void DeleteDirectMessages(uint node) { Execute("DELETE FROM MeshtasticMessages WHERE Kind='Direct' AND (FromNode=@node OR ToNode=@node)", delegate(DbCommand c) { Add(c, "@node", (long)node); }); }
-        public IList<StoredMeshMessage> GetChannelMessages() { return Query("SELECT * FROM MeshtasticMessages WHERE Kind='Channel' ORDER BY OccurredUtc", null); }
-        public IList<StoredMeshMessage> GetChannelMessages(int channelIndex) { return Query("SELECT * FROM MeshtasticMessages WHERE Kind='Channel' AND ChannelIndex=@channel ORDER BY OccurredUtc", delegate(DbCommand c) { Add(c, "@channel", channelIndex); }); }
+        public IList<StoredMeshMessage> GetRecentChannelMessages(int channel, int count, bool includeOutgoing = true)
+        {
+            if (count < 0 || count > 1000) throw new ArgumentOutOfRangeException("count");
+            if (count == 0) return new List<StoredMeshMessage>();
+            var directionFilter = includeOutgoing ? "" : " AND Direction='Incoming'";
+            var sql = _sqlite ? "SELECT * FROM MeshtasticMessages WHERE Kind='Channel' AND ChannelIndex=@channel" + directionFilter + " ORDER BY " + MessageStorageOrder(true) + " LIMIT @count"
+                : "SELECT TOP (@count) * FROM MeshtasticMessages WHERE Kind='Channel' AND ChannelIndex=@channel" + directionFilter + " ORDER BY " + MessageStorageOrder(true);
+            return Query(sql, c => { Add(c, "@channel", channel); Add(c, "@count", count); }).Reverse().ToList();
+        }
+        public IList<StoredMeshMessage> GetChannelMessages() { return Query("SELECT * FROM MeshtasticMessages WHERE Kind='Channel' ORDER BY " + MessageStorageOrder(), null); }
+        public IList<StoredMeshMessage> GetChannelMessages(int channelIndex) { return Query("SELECT * FROM MeshtasticMessages WHERE Kind='Channel' AND ChannelIndex=@channel ORDER BY " + MessageStorageOrder(), delegate(DbCommand c) { Add(c, "@channel", channelIndex); }); }
         public void DeleteChannelMessages() { Execute("DELETE FROM MeshtasticMessages WHERE Kind='Channel'", null); }
         public void DeleteChannelMessages(int channelIndex) { Execute("DELETE FROM MeshtasticMessages WHERE Kind='Channel' AND ChannelIndex=@channel", delegate(DbCommand c) { Add(c, "@channel", channelIndex); }); }
         public int CountNewChannelMessages(int channelIndex) { return Count("SELECT COUNT(*) FROM MeshtasticMessages WHERE Kind='Channel' AND ChannelIndex=@channel AND IsNew=1", delegate(DbCommand c) { Add(c, "@channel", channelIndex); }); }
@@ -204,21 +326,21 @@ namespace Meshtastic.Client
         public void AddOrUpdateNode(MeshNode node)
         {
             if (node == null) throw new ArgumentNullException("node");
-            var timestamp = node.LastHeardUtc ?? DateTime.UtcNow;
+            var timestamp = node.LastHeardUtc ?? (node.MeshCoreContactType.HasValue ? DateTime.MinValue : DateTime.UtcNow);
             var hasLastHeard = node.LastHeardUtc.HasValue;
             lock (_sync)
             {
                 if (_sqlite)
                 {
-                    const string upsert = "INSERT INTO MeshtasticNodes (NodeNumber,NodeId,LongName,ShortName,LastReceivedUtc,IsFavorite,Latitude,Longitude,BatteryLevel,HopsAway) VALUES (@number,@id,@longName,@shortName,@lastReceived,0,@lat,@lon,@battery,@hops) ON CONFLICT(NodeNumber) DO UPDATE SET NodeId=excluded.NodeId,LongName=excluded.LongName,ShortName=excluded.ShortName,LastReceivedUtc=CASE WHEN @hasLastHeard=1 THEN excluded.LastReceivedUtc ELSE MeshtasticNodes.LastReceivedUtc END,Latitude=excluded.Latitude,Longitude=excluded.Longitude,BatteryLevel=excluded.BatteryLevel,HopsAway=excluded.HopsAway";
-                    Execute(upsert, delegate(DbCommand c) { AddNodeParameters(c, node, timestamp, hasLastHeard); });
+                    const string upsert = "INSERT INTO MeshtasticNodes (NodeNumber,NodeId,LongName,ShortName,LastReceivedUtc,IsFavorite,Latitude,Longitude,BatteryLevel,HopsAway,LastRssi,LastSnr,LocalReceptionVerified,MeshCoreContactType) VALUES (@number,@id,@longName,@shortName,@lastReceived,0,@lat,@lon,@battery,@hops,@rssi,@snr,@meshCore,@contactType) ON CONFLICT(NodeNumber) DO UPDATE SET NodeId=excluded.NodeId,LongName=excluded.LongName,ShortName=excluded.ShortName,LastReceivedUtc=CASE WHEN @hasLastHeard=1 THEN excluded.LastReceivedUtc WHEN @meshCore=1 AND MeshtasticNodes.LocalReceptionVerified=0 THEN @unknown ELSE MeshtasticNodes.LastReceivedUtc END,LocalReceptionVerified=CASE WHEN @meshCore=1 THEN 1 ELSE MeshtasticNodes.LocalReceptionVerified END,Latitude=excluded.Latitude,Longitude=excluded.Longitude,BatteryLevel=excluded.BatteryLevel,HopsAway=CASE WHEN @meshCore=1 THEN COALESCE(excluded.HopsAway,MeshtasticNodes.HopsAway) ELSE excluded.HopsAway END,LastRssi=COALESCE(excluded.LastRssi,MeshtasticNodes.LastRssi),LastSnr=COALESCE(excluded.LastSnr,MeshtasticNodes.LastSnr),MeshCoreContactType=COALESCE(excluded.MeshCoreContactType,MeshtasticNodes.MeshCoreContactType)";
+                    Execute(upsert, delegate(DbCommand c) { AddNodeParameters(c, node, timestamp, hasLastHeard);  Add(c, "@unknown", TimeValue(DateTime.MinValue)); });
                     return;
                 }
-                var update = "UPDATE MeshtasticNodes SET NodeId=@id, LongName=@longName, ShortName=@shortName, LastReceivedUtc=CASE WHEN @hasLastHeard=1 THEN @lastReceived ELSE LastReceivedUtc END, Latitude=@lat, Longitude=@lon, BatteryLevel=@battery, HopsAway=@hops WHERE NodeNumber=@number";
+                var update = "UPDATE MeshtasticNodes SET NodeId=@id, LongName=@longName, ShortName=@shortName, LastReceivedUtc=CASE WHEN @hasLastHeard=1 THEN @lastReceived ELSE LastReceivedUtc END, Latitude=@lat, Longitude=@lon, BatteryLevel=@battery, HopsAway=CASE WHEN @meshCore=1 THEN COALESCE(@hops,HopsAway) ELSE @hops END, LastRssi=COALESCE(@rssi,LastRssi), LastSnr=COALESCE(@snr,LastSnr), MeshCoreContactType=COALESCE(@contactType,MeshCoreContactType) WHERE NodeNumber=@number";
                 var affected = ExecuteNonQuery(update, delegate(DbCommand c) { AddNodeParameters(c, node, timestamp, hasLastHeard); });
                 if (affected == 0)
                 {
-                    const string insert = "INSERT INTO MeshtasticNodes (NodeNumber,NodeId,LongName,ShortName,LastReceivedUtc,IsFavorite,Latitude,Longitude,BatteryLevel,HopsAway) VALUES (@number,@id,@longName,@shortName,@lastReceived,@favorite,@lat,@lon,@battery,@hops)";
+                    const string insert = "INSERT INTO MeshtasticNodes (NodeNumber,NodeId,LongName,ShortName,LastReceivedUtc,IsFavorite,Latitude,Longitude,BatteryLevel,HopsAway,LastRssi,LastSnr,MeshCoreContactType) VALUES (@number,@id,@longName,@shortName,@lastReceived,@favorite,@lat,@lon,@battery,@hops,@rssi,@snr,@contactType)";
                     Execute(insert, delegate(DbCommand c) { AddNodeParameters(c, node, timestamp, hasLastHeard); Add(c, "@favorite", _sqlite ? (object)0 : false); });
                 }
             }
@@ -226,7 +348,8 @@ namespace Meshtastic.Client
         public IList<StoredMeshNode> GetNodes(StoredNodeSort sort = StoredNodeSort.Name)
         {
             var orderBy = sort == StoredNodeSort.NodeId ? "NodeId, NodeNumber" : sort == StoredNodeSort.LastReceived ? "LastReceivedUtc DESC, LongName" : "LongName, NodeId";
-            return QueryNodes("SELECT * FROM MeshtasticNodes ORDER BY " + orderBy);
+            // Channel sender names are message identities, not discovered radio nodes.
+            return QueryNodes("SELECT * FROM MeshtasticNodes WHERE NodeId IS NULL OR NodeId NOT LIKE 'channel-name:%' ORDER BY " + orderBy);
         }
         public void SetNodeFavorite(uint nodeNumber, bool isFavorite)
         {
@@ -269,13 +392,40 @@ namespace Meshtastic.Client
             {
                 Add(c, "@id", IdValue(id)); Add(c, "@node", (long)telemetry.From); Add(c, "@received", TimeValue(telemetry.ReceivedAtUtc)); Add(c, "@telemetryTime", telemetry.TelemetryTimeUtc.HasValue ? TimeValue(telemetry.TelemetryTimeUtc.Value) : null); Add(c, "@type", telemetry.Type);
                 Add(c, "@battery", device != null && device.HasBatteryLevel ? (object)(long)device.BatteryLevel : null); Add(c, "@voltage", device != null && device.HasVoltage ? (object)device.Voltage : (environment != null && environment.HasVoltage ? (object)environment.Voltage : null)); Add(c, "@channelUtilization", device != null && device.HasChannelUtilization ? (object)device.ChannelUtilization : null); Add(c, "@airUtilTx", device != null && device.HasAirUtilTx ? (object)device.AirUtilTx : null); Add(c, "@uptime", device != null && device.HasUptimeSeconds ? (object)(long)device.UptimeSeconds : null);
-                Add(c, "@temperature", environment != null && environment.HasTemperature ? (object)environment.Temperature : null); Add(c, "@humidity", environment != null && environment.HasRelativeHumidity ? (object)environment.RelativeHumidity : null); Add(c, "@pressure", environment != null && environment.HasBarometricPressure ? (object)environment.BarometricPressure : null); Add(c, "@raw", telemetry.Telemetry.ToString());
+                Add(c, "@temperature", environment != null && environment.HasTemperature ? (object)environment.Temperature : null); Add(c, "@humidity", environment != null && environment.HasRelativeHumidity ? (object)environment.RelativeHumidity : null); Add(c, "@pressure", environment != null && environment.HasBarometricPressure ? (object)environment.BarometricPressure : null); Add(c, "@raw", telemetry.MeshCoreRawTelemetry ?? telemetry.Telemetry.ToString());
             });
             return id;
+        }
+        // Channel names are not cryptographic identities. Only position history is
+        // associated with a uniquely named known contact; chat identities stay separate.
+        public uint ResolveMeshCorePositionNode(uint source)
+        {
+            if (!_sqlite) return source;
+            var pairs = MeshCorePositionAliases();
+            uint target;
+            return pairs.TryGetValue(source, out target) ? target : source;
+        }
+        private Dictionary<uint, uint> MeshCorePositionAliases()
+        {
+            var result = new Dictionary<uint, uint>();
+            if (!_sqlite) return result;
+            lock (_sync) using (var connection = Open())
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "SELECT i.NodeNumber, MIN(n.NodeNumber) FROM MeshCoreIdentities i JOIN MeshtasticNodes n ON i.Identity = 'channel-name:' || n.LongName WHERE length(n.NodeId)=64 AND n.NodeId NOT GLOB '*[^0-9a-fA-F]*' GROUP BY i.NodeNumber HAVING COUNT(*)=1";
+                using (var reader = command.ExecuteReader()) while (reader.Read()) result[Convert.ToUInt32(reader.GetValue(0))] = Convert.ToUInt32(reader.GetValue(1));
+            }
+            return result;
+        }
+        private void RepairMeshCorePositionAliases()
+        {
+            foreach (var pair in MeshCorePositionAliases())
+                if (pair.Key != pair.Value) Execute("UPDATE MeshtasticTelemetry SET NodeNumber=@target WHERE NodeNumber=@source AND Type='Position'", c => { Add(c, "@target", (long)pair.Value); Add(c, "@source", (long)pair.Key); });
         }
         public Guid AddPosition(uint nodeNumber, Meshtastic.Protobufs.Position position, DateTime receivedAtUtc)
         {
             if (position == null) throw new ArgumentNullException("position");
+            nodeNumber = ResolveMeshCorePositionNode(nodeNumber);
             var id = Guid.NewGuid();
             DateTime? positionTimeUtc = position.Timestamp != 0 ? UnixTime(position.Timestamp) : (position.Time != 0 ? UnixTime(position.Time) : (DateTime?)null);
             const string sql = "INSERT INTO MeshtasticTelemetry (Id,NodeNumber,ReceivedAtUtc,TelemetryTimeUtc,Type,Latitude,Longitude,Altitude,RawTelemetry) VALUES (@id,@node,@received,@positionTime,@type,@lat,@lon,@altitude,@raw)";
@@ -289,22 +439,26 @@ namespace Meshtastic.Client
         public IList<StoredTelemetry> GetTelemetry(uint nodeNumber, int maximumCount = 100)
         {
             if (maximumCount <= 0) throw new ArgumentOutOfRangeException("maximumCount");
+            RepairMeshCorePositionAliases();
             return QueryTelemetry("SELECT * FROM MeshtasticTelemetry WHERE NodeNumber=@node ORDER BY ReceivedAtUtc DESC", delegate(DbCommand c) { Add(c, "@node", (long)nodeNumber); }, maximumCount);
         }
         public IList<StoredTelemetry> GetTelemetry(int maximumCount = 100)
         {
             if (maximumCount <= 0) throw new ArgumentOutOfRangeException("maximumCount");
+            RepairMeshCorePositionAliases();
             return QueryTelemetry("SELECT * FROM MeshtasticTelemetry ORDER BY ReceivedAtUtc DESC", null, maximumCount);
         }
         public IList<StoredTelemetry> GetPositions(uint nodeNumber, int maximumCount = 5000)
         {
             if (maximumCount <= 0) throw new ArgumentOutOfRangeException("maximumCount");
+            RepairMeshCorePositionAliases();
             return QueryTelemetry("SELECT * FROM MeshtasticTelemetry WHERE NodeNumber=@node AND Latitude IS NOT NULL AND Longitude IS NOT NULL ORDER BY ReceivedAtUtc DESC", delegate(DbCommand c) { Add(c, "@node", (long)nodeNumber); }, maximumCount);
         }
         public IList<StoredTelemetry> GetPositions(uint nodeNumber, DateTime oldestUtc, DateTime newestUtc, int maximumCount = 5000)
         {
             if (maximumCount <= 0) throw new ArgumentOutOfRangeException("maximumCount");
             if (newestUtc < oldestUtc) throw new ArgumentException("The newest position time must not be earlier than the oldest position time.", "newestUtc");
+            RepairMeshCorePositionAliases();
             return QueryTelemetry("SELECT * FROM MeshtasticTelemetry WHERE NodeNumber=@node AND Latitude IS NOT NULL AND Longitude IS NOT NULL AND ReceivedAtUtc>=@oldest AND ReceivedAtUtc<=@newest ORDER BY ReceivedAtUtc DESC", delegate(DbCommand c) { Add(c, "@node", (long)nodeNumber); Add(c, "@oldest", TimeValue(oldestUtc)); Add(c, "@newest", TimeValue(newestUtc)); }, maximumCount);
         }        public IList<uint> GetPositionNodeNumbers()
         {
@@ -327,11 +481,12 @@ namespace Meshtastic.Client
 
         private Guid Insert(StoredMeshMessage item)
         {
-            const string sql = "INSERT INTO MeshtasticMessages (Id,OccurredUtc,CreatedUtc,Direction,Kind,PacketId,FromNode,ToNode,ChannelIndex,ChannelName,Text,DeliveryStatus,DeliveryError,IsNew,Latitude,Longitude,RawMetadata) VALUES (@id,@occurred,@created,@direction,@kind,@packetId,@from,@to,@channelIndex,@channelName,@text,@status,@error,@isNew,@lat,@lon,@raw)";
+            const string sql = "INSERT INTO MeshtasticMessages (Id,OccurredUtc,CreatedUtc,Direction,Kind,PacketId,FromNode,ToNode,ChannelIndex,ChannelName,Text,DeliveryStatus,DeliveryError,IsNew,Latitude,Longitude,RawMetadata,SenderName,ReceivedHops,ReceivedRssi,ReceivedSnr) VALUES (@id,@occurred,@created,@direction,@kind,@packetId,@from,@to,@channelIndex,@channelName,@text,@status,@error,@isNew,@lat,@lon,@raw,@sender,@messageHops,@messageRssi,@messageSnr)";
             Execute(sql, delegate(DbCommand c)
             {
-                Add(c,"@id",IdValue(item.Id)); Add(c,"@occurred",TimeValue(item.OccurredUtc)); Add(c,"@created",TimeValue(item.CreatedUtc)); Add(c,"@direction",item.Direction.ToString()); Add(c,"@kind",item.Kind.ToString()); Add(c,"@packetId",NullableNumber(item.PacketId)); Add(c,"@from",NullableNumber(item.FromNode)); Add(c,"@to",NullableNumber(item.ToNode)); Add(c,"@channelIndex",item.ChannelIndex); Add(c,"@channelName",item.ChannelName); Add(c,"@text",item.Text); Add(c,"@status",item.DeliveryStatus); Add(c,"@error",item.DeliveryError); Add(c,"@isNew",_sqlite ? (object)(item.IsNew ? 1 : 0) : item.IsNew); Add(c,"@lat",item.Latitude); Add(c,"@lon",item.Longitude); Add(c,"@raw",item.RawMetadata);
+                Add(c,"@id",IdValue(item.Id)); Add(c,"@occurred",TimeValue(item.OccurredUtc)); Add(c,"@created",TimeValue(item.CreatedUtc)); Add(c,"@direction",item.Direction.ToString()); Add(c,"@kind",item.Kind.ToString()); Add(c,"@packetId",NullableNumber(item.PacketId)); Add(c,"@from",NullableNumber(item.FromNode)); Add(c,"@to",NullableNumber(item.ToNode)); Add(c,"@channelIndex",item.ChannelIndex); Add(c,"@channelName",item.ChannelName); Add(c,"@text",item.Text); Add(c,"@status",item.DeliveryStatus); Add(c,"@error",item.DeliveryError); Add(c,"@isNew",_sqlite ? (object)(item.IsNew ? 1 : 0) : item.IsNew); Add(c,"@lat",item.Latitude); Add(c,"@lon",item.Longitude); Add(c,"@raw",item.RawMetadata); Add(c,"@sender",item.SenderName); Add(c,"@messageHops",NullableNumber(item.ReceivedHops)); Add(c,"@messageRssi",item.ReceivedRssi); Add(c,"@messageSnr",item.ReceivedSnr);
             });
+            try { MessageStored?.Invoke(item); } catch { }
             return item.Id;
         }
         private IList<StoredMeshMessage> Query(string sql, Action<DbCommand> parameters)
@@ -393,7 +548,7 @@ namespace Meshtastic.Client
                 using (var reader = command.ExecuteReader())
                 {
                     var result = new List<StoredMeshNode>();
-                    while (reader.Read()) result.Add(new StoredMeshNode { NodeNumber = Convert.ToUInt32(reader["NodeNumber"]), NodeId = Convert.ToString(reader["NodeId"]), LongName = Convert.ToString(reader["LongName"]), ShortName = Convert.ToString(reader["ShortName"]), LastReceivedUtc = ReadTime(reader["LastReceivedUtc"]), IsFavorite = Convert.ToInt32(reader["IsFavorite"]) != 0, Latitude = reader["Latitude"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Latitude"]), Longitude = reader["Longitude"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Longitude"]), BatteryLevel = reader["BatteryLevel"] == DBNull.Value ? (uint?)null : Convert.ToUInt32(reader["BatteryLevel"]), HopsAway = reader["HopsAway"] == DBNull.Value ? (uint?)null : Convert.ToUInt32(reader["HopsAway"]) });
+                    while (reader.Read()) result.Add(new StoredMeshNode { MeshCoreContactType = reader["MeshCoreContactType"] == DBNull.Value ? (byte?)null : Convert.ToByte(reader["MeshCoreContactType"]), NodeNumber = Convert.ToUInt32(reader["NodeNumber"]), NodeId = Convert.ToString(reader["NodeId"]), LongName = Convert.ToString(reader["LongName"]), ShortName = Convert.ToString(reader["ShortName"]), LastReceivedUtc = ReadTime(reader["LastReceivedUtc"]), IsFavorite = Convert.ToInt32(reader["IsFavorite"]) != 0, Latitude = reader["Latitude"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Latitude"]), Longitude = reader["Longitude"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Longitude"]), BatteryLevel = reader["BatteryLevel"] == DBNull.Value ? (uint?)null : Convert.ToUInt32(reader["BatteryLevel"]), HopsAway = reader["HopsAway"] == DBNull.Value ? (uint?)null : Convert.ToUInt32(reader["HopsAway"]), LastRssi = reader["LastRssi"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["LastRssi"]), LastSnr = reader["LastSnr"] == DBNull.Value ? (float?)null : Convert.ToSingle(reader["LastSnr"]) });
                     return result;
                 }
             }
@@ -437,13 +592,13 @@ namespace Meshtastic.Client
         private static object NullableNumber(uint? value) { return value.HasValue ? (object)(long)value.Value : DBNull.Value; }
         private void AddNodeParameters(DbCommand command, MeshNode node, DateTime timestamp, bool hasLastHeard)
         {
-            Add(command, "@number", (long)node.Number); Add(command, "@id", node.Id); Add(command, "@longName", node.LongName); Add(command, "@shortName", node.ShortName); Add(command, "@lastReceived", TimeValue(timestamp)); Add(command, "@hasLastHeard", _sqlite ? (object)(hasLastHeard ? 1 : 0) : hasLastHeard); Add(command, "@lat", node.Latitude); Add(command, "@lon", node.Longitude); Add(command, "@battery", node.BatteryLevel.HasValue ? (object)(long)node.BatteryLevel.Value : DBNull.Value); Add(command, "@hops", node.HopsAway.HasValue ? (object)(long)node.HopsAway.Value : DBNull.Value);
+            Add(command, "@contactType", node.MeshCoreContactType.HasValue ? (object)(int)node.MeshCoreContactType.Value : DBNull.Value); Add(command, "@number", (long)node.Number); Add(command, "@id", node.Id); Add(command, "@longName", node.LongName); Add(command, "@shortName", node.ShortName); Add(command, "@lastReceived", TimeValue(timestamp)); Add(command, "@hasLastHeard", _sqlite ? (object)(hasLastHeard ? 1 : 0) : hasLastHeard); Add(command, "@lat", node.Latitude); Add(command, "@lon", node.Longitude); Add(command, "@battery", node.BatteryLevel.HasValue ? (object)(long)node.BatteryLevel.Value : DBNull.Value); Add(command, "@rssi", node.LastRssi); Add(command, "@snr", node.LastSnr); Add(command, "@meshCore", node.MeshCoreContactType.HasValue ? 1 : 0); Add(command, "@hops", node.HopsAway.HasValue ? (object)(long)node.HopsAway.Value : DBNull.Value);
         }
         private static void Add(DbCommand command, string name, object value) { var p = command.CreateParameter(); p.ParameterName = name; p.Value = value ?? DBNull.Value; command.Parameters.Add(p); }
         private StoredMeshMessage Read(IDataRecord r)
         {
             Func<string, object> v = delegate(string name) { var value = r[name]; return value == DBNull.Value ? null : value; };
-            return new StoredMeshMessage { Id = Guid.Parse(Convert.ToString(v("Id"))), OccurredUtc = ReadTime(v("OccurredUtc")), CreatedUtc = ReadTime(v("CreatedUtc")), Direction = (MessageDirection)Enum.Parse(typeof(MessageDirection), Convert.ToString(v("Direction"))), Kind = (StoredMessageKind)Enum.Parse(typeof(StoredMessageKind), Convert.ToString(v("Kind"))), PacketId = ReadUInt(v("PacketId")), FromNode = ReadUInt(v("FromNode")), ToNode = ReadUInt(v("ToNode")), ChannelIndex = v("ChannelIndex") == null ? (int?)null : Convert.ToInt32(v("ChannelIndex")), ChannelName = Convert.ToString(v("ChannelName")), Text = Convert.ToString(v("Text")), DeliveryStatus = Convert.ToString(v("DeliveryStatus")), DeliveryError = Convert.ToString(v("DeliveryError")), IsNew = v("IsNew") != null && Convert.ToInt32(v("IsNew")) != 0, Latitude = v("Latitude") == null ? (double?)null : Convert.ToDouble(v("Latitude")), Longitude = v("Longitude") == null ? (double?)null : Convert.ToDouble(v("Longitude")), RawMetadata = Convert.ToString(v("RawMetadata")) };
+            return new StoredMeshMessage { Id = Guid.Parse(Convert.ToString(v("Id"))), OccurredUtc = ReadTime(v("OccurredUtc")), CreatedUtc = ReadTime(v("CreatedUtc")), Direction = (MessageDirection)Enum.Parse(typeof(MessageDirection), Convert.ToString(v("Direction"))), Kind = (StoredMessageKind)Enum.Parse(typeof(StoredMessageKind), Convert.ToString(v("Kind"))), PacketId = ReadUInt(v("PacketId")), FromNode = ReadUInt(v("FromNode")), ToNode = ReadUInt(v("ToNode")), ChannelIndex = v("ChannelIndex") == null ? (int?)null : Convert.ToInt32(v("ChannelIndex")), ChannelName = Convert.ToString(v("ChannelName")), Text = Convert.ToString(v("Text")), DeliveryStatus = Convert.ToString(v("DeliveryStatus")), DeliveryError = Convert.ToString(v("DeliveryError")), IsNew = v("IsNew") != null && Convert.ToInt32(v("IsNew")) != 0, Latitude = v("Latitude") == null ? (double?)null : Convert.ToDouble(v("Latitude")), Longitude = v("Longitude") == null ? (double?)null : Convert.ToDouble(v("Longitude")), ReceivedHops = ReadUInt(v("ReceivedHops")), ReceivedRssi = v("ReceivedRssi") == null ? (int?)null : Convert.ToInt32(v("ReceivedRssi")), ReceivedSnr = v("ReceivedSnr") == null ? (float?)null : Convert.ToSingle(v("ReceivedSnr")), SenderName = Convert.ToString(v("SenderName")), RawMetadata = Convert.ToString(v("RawMetadata")) };
         }
         private static DateTime UnixTime(uint seconds) { return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(seconds); }
         private static uint? ReadUInt(object value) { return value == null ? (uint?)null : Convert.ToUInt32(value); }

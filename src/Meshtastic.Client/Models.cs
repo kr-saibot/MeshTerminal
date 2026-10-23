@@ -25,6 +25,7 @@ namespace Meshtastic.Client
 
     public sealed class MeshNode
     {
+        public byte? MeshCoreContactType { get; internal set; }
         private int? _lastRssi;
         private float? _lastSnr;
         internal MeshNode(NodeInfo value) { Value = value; }
@@ -34,7 +35,8 @@ namespace Meshtastic.Client
         public string Id { get { return Value.User == null ? "!" + Number.ToString("x8") : Value.User.Id; } }
         public string LongName { get { return Value.User == null ? null : Value.User.LongName; } }
         public string ShortName { get { return Value.User == null ? null : Value.User.ShortName; } }
-        public DateTime? LastHeardUtc { get { return Value.LastHeard == 0 ? (DateTime?)null : UnixTime(Value.LastHeard); } }
+        internal DateTime? LocalReceivedUtc { get; set; }
+        public DateTime? LastHeardUtc { get { if (MeshCoreContactType.HasValue) return LocalReceivedUtc; return Value.LastHeard == 0 ? (DateTime?)null : UnixTime(Value.LastHeard); } }
         public double? Latitude { get { return Value.Position == null || !Value.Position.HasLatitudeI ? (double?)null : Value.Position.LatitudeI / 10000000d; } }
         public double? Longitude { get { return Value.Position == null || !Value.Position.HasLongitudeI ? (double?)null : Value.Position.LongitudeI / 10000000d; } }
         public uint? BatteryLevel { get { return Value.DeviceMetrics == null || !Value.DeviceMetrics.HasBatteryLevel ? (uint?)null : Value.DeviceMetrics.BatteryLevel; } }
@@ -60,6 +62,12 @@ namespace Meshtastic.Client
 
     public sealed class MeshMessage
     {
+        public string SenderName { get; internal set; }
+        public string MeshCoreSenderPrefix { get; internal set; }
+        public MeshProtocol Protocol { get; internal set; }
+        public float? MeshCoreSnr { get; internal set; }
+        public byte? MeshCorePathLength { get; internal set; }
+        public uint? MeshCoreHops { get { return MeshCorePathLength.HasValue ? MeshtasticClient.DecodeMeshCoreHops(MeshCorePathLength.Value) : null; } }
         internal MeshMessage(MeshPacket packet, string text)
         {
             Packet = packet; Text = text;
@@ -79,6 +87,7 @@ namespace Meshtastic.Client
 
     public sealed class MeshTelemetry
     {
+        public string MeshCoreRawTelemetry { get; internal set; }
         internal MeshTelemetry(MeshPacket packet, Telemetry telemetry)
         {
             Packet = packet; Telemetry = telemetry; ReceivedAtUtc = DateTime.UtcNow;
@@ -88,7 +97,7 @@ namespace Meshtastic.Client
         public uint From { get { return Packet.From; } }
         public DateTime ReceivedAtUtc { get; private set; }
         public DateTime? TelemetryTimeUtc { get { return Telemetry.Time == 0 ? (DateTime?)null : new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(Telemetry.Time); } }
-        public string Type { get { return Telemetry.VariantCase.ToString(); } }
+        public string Type { get { return MeshCoreRawTelemetry == null ? Telemetry.VariantCase.ToString() : "MeshCore"; } }
     }
 
     public enum MessageDeliveryState { QueuedAtDevice, Sent, Delivered, Failed }
@@ -106,10 +115,26 @@ namespace Meshtastic.Client
 
     public sealed class DeviceInfo
     {
+        public Config.Types.LoRaConfig LoRaConfig { get; internal set; }
+        public double? RadioFrequencyMHz { get; internal set; }
+        public double? RadioBandwidthKHz { get; internal set; }
+        public int? RadioTxPowerDbm { get; internal set; }
+        public int? RadioSpreadingFactor { get; internal set; }
+        public int? RadioCodingRate { get; internal set; }
+        public DateTime? DeviceClockUtc { get; internal set; }
+        public DateTime? DeviceClockReadAtUtc { get; internal set; }
+        public string DeviceClockSyncStatus { get; internal set; }
+        public int? RoutingHashLengthBytes { get; internal set; }
+        public int? NoiseFloorDbm { get; internal set; }
+        public double? MeshCoreBatteryVoltage { get; internal set; }
+        public byte? MeshCoreProtocolVersion { get; internal set; }
+        public string HardwareName { get; internal set; }
+        public string FirmwareBuildDate { get; internal set; }
         public MyNodeInfo MyNode { get; internal set; }
         public DeviceMetadata Metadata { get; internal set; }
         public MeshNode LocalNode { get; internal set; }
         public string NodeId { get { return LocalNode == null ? null : LocalNode.Id; } }
+        public string NodeName { get { return LocalNode == null ? null : (!String.IsNullOrWhiteSpace(LocalNode.LongName) ? LocalNode.LongName : LocalNode.ShortName); } }
         public uint? BatteryLevel { get { return LocalNode == null ? (uint?)null : LocalNode.BatteryLevel; } }
         public double? Latitude { get { return LocalNode == null ? (double?)null : LocalNode.Latitude; } }
         public double? Longitude { get { return LocalNode == null ? (double?)null : LocalNode.Longitude; } }

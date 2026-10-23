@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Collections.Generic;
 using System.Linq;
@@ -7,16 +7,20 @@ using System.Xml.Serialization;
 
 namespace Meshtastic.Client
 {
-    public enum MeshtasticTransportType { Serial, Tcp }
+    public enum MeshtasticTransportType { Serial, Tcp, Bluetooth }
+    public enum MeshProtocol { Meshtastic, MeshCore }
 
     /// <summary>Connection-related settings. Add further settings classes/properties to MeshtasticApplicationSettings as the application grows.</summary>
     public sealed class MeshtasticConnectionSettings
     {
+        public MeshProtocol Protocol { get; set; }
         public MeshtasticTransportType Transport { get; set; }
         public string SerialPort { get; set; }
         public int SerialBaudRate { get; set; }
         public bool SerialDtrEnable { get; set; }
         public bool SerialRtsEnable { get; set; }
+        public string BluetoothDeviceName { get; set; }
+        public string BluetoothDeviceId { get; set; }
         public string TcpHost { get; set; }
         public int TcpPort { get; set; }
         public bool AutomaticReconnect { get; set; }
@@ -29,6 +33,7 @@ namespace Meshtastic.Client
             SerialBaudRate = 115200;
             SerialDtrEnable = true;
             SerialRtsEnable = false;
+            BluetoothDeviceId = "";
             TcpHost = "192.168.1.1";
             TcpPort = 4403;
             AutomaticReconnect = true;
@@ -94,6 +99,7 @@ namespace Meshtastic.Client
     /// <summary>Defines one command-triggered local chat bot.</summary>
     public class MeshtasticChatBotSettings
     {
+        public MeshProtocol Protocol { get; set; }
         public bool Enabled { get; set; }
         public string Command { get; set; }
         public bool CaseSensitive { get; set; }
@@ -120,13 +126,15 @@ namespace Meshtastic.Client
 
         public MeshtasticChatBotSettings()
         {
-            Enabled = true; Command = ""; CaseSensitive = false; ExecutablePath = ""; MaximumReplyLength = 200; MaximumParameterCount = 10; ArgumentPrefix = ""; ArgumentSuffix = ""; ReactToDirectMessages = true; FavoritesOnly = false; ReactToChannels = Enumerable.Range(0, 8).ToList();
+            Enabled = true; Command = ""; CaseSensitive = false; ExecutablePath = ""; MaximumReplyLength = 200; MaximumParameterCount = 10; ArgumentPrefix = ""; ArgumentSuffix = ""; ReactToDirectMessages = true; FavoritesOnly = false; ReactToChannels = new List<int>();
         }
     }
 
-    /// <summary>Connects one Meshtastic channel to one Telegram chat through a bot token.</summary>
+    /// <summary>Connects one mesh channel to one Telegram chat through a bot token.</summary>
     public sealed class TelegramGatewaySettings
     {
+        public string Name { get; set; }
+        public MeshProtocol Protocol { get; set; }
         public int ChannelIndex { get; set; }
         public bool Enabled { get; set; }
         public bool ForwardMeshtasticToTelegram { get; set; }
@@ -137,6 +145,31 @@ namespace Meshtastic.Client
         public TelegramGatewaySettings() { BotToken = ""; ForwardMeshtasticToTelegram = true; ForwardTelegramToMeshtastic = true; }
     }
 
+    public enum TelnetEmojiArtSize { Small, Large }
+    public sealed class TelnetServerSettings
+    {
+        public string Name { get; set; }
+        public MeshProtocol Protocol { get; set; }
+        public bool Enabled { get; set; }
+        public int ChannelIndex { get; set; }
+        public int Port { get; set; }
+        public string BindAddress { get; set; }
+        public bool SendWelcome { get; set; }
+        public string WelcomeMessage { get; set; }
+        public int HistoryCount { get; set; }
+        public bool ShowTimestamps { get; set; }
+        public bool ShowSender { get; set; }
+        public bool ReadOnly { get; set; }
+        public bool EchoInput { get; set; }
+        public bool SendEmojiArt { get; set; }
+        public TelnetEmojiArtSize EmojiArtSize { get; set; }
+        public bool ReplaceEmojisWithNames { get; set; }
+        public bool ShowOwnMessages { get; set; }
+        public bool SendBell { get; set; }
+        public bool RequirePassword { get; set; }
+        public string PasswordHash { get; set; }
+        public TelnetServerSettings() { Name = "Telnet"; Port = 7023; BindAddress = "127.0.0.1"; SendWelcome = true; WelcomeMessage = "Welcome to {channel}"; HistoryCount = 10; ShowTimestamps = true; ShowSender = true; ShowOwnMessages = true; PasswordHash = ""; }
+    }
     public sealed class MeshtasticHttpBotParameter { public string Name { get; set; } public string Value { get; set; } public MeshtasticHttpBotParameter() { Name = ""; Value = ""; } }
     public sealed class MeshtasticHttpBotSettings : MeshtasticChatBotSettings
     {
@@ -154,6 +187,8 @@ namespace Meshtastic.Client
         public bool SuppressMapMessageAlerts { get; set; }
         public bool BlinkLogoForUnreadMessages { get; set; }
         public int RepeatBeepIntervalSeconds { get; set; }
+        public bool EnableSoundCooldown { get; set; }
+        public int SoundCooldownSeconds { get; set; }
         public bool EnableHttpGet { get; set; }
         public string HttpGetUrl { get; set; }
         public bool EnableExecutable { get; set; }
@@ -161,13 +196,14 @@ namespace Meshtastic.Client
 
         public MeshtasticAlertSettings()
         {
-            EnableWindowsBeep = true; EnableTerminalBell = true; EnableDesktopNotifications = true; BlinkLogoForUnreadMessages = false; RepeatBeepIntervalSeconds = 0; HttpGetUrl = ""; ExecutablePath = "";
+            EnableWindowsBeep = true; EnableTerminalBell = true; EnableDesktopNotifications = true; BlinkLogoForUnreadMessages = false; RepeatBeepIntervalSeconds = 0; EnableSoundCooldown = true; SoundCooldownSeconds = 5; HttpGetUrl = ""; ExecutablePath = "";
         }
     }
 
     public sealed class MeshtasticNodeListSettings
     {
         public bool FavoritesOnly { get; set; }
+        [System.Xml.Serialization.XmlIgnore]
         public string SearchText { get; set; }
         public string SortMode { get; set; }
         public bool SortAscending { get; set; }
@@ -183,6 +219,8 @@ namespace Meshtastic.Client
         public bool ShowBackgroundMap { get; set; }
         public bool HopLimitEnabled { get; set; }
         public int HopLimit { get; set; }
+        public bool NodeAgeLimitEnabled { get; set; }
+        public double NodeAgeLimitHours { get; set; } = 24;
         public string PositionMarkerColor { get; set; } = "BrightYellow";
         public string PositionMarkerSymbol { get; set; } = "+";
         public string PositionMarkerCallSign { get; set; } = "";
@@ -207,6 +245,10 @@ namespace Meshtastic.Client
     [XmlRoot("MeshtasticApplicationSettings")]
     public sealed class MeshtasticApplicationSettings
     {
+        public string[] RepeaterQuickCommands { get; set; } = new string[] { "ver", "board", "get name", "get radio", "get tx", "clock" };
+        public List<RepeaterCredential> RepeaterCredentials { get; set; } = new List<RepeaterCredential>();
+        public List<LocalChannel> LocalChannels { get; set; } = new List<LocalChannel>();
+        public List<ChannelDraft> ChannelDrafts { get; set; } = new List<ChannelDraft>();
         public MeshtasticConnectionSettings Connection { get; set; }
         public bool EnableNewMessageBeep { get; set; }
         public bool StoreTelemetryData { get; set; }
@@ -214,6 +256,8 @@ namespace Meshtastic.Client
         public bool StorePositionData { get; set; }
         public bool StorePositionFavoritesOnly { get; set; }
         public bool EnableSerialTrafficLog { get; set; }
+        public bool CommunicationLogLoRaOnly { get; set; }
+        public int CommunicationLogCapacity { get; set; } = 500;
         public MeshtasticAlertSettings Alerts { get; set; }
         public MeshtasticAppearanceSettings Appearance { get; set; }
         public MeshtasticLogoSettings Logo { get; set; }
@@ -222,11 +266,11 @@ namespace Meshtastic.Client
         public List<MeshtasticChatBotSettings> ChatBots { get; set; }
         public List<TelegramGatewaySettings> TelegramGateways { get; set; }
         public List<MeshtasticHttpBotSettings> HttpBots { get; set; }
+        public List<TelnetServerSettings> TelnetServers { get; set; }
 
         public MeshtasticApplicationSettings()
         {
-            Connection = new MeshtasticConnectionSettings(); Appearance = new MeshtasticAppearanceSettings(); Logo = new MeshtasticLogoSettings(); Map = new MeshtasticMapSettings(); Nodes = new MeshtasticNodeListSettings(); Alerts = new MeshtasticAlertSettings(); ChatBots = new List<MeshtasticChatBotSettings>(); HttpBots = new List<MeshtasticHttpBotSettings>(); TelegramGateways = new List<TelegramGatewaySettings>(); EnableNewMessageBeep = true; StoreTelemetryData = true; StorePositionData = true;
-            for (var channel = 0; channel < 8; channel++) TelegramGateways.Add(new TelegramGatewaySettings { ChannelIndex = channel });
+            Connection = new MeshtasticConnectionSettings(); Appearance = new MeshtasticAppearanceSettings(); Logo = new MeshtasticLogoSettings(); Map = new MeshtasticMapSettings(); Nodes = new MeshtasticNodeListSettings(); Alerts = new MeshtasticAlertSettings(); ChatBots = new List<MeshtasticChatBotSettings>(); HttpBots = new List<MeshtasticHttpBotSettings>(); TelnetServers = new List<TelnetServerSettings>(); TelegramGateways = new List<TelegramGatewaySettings>(); EnableNewMessageBeep = true; StoreTelemetryData = true; StorePositionData = true;
         }
     }
 
@@ -247,6 +291,7 @@ namespace Meshtastic.Client
                 if (settings.Logo == null) settings.Logo = new MeshtasticLogoSettings();
                 if (settings.Map == null) settings.Map = new MeshtasticMapSettings();
                 if (settings.Map.HopLimit < 0) settings.Map.HopLimit = 0;
+            if (Double.IsNaN(settings.Map.NodeAgeLimitHours) || Double.IsInfinity(settings.Map.NodeAgeLimitHours) || settings.Map.NodeAgeLimitHours <= 0 || settings.Map.NodeAgeLimitHours > 876000) settings.Map.NodeAgeLimitHours = 24;
                 if (String.IsNullOrWhiteSpace(settings.Map.PositionTrackColor)) settings.Map.PositionTrackColor = "BrightYellow";
                 if (String.IsNullOrWhiteSpace(settings.Map.PositionTrackSymbol)) settings.Map.PositionTrackSymbol = "O";
                 if (settings.Map.PositionTrackFromHoursAgo < 0) settings.Map.PositionTrackFromHoursAgo = 0;
@@ -254,6 +299,7 @@ namespace Meshtastic.Client
                 if (settings.Nodes == null) settings.Nodes = new MeshtasticNodeListSettings();
                 if (settings.Alerts == null) settings.Alerts = new MeshtasticAlertSettings();
                 if (settings.Alerts.RepeatBeepIntervalSeconds < 0) settings.Alerts.RepeatBeepIntervalSeconds = 0;
+            if (settings.Alerts.SoundCooldownSeconds < 1 || settings.Alerts.SoundCooldownSeconds > 86400) settings.Alerts.SoundCooldownSeconds = 5;
                 if (settings.Logo.RotationIntervalSeconds < 1) settings.Logo.RotationIntervalSeconds = 1;
                 if (settings.Logo.TallLogoFrameIntervalMilliseconds < 50) settings.Logo.TallLogoFrameIntervalMilliseconds = 250;
                 if (settings.Logo.AnimationVerticalStepLines < 1) settings.Logo.AnimationVerticalStepLines = 8;
@@ -262,7 +308,8 @@ namespace Meshtastic.Client
                 if (settings.Logo.InnerHeight < 1) settings.Logo.InnerHeight = 1;
                 if (settings.ChatBots == null) settings.ChatBots = new List<MeshtasticChatBotSettings>();
                 NormalizeChatBots(settings);
-                if (settings.HttpBots == null) settings.HttpBots = new List<MeshtasticHttpBotSettings>(); NormalizeHttpBots(settings);
+                if (settings.TelnetServers == null) settings.TelnetServers = new List<TelnetServerSettings>();
+            if (settings.HttpBots == null) settings.HttpBots = new List<MeshtasticHttpBotSettings>(); NormalizeHttpBots(settings);
                 EnsureTelegramGateways(settings);
                 Validate(settings);
                 return settings;
@@ -279,6 +326,7 @@ namespace Meshtastic.Client
             if (settings.Logo == null) settings.Logo = new MeshtasticLogoSettings();
             if (settings.Map == null) settings.Map = new MeshtasticMapSettings();
             if (settings.Map.HopLimit < 0) settings.Map.HopLimit = 0;
+            if (Double.IsNaN(settings.Map.NodeAgeLimitHours) || Double.IsInfinity(settings.Map.NodeAgeLimitHours) || settings.Map.NodeAgeLimitHours <= 0 || settings.Map.NodeAgeLimitHours > 876000) settings.Map.NodeAgeLimitHours = 24;
             if (String.IsNullOrWhiteSpace(settings.Map.PositionTrackColor)) settings.Map.PositionTrackColor = "BrightYellow";
             if (String.IsNullOrWhiteSpace(settings.Map.PositionTrackSymbol)) settings.Map.PositionTrackSymbol = "O";
             if (settings.Map.PositionTrackFromHoursAgo < 0) settings.Map.PositionTrackFromHoursAgo = 0;
@@ -286,6 +334,7 @@ namespace Meshtastic.Client
             if (settings.Nodes == null) settings.Nodes = new MeshtasticNodeListSettings();
             if (settings.Alerts == null) settings.Alerts = new MeshtasticAlertSettings();
             if (settings.Alerts.RepeatBeepIntervalSeconds < 0) settings.Alerts.RepeatBeepIntervalSeconds = 0;
+            if (settings.Alerts.SoundCooldownSeconds < 1 || settings.Alerts.SoundCooldownSeconds > 86400) settings.Alerts.SoundCooldownSeconds = 5;
             if (settings.Logo.RotationIntervalSeconds < 1) settings.Logo.RotationIntervalSeconds = 1;
             if (settings.Logo.TallLogoFrameIntervalMilliseconds < 50) settings.Logo.TallLogoFrameIntervalMilliseconds = 250;
             if (settings.Logo.AnimationVerticalStepLines < 1) settings.Logo.AnimationVerticalStepLines = 8;
@@ -294,6 +343,7 @@ namespace Meshtastic.Client
             if (settings.Logo.InnerHeight < 1) settings.Logo.InnerHeight = 1;
             if (settings.ChatBots == null) settings.ChatBots = new List<MeshtasticChatBotSettings>();
             NormalizeChatBots(settings);
+            if (settings.TelnetServers == null) settings.TelnetServers = new List<TelnetServerSettings>();
             if (settings.HttpBots == null) settings.HttpBots = new List<MeshtasticHttpBotSettings>(); NormalizeHttpBots(settings);
             EnsureTelegramGateways(settings);
             Validate(settings);
@@ -333,15 +383,12 @@ namespace Meshtastic.Client
             // Older configuration saves could contain duplicate channel entries. Keep the
             // configured/enabled entry and normalize the list to exactly one entry per channel.
             settings.TelegramGateways = settings.TelegramGateways
-                .Where(gateway => gateway != null && gateway.ChannelIndex >= 0 && gateway.ChannelIndex <= 7)
-                .GroupBy(gateway => gateway.ChannelIndex)
+                .Where(gateway => gateway != null && gateway.ChannelIndex >= 0 && ((gateway.Protocol == MeshProtocol.Meshtastic && gateway.ChannelIndex < 8) || (gateway.Protocol == MeshProtocol.MeshCore && gateway.ChannelIndex < 256)))
+                .Where(gateway => gateway.Enabled || !String.IsNullOrWhiteSpace(gateway.Name) || !String.IsNullOrWhiteSpace(gateway.BotToken) || gateway.ChatId != 0)
+                .GroupBy(gateway => new { gateway.Protocol, gateway.ChannelIndex })
                 .Select(group => group.OrderByDescending(gateway => gateway.Enabled).ThenByDescending(gateway => !String.IsNullOrWhiteSpace(gateway.BotToken)).First())
                 .OrderBy(gateway => gateway.ChannelIndex)
                 .ToList();
-            for (var channel = 0; channel < 8; channel++)
-            {
-                if (!settings.TelegramGateways.Exists(gateway => gateway != null && gateway.ChannelIndex == channel)) settings.TelegramGateways.Add(new TelegramGatewaySettings { ChannelIndex = channel });
-            }
             settings.TelegramGateways.Sort((first, second) => first.ChannelIndex.CompareTo(second.ChannelIndex));
         }
 
@@ -352,7 +399,7 @@ namespace Meshtastic.Client
                 // Files written by older versions have no channel list; retain their former
                 // behavior by enabling all channels and direct messages.
                 if (bot.ReactToChannels == null) bot.ReactToChannels = Enumerable.Range(0, 8).ToList();
-                bot.ReactToChannels = bot.ReactToChannels.Where(channel => channel >= 0 && channel < 8).Distinct().OrderBy(channel => channel).ToList();
+                bot.ReactToChannels = bot.ReactToChannels.Where(channel => channel >= 0 && channel < (bot.Protocol == MeshProtocol.MeshCore ? 256 : 8)).Distinct().OrderBy(channel => channel).ToList();
             }
         }
         private static void NormalizeHttpBots(MeshtasticApplicationSettings settings)
@@ -360,7 +407,7 @@ namespace Meshtastic.Client
             foreach (var bot in settings.HttpBots.Where(bot => bot != null))
             {
                 if (bot.ReactToChannels == null) bot.ReactToChannels = Enumerable.Range(0, 8).ToList();
-                bot.ReactToChannels = bot.ReactToChannels.Where(channel => channel >= 0 && channel < 8).Distinct().OrderBy(channel => channel).ToList();
+                bot.ReactToChannels = bot.ReactToChannels.Where(channel => channel >= 0 && channel < (bot.Protocol == MeshProtocol.MeshCore ? 256 : 8)).Distinct().OrderBy(channel => channel).ToList();
                 if (bot.QueryParameters == null) bot.QueryParameters = new List<MeshtasticHttpBotParameter>();
                 while (bot.QueryParameters.Count < 5) bot.QueryParameters.Add(new MeshtasticHttpBotParameter());
                 if (bot.QueryParameters.Count > 5) bot.QueryParameters.RemoveRange(5, bot.QueryParameters.Count - 5);

@@ -37,6 +37,7 @@ namespace ConsoleClient
         [XmlIgnore] public string SourceFile { get; set; }
         [XmlIgnore] public string OverlayName { get; set; }
         [XmlIgnore] public bool Selectable { get; set; }
+        [XmlIgnore] public bool IsPathOverlay { get; set; }
         [XmlIgnore] public bool IsTelemetryPosition { get; set; }
         [XmlIgnore] public uint TelemetryNodeNumber { get; set; }
         [XmlIgnore] public DateTime? TelemetryReceivedAtUtc { get; set; }

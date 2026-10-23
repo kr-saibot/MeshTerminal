@@ -2,11 +2,68 @@
 
 MeshtasticConsoleClient is a C# 7.3 / .NET Framework 4.7.2 client library and terminal
 application for the native Meshtastic Protobuf API. It connects by USB/serial
-or TCP, stores messages, nodes and telemetry in SQLite, and supports optional
+TCP or Bluetooth LE, stores messages, nodes and telemetry in SQLite, and supports optional
 Telegram gateways and local or HTTP chat bots.
+
+It also includes an initial MeshCore Companion protocol adapter for serial and
+TCP and Bluetooth LE connections, with contacts, configured channels, direct chat and channel
+messages. Select **MeshCore** in **Settings > Connection**, enter the serial port
+(for example `COM14`) and baud rate `115200`, save, and restart the program.
+The TCP port must match the MeshCore device's configuration; the Meshtastic
+default `4403` is not automatically changed.
+
+MeshCore chat data is stored separately in `meshcore-messages.db`. Full public
+keys are mapped to persistent local database IDs without truncating keys.
+Group messages identify their sender by a display name, so group senders are
+kept separate from authenticated contacts with the same name. The composer
+uses the MeshCore UTF-8 text limit, including the local name prefix for groups.
+Channel messages become `Sent` after local acceptance; no recipient ACK is available.
+Direct messages initially show `QueuedAtDevice` and can subsequently
+be marked `Delivered` by a radio ACK. A missing direct ACK is marked `Failed`.
+
+Room Servers appear in the direct chat list. Use **MeshCore > Room Server login**
+to enter a password and see whether the server grants read or write access.
+Passwords are not saved; log in again after reconnecting. Room posts are limited
+to 151 UTF-8 bytes. Signed room messages remain in the room conversation and
+show the author name only when its short key identifies a unique contact.
+
+Use **Telemetry > Request MeshCore telemetry** to query the local device or a
+contact. Remote devices must permit the request. Received sensor values and raw
+payloads are stored when telemetry storage is enabled.
+Repeater commands and contact import are not implemented. Telegram gateways,
+local chat bots and HTTP bots support both protocols. Positions supplied by MeshCore contacts can appear on
+the existing map. Protocol switching requires a restart to select the matching
+database. Existing Meshtastic history and settings are retained.
+
+Protocol reference: https://github.com/meshcore-dev/MeshCore/blob/main/examples/companion_radio/MyMesh.cpp
 
 Source code and releases: https://github.com/kr-saibot/MeshtasticConsoleClient
 
+## Bluetooth LE (Windows and Linux)
+
+Bluetooth uses native .NET access on Windows and BlueZ over D-Bus on Linux.
+No Python installation or helper process is required.
+
+1. Enable Bluetooth and pair the radio in the operating system's Bluetooth settings.
+2. Open **Settings > Connection**, choose the protocol and **Bluetooth LE**.
+3. Use **Select device** to choose a paired radio, then save and connect.
+   A Bluetooth address can also be entered manually.
+
+Windows requires Windows 10/11 and a BLE-capable adapter. Linux uses the existing
+Mono build and requires a running BlueZ service, the system D-Bus, a powered
+adapter and permission for the current user to use Bluetooth. The device must
+be paired on that Linux computer. Device selection lists paired devices; the
+selected protocol's GATT service is validated when connecting.
+
+MeshCore requires **Bluetooth companion firmware**; a device running serial
+companion firmware on COM14 may require different firmware before BLE works.
+Meshtastic requires Bluetooth to be enabled in its device configuration. Close
+any mobile app connected to the same radio before connecting this client.
+Automatic reconnect also applies to Bluetooth connections.
+
+Both platform builds and automated packet/disconnect/settings tests have been
+verified. Real-radio BLE operation, especially Linux adapter/permission behavior,
+still needs a hardware test.
 ## Screenshots
 
 ### Chat
@@ -226,24 +283,64 @@ Prerequisites:
 - .NET SDK with .NET Framework 4.7.2 targeting support
 - NuGet package restore access
 
-Create both Windows and Linux builds with the repository's build script:
+```powershell
+./tools/Build-All.ps1
+```
 
-~~~powershell
-.\tools\Build-All.ps1
-~~~
+The script builds both platforms, runs MeshCore protocol tests against a simulated
+Companion radio, and updates `C:\Users\Tobias\Documents\ConsoleClientBuilds\Windows`
+and `C:\Users\Tobias\Documents\ConsoleClientBuilds\Linux`. Existing runtime data
+is preserved. The Windows host and its dependencies are in `Windows\Host`.
+The `Windows\MeshtasticConsoleHost.lnk` shortcut starts the native terminal.
+Temporary build and test files are isolated in `.build-staging`.
+The Windows host project is located in `src/ConsoleHost/` and targets x64.
+Release builds do not include `.pdb` debug-symbol files. These symbols are not
+needed at runtime; use a Debug build when source-level crash diagnostics are
+required.
+On Linux it is intended to run with Mono and uses the distribution-provided
+`libsqlite3.so` library.
 
-Canonical output directories:
+After building, an optional read-only hardware probe can be run with
+`.\.build-staging\Tests\MeshCore.Tests.exe --port COM14`. It reads device
+information, contacts and channels, without transmitting radio messages or
+consuming queued messages. Add `--telemetry` to also read local sensor values.
+Close other applications using that serial port first.
 
-- Windows: C:\Users\Tobias\Documents\ConsoleClientBuilds\Windows
-- Linux: C:\Users\Tobias\Documents\ConsoleClientBuilds\Linux
+## Editing device channels
 
-The script uses .build-staging temporarily and overwrites program files while
-preserving existing runtime data, including meshtastic-settings.xml,
-meshtastic-messages.db and Host/settings.ini. The Windows host and its dependencies
-are packaged in Windows/Host separately from the client.
+Use **Settings > Edit channels** after connecting and synchronizing the device.
+The editor reads every slot, including free ones. Select a slot to edit its name,
+key and enabled state, then choose **Save to device**. Keys are hidden until
+**Show key** is selected. **New random key** generates a private channel key.
+Other participants need the same name and key to communicate.
 
-Release builds omit debug symbols. The Windows host targets x64.
-On Linux, run the client with Mono and the distribution's libsqlite3.so.
+Meshtastic supports names up to 11 UTF-8 bytes and keys of 0, 1, 16 or 32 bytes.
+Enter keys as hex or with a `base64:` prefix. An empty key disables encryption;
+`01` (also available through **Default key**) selects the public default key.
+The editor also supports MQTT uplink/downlink, mute and position precision.
+The existing primary channel stays primary; other slots can be enabled as
+secondary channels or disabled. Settings not exposed by the editor are retained.
+
+MeshCore supports names up to 31 UTF-8 bytes and 16-byte keys (32 hex characters).
+Disabling a slot clears its name and key. Existing slot numbers are preserved.
+Saving waits for the device reply and reads the slot back before reporting
+success. If a write cannot be confirmed, close and reopen the editor to reload
+its current state. Only the locally connected device is edited.
+
+**Show QR code** shares the current editor values, including the key, without
+saving them to the device. Scan it in the matching mobile app. Meshtastic uses
+an add-only single-channel URL without LoRa configuration; MeshCore uses its
+channel-import URI. **Save PNG** exports a scannable image. If the terminal is
+too small to show the whole QR, enlarge it or use the exported PNG.
+
+Use **MeshCore > Send advert** to announce a MeshCore device. It supports
+zero-hop adverts (directly reachable devices) and flood adverts (forwarded
+through the mesh). **Include the device position** controls whether this advert
+contains the position currently stored on the device. The original advert
+position policy is restored afterwards, including after a rejected send.
+Meshtastic uses **Nodes > Broadcast node information** to send local NodeInfo on its
+primary channel. A successful submission does not confirm reception elsewhere.
+The status line shows the local long name, with the short name as a fallback.
 
 ## Running
 

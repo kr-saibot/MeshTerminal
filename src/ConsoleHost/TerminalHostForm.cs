@@ -20,6 +20,7 @@ namespace Meshtastic.ConsoleHost
         private readonly ElementHost _terminalHost;
         private readonly System.Windows.Media.MediaPlayer _bellPlayer = new System.Windows.Media.MediaPlayer();
         private NotifyIcon _trayIcon;
+        private Icon _programIcon;
         private Timer _processExitTimer;
         private Timer _startupTrayTimer;
         private Timer _screenshotTimer;
@@ -30,13 +31,12 @@ namespace Meshtastic.ConsoleHost
 
         public TerminalHostForm(string[] args)
         {
-            Text = "Meshtastic Console Client";
+            Text = TaskbarIdentity.DisplayName;
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(800, 500);
             ClientSize = new Size(AppSettings.WindowWidth, AppSettings.WindowHeight);
             BackColor = Color.Black;
-            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
-            catch { }
+            ApplyProgramIcon();
             InitializeTrayIcon();
             if (AppSettings.StartMinimized && !AppSettings.MinimizeToTray)
                 WindowState = FormWindowState.Minimized;
@@ -71,6 +71,7 @@ namespace Meshtastic.ConsoleHost
 
             Shown += delegate
             {
+                TaskbarIdentity.Apply(Handle, _programIcon, AppSettings.ProgramIconId);
                 TerminalPresentation.SetFontSize(_terminal, AppSettings.FontSize);
                 if (AppSettings.StartMinimized && AppSettings.MinimizeToTray)
                 {
@@ -99,10 +100,13 @@ namespace Meshtastic.ConsoleHost
             base.OnHandleCreated(e);
             TerminalSystemMenu.Install(Handle);
             WindowAppearance.SetDarkTitleBar(Handle, AppSettings.DarkMode);
+            if (_programIcon != null) TaskbarIdentity.Apply(Handle, _programIcon, AppSettings.ProgramIconId);
         }
 
         protected override void WndProc(ref Message message)
         {
+            if ((uint)message.Msg == TaskbarIdentity.TaskbarCreated && _programIcon != null)
+                TaskbarIdentity.Apply(Handle, _programIcon, AppSettings.ProgramIconId);
             if (message.Msg == WmNcButtonDown && message.WParam.ToInt32() == HtClose)
             {
                 WindowState = FormWindowState.Minimized;
@@ -121,6 +125,20 @@ namespace Meshtastic.ConsoleHost
                 if (TerminalSystemMenu.IsSelectClientCommand(message.WParam))
                 {
                     SelectAndRestartConsoleClient();
+                    return;
+                }
+
+                if (TerminalSystemMenu.IsSelectProgramIconCommand(message.WParam))
+                {
+                    using (var dialog = new IconSelectionDialog(AppSettings.ProgramIconId))
+                    {
+                        if (dialog.ShowDialog(this) == DialogResult.OK)
+                        {
+                            AppSettings.ProgramIconId = dialog.SelectedIconId;
+                            ApplyProgramIcon();
+                            AppSettings.Save();
+                        }
+                    }
                     return;
                 }
 
@@ -174,6 +192,7 @@ namespace Meshtastic.ConsoleHost
                     AppSettings.DarkMode = !AppSettings.DarkMode;
                     AppSettings.Save();
                     WindowAppearance.SetDarkTitleBar(Handle, AppSettings.DarkMode);
+            if (_programIcon != null) TaskbarIdentity.Apply(Handle, _programIcon, AppSettings.ProgramIconId);
                     TerminalSystemMenu.Refresh(Handle);
                     return;
                 }
@@ -277,6 +296,17 @@ namespace Meshtastic.ConsoleHost
             _startupTrayTimer = null;
         }
 
+        private void ApplyProgramIcon()
+        {
+            var previous = _programIcon;
+            _programIcon = ProgramIcons.Load(AppSettings.ProgramIconId);
+            Icon = _programIcon;
+            if (_trayIcon != null) _trayIcon.Icon = _programIcon;
+            if (IsHandleCreated && Visible && ShowInTaskbar && !_hiddenToTray)
+                { TaskbarIdentity.Apply(Handle, _programIcon, AppSettings.ProgramIconId); TaskbarIconRefresh.Refresh(Handle, ContainsFocus); }
+            if (previous != null) previous.Dispose();
+        }
+
         private void InitializeTrayIcon()
         {
 
@@ -349,7 +379,7 @@ namespace Meshtastic.ConsoleHost
 
         private void ShowTemporaryTitleMessage(string message)
         {
-            const string originalTitle = "Meshtastic Console Client";
+            const string originalTitle = TaskbarIdentity.DisplayName;
             Text = message;
             var timer = new Timer { Interval = 1800 };
             timer.Tick += delegate
@@ -533,7 +563,7 @@ namespace Meshtastic.ConsoleHost
             e.Cancel = true;
             var answer = MessageBox.Show(
                 this,
-                "Der Meshtastic Console Client läuft möglicherweise noch. Wirklich beenden?",
+                "Der Meshtastic / Meshcore Console Client läuft möglicherweise noch. Wirklich beenden?",
                 "Programm beenden",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question,
@@ -586,6 +616,7 @@ namespace Meshtastic.ConsoleHost
                 }
             }
             base.Dispose(disposing);
+            if (disposing && _programIcon != null) { _programIcon.Dispose(); _programIcon = null; }
         }
 
         private static string ResolveConsoleClient(string[] args)

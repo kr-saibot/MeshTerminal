@@ -44,3 +44,7 @@ bin\Debug\net472\MeshtasticConsoleHost.exe `
 ConPTY requires Windows 10 version 1809 or newer. The host targets x64 because
 the embedded Windows Terminal renderer contains native x64 components. ConPTY
 is part of Windows and does not add a separate redistributable license.
+
+## Programm-Icons
+
+Alt+Leertaste > Programm-Icon auswählen: MC und MT in sechs Farben, jeweils gefüllt oder als transparenter Rahmen. Eigene .ico-Dateien in Host/assets/icons werden beim Öffnen der Auswahl eingelesen. Die Auswahl wird gespeichert; Fenster, Infobereich und Taskleiste werden aktualisiert. Die Screenshot-Funktion bleibt verfügbar.

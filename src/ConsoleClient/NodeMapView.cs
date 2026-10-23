@@ -67,19 +67,22 @@ namespace ConsoleClient
         public Color ClusterColor { get; set; } = Color.BrightMagenta;
         public Color GridColor { get; set; } = Color.DarkGray;
         public bool ShowKnownNodes { get; set; } = true;
+        public bool ShowPositionMarkers { get; set; } = true;
         public bool HopLimitEnabled { get; set; }
         public int HopLimit { get; set; }
+        public bool NodeAgeLimitEnabled { get; set; }
+        public double NodeAgeLimitHours { get; set; } = 24;
         public bool ShowBackgroundMap { get; set; } = true;
         public bool HasBackgroundMap { get { return _offlineMap != null; } }
         public NodeMapView() { CanFocus = true; }
 
-        public void SetData(IEnumerable<StoredMeshNode> source, double? latitude, double? longitude)
+        public void SetData(IEnumerable<StoredMeshNode> source, double? latitude, double? longitude, bool preserveView = false)
         {
             _nodes.Clear();
             _nodes.AddRange(source.Where(HasPosition).Where(node => !HopLimitEnabled || (node.HopsAway.HasValue && node.HopsAway.Value <= HopLimit)));
             _ownLatitude = ValidLatitude(latitude) ? latitude : null;
             _ownLongitude = ValidLongitude(longitude) ? longitude : null;
-            Center(false);
+            if (preserveView) SetNeedsDisplay(); else Center(false);
         }
 
         public void SetOverlayPoints(IEnumerable<MapOverlayPoint> points)
@@ -222,6 +225,19 @@ namespace ConsoleClient
             Draw(coordinatesLeft + coordinates.Length / 2, height - 1, coordinates, Color.Gray, Color.Black, Math.Max(0, scaleLeft - 1));
             Draw(scaleLeft + scaleText.Length / 2, height - 1, scaleText, Color.Gray, Color.Black, width);
             DrawPositionMarkers(width, height);
+            // Path lines are drawn after every ordinary layer and its labels.
+            DrawOverlayShapes(width, height, true);
+            foreach (var group in _overlayPoints.Where(item => item.IsPathOverlay && item.Shape == "Point").GroupBy(item => Tuple.Create(item.Latitude, item.Longitude)))
+            {
+                var overlap = group.Select(item => item.Color).Distinct().Count() > 1;
+                foreach (var point in group)
+                {
+                    int px, py; Project(point.Latitude, point.Longitude, width, height, out px, out py);
+                    Color color; if (!Enum.TryParse(point.Color, out color)) color = Color.White;
+                    if (overlap) { if (px >= 0 && px < width && py > 0 && py < height - 1) Draw(px, py, "\u2022", color, Color.Black, width); py += color == Color.White ? -1 : 1; }
+                    if (px >= 0 && px < width && py > 0 && py < height - 1) Draw(px, py, SafeLabel(point.ShortName), color, Color.Black, width);
+                }
+            }
         }
 
 
@@ -264,6 +280,7 @@ namespace ConsoleClient
         }
         private void AddPositionMarkers(int width, int height)
         {
+            if (!ShowPositionMarkers) return;
             foreach (var position in _positionMarkers.Values)
             {
                 int x, y; Project(position.Latitude, position.Longitude, width, height, out x, out y);
@@ -274,6 +291,7 @@ namespace ConsoleClient
         }
         private void DrawPositionMarkers(int width, int height)
         {
+            if (!ShowPositionMarkers) return;
             foreach (var position in _positionMarkers.Values.OrderBy(item => "p:" + item.NodeNumber == _selectedKey ? 1 : 0))
             {
                 int x, y; Project(position.Latitude, position.Longitude, width, height, out x, out y);
@@ -362,10 +380,11 @@ namespace ConsoleClient
             _backgroundLatitude = _centerLatitude; _backgroundLongitude = _centerLongitude; _backgroundMetersPerRow = _metersPerRow;
         }
 
-        private void DrawOverlayShapes(int width, int height)
+        private void DrawOverlayShapes(int width, int height, bool pathOnly = false)
         {
-            _shapeHitCells.Clear();
-            foreach (var point in _overlayPoints.Where(item => item.ReferenceLatitude.HasValue && item.ReferenceLongitude.HasValue && !String.Equals(item.Shape, "Point", StringComparison.OrdinalIgnoreCase)))
+            if (!pathOnly) _shapeHitCells.Clear();
+            var pathColors = new Dictionary<string, Color>();
+            foreach (var point in _overlayPoints.Where(item => item.IsPathOverlay == pathOnly && item.ReferenceLatitude.HasValue && item.ReferenceLongitude.HasValue && !String.Equals(item.Shape, "Point", StringComparison.OrdinalIgnoreCase)))
             {
                 int x1, y1, x2, y2;
                 Project(point.Latitude, point.Longitude, width, height, out x1, out y1);
@@ -401,9 +420,19 @@ namespace ConsoleClient
                     if (fillDensity > 1 && Math.Abs((fillX - x1) + (fillY - y1) * 131) % fillDensity != 0) continue;
                     Draw(fillX, fillY, fillSymbol, color, Color.Black, width);
                 }
-                foreach (var cell in outlineCells) { var parts = cell.Split(':'); Draw(Int32.Parse(parts[0], CultureInfo.InvariantCulture), Int32.Parse(parts[1], CultureInfo.InvariantCulture), outlineSymbol, color, Color.Black, width); }
-                foreach (var cell in fillCells) _shapeHitCells[cell] = point;
-                foreach (var cell in outlineCells) _shapeHitCells[cell] = point;
+                foreach (var cell in outlineCells)
+                {
+                    var parts = cell.Split(':'); var x = Int32.Parse(parts[0], CultureInfo.InvariantCulture); var y = Int32.Parse(parts[1], CultureInfo.InvariantCulture); var drawColor = color;
+                    if (point.IsPathOverlay)
+                    {
+                        Color previous;
+                        if (pathColors.TryGetValue(cell, out previous) && previous != color) drawColor = ((x + y) & 1) == 0 ? Color.White : Color.BrightYellow;
+                        else pathColors[cell] = color;
+                    }
+                    Draw(x, y, outlineSymbol, drawColor, Color.Black, width);
+                }
+                if (!point.IsPathOverlay) foreach (var cell in fillCells) _shapeHitCells[cell] = point;
+                if (!point.IsPathOverlay) foreach (var cell in outlineCells) _shapeHitCells[cell] = point;
             }
         }
 
@@ -436,7 +465,7 @@ namespace ConsoleClient
             foreach (var marker in _markers)
                 for (var column = marker.X - marker.Label.Length / 2 - 1; column <= marker.X + marker.Label.Length / 2 + 1; column++) occupied.Add(marker.Y + ":" + column);
             var index = 0;
-            foreach (var point in _overlayPoints.OrderBy(item => String.Equals(item.Shape, "Point", StringComparison.OrdinalIgnoreCase) ? 0 : 1))
+            foreach (var point in _overlayPoints.Where(point => !point.IsPathOverlay).OrderBy(item => String.Equals(item.Shape, "Point", StringComparison.OrdinalIgnoreCase) ? 0 : 1))
             {
                 int x, y;
                 Project(point.Latitude, point.Longitude, width, height, out x, out y);
@@ -470,7 +499,7 @@ namespace ConsoleClient
             _markers.Clear();
             if (!ShowKnownNodes) return;
             var points = new List<Marker>();
-            foreach (var node in _nodes)
+            foreach (var node in _nodes.Where(item => MapNodeVisibility.IsRecentlyHeard(item, NodeAgeLimitEnabled, NodeAgeLimitHours, DateTime.UtcNow)))
             {
                 int x, y;
                 Project(node.Latitude.Value, node.Longitude.Value, width, height, out x, out y);
@@ -732,7 +761,20 @@ namespace ConsoleClient
             for (var index = 0; index < coordinates.Length && coordinatesLeft + index < Math.Max(0, scaleLeft - 1); index++) rows[height - 1][coordinatesLeft + index] = coordinates[index];
             for (var index = 0; index < scaleText.Length && scaleLeft + index < width; index++) rows[height - 1][scaleLeft + index] = scaleText[index];
             _mapTextRows = rows;
-            try { DrawPositionMarkers(width, height); }
+            try { DrawPositionMarkers(width, height);
+            // Path lines are drawn after every ordinary layer and its labels.
+            DrawOverlayShapes(width, height, true);
+            foreach (var group in _overlayPoints.Where(item => item.IsPathOverlay && item.Shape == "Point").GroupBy(item => Tuple.Create(item.Latitude, item.Longitude)))
+            {
+                var overlap = group.Select(item => item.Color).Distinct().Count() > 1;
+                foreach (var point in group)
+                {
+                    int px, py; Project(point.Latitude, point.Longitude, width, height, out px, out py);
+                    Color color; if (!Enum.TryParse(point.Color, out color)) color = Color.White;
+                    if (overlap) { if (px >= 0 && px < width && py > 0 && py < height - 1) Draw(px, py, "\u2022", color, Color.Black, width); py += color == Color.White ? -1 : 1; }
+                    if (px >= 0 && px < width && py > 0 && py < height - 1) Draw(px, py, SafeLabel(point.ShortName), color, Color.Black, width);
+                }
+            } }
             finally { _mapTextRows = null; }
             return String.Join(Environment.NewLine, rows.Select(row => new string(row).TrimEnd()));
         }

@@ -28,7 +28,7 @@ namespace Meshtastic.ConsoleHost
                 catch { }
 
                 MessageBox.Show(
-                    "Der Meshtastic Console Host konnte nicht gestartet werden.\r\n\r\n" + exception.Message,
+                    "Der Meshtastic / Meshcore Console Client konnte nicht gestartet werden.\r\n\r\n" + exception.Message,
                     "Startfehler", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }

@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Xml.Linq" />
+    <None Include="../../src/ConsoleClient/emoji-blocks-full.xml" Link="emoji-blocks-full.xml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../src/ConsoleClient/emoji-blocks-12line-full.xml" Link="emoji-blocks-12line-full.xml" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="../../src/ConsoleClient/DialogDefaultPolicy.cs" Link="DialogDefaultPolicy.cs" />
+    <Compile Include="../../src/ConsoleClient/CommunicationLogBuffer.cs" Link="CommunicationLogBuffer.cs" />
+    <Compile Include="../../src/ConsoleClient/ChannelChatCatalog.cs" Link="ChannelChatCatalog.cs" />
+    <Compile Include="../../src/ConsoleClient/MessageContentParser.cs" Link="MessageContentParser.cs" />
+    <Compile Include="../../src/ConsoleClient/DatabaseWriteQueue.cs" Link="DatabaseWriteQueue.cs" />
+    <Compile Include="../../src/ConsoleClient/MapOverlay.cs" Link="MapOverlay.cs" />
+    <Compile Include="../../src/ConsoleClient/MeshCorePathMap.cs" Link="MeshCorePathMap.cs" />
+    <Reference Include="System.Web" />
+    <Compile Include="../../src/Meshtastic.Client/LinuxBleConnection.cs" Link="LinuxBleConnection.cs" />
+    <PackageReference Include="Tmds.DBus" Version="0.95.1" /><PackageReference Include="Tmds.DBus.Protocol" Version="0.95.1" />
+    <Compile Include="../../src/Meshtastic.Client/BlueZDbus.cs" Link="BlueZDbus.cs" />
+    <Compile Include="../../src/ConsoleClient/ChannelQrCode.cs" Link="ChannelQrCode.cs" />
+    <Compile Include="../../src/ConsoleClient/MapPositionMarker.cs" Link="MapPositionMarker.cs" />
+    <PackageReference Include="QRCoder" Version="1.6.0" />
+    <PackageReference Include="ZXing.Net" Version="0.16.11" />
+    <ProjectReference Include="../../src/Meshtastic.Client/Meshtastic.Client.csproj" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
+  </ItemGroup>
+</Project>

@@ -9,14 +9,16 @@ namespace Meshtastic.ConsoleHost
     internal static class AppSettings
     {
         private const string RunValueName = "MeshtasticConsoleHost";
-        private static readonly string FileName = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.ini");
-        private static readonly string LegacyFolder = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MeshtasticConsoleHost");
-        private static readonly string LegacyFileName = Path.Combine(LegacyFolder, "settings.ini");
-        private static readonly string DefaultBellSoundPath = Path.Combine(
+        internal static string GetSettingsFileName(string executable)
+        {
+            var name = Path.GetFileNameWithoutExtension(executable);
+            return Path.Combine(Path.GetDirectoryName(executable), String.Equals(name, "MeshtasticConsoleHost", StringComparison.OrdinalIgnoreCase) ? "settings.ini" : name + ".settings.ini");
+        }
+        private static readonly string FileName = GetSettingsFileName(Application.ExecutablePath);        private static readonly string DefaultBellSoundPath = Path.Combine(
             AppDomain.CurrentDomain.BaseDirectory, "assets", "meshtastic-alert.wav");
 
         public static string ClientPath { get; set; }
+        public static string ProgramIconId { get; set; } = "default";
         public static string BellSoundPath { get; set; } = DefaultBellSoundPath;
         public static int FontSize { get; set; } = 12;
         public static bool StartMinimized { get; set; }
@@ -32,7 +34,7 @@ namespace Meshtastic.ConsoleHost
             {
                 var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 LoadedFromProgramFolder = File.Exists(FileName);
-                var source = File.Exists(FileName) ? FileName : LegacyFileName;
+                var source = FileName;
                 if (File.Exists(source))
                 {
                     foreach (var line in File.ReadAllLines(source))
@@ -44,6 +46,7 @@ namespace Meshtastic.ConsoleHost
                 }
 
                 string value;
+                if (values.TryGetValue("ProgramIcon", out value) && ProgramIcons.IsValid(value)) ProgramIconId = value;
                 // Never migrate an executable path from the old per-user settings.
                 // Packaged builds must prefer the ConsoleClient beside the host.
                 if (LoadedFromProgramFolder && values.TryGetValue("ClientPath", out value)) ClientPath = value;
@@ -72,7 +75,6 @@ namespace Meshtastic.ConsoleHost
                     bool parsed;
                     if (Boolean.TryParse(value, out parsed)) DarkMode = parsed;
                 }
-
                 if (values.TryGetValue("WindowWidth", out value))
                 {
                     int parsed;
@@ -95,6 +97,7 @@ namespace Meshtastic.ConsoleHost
                 File.WriteAllLines(FileName, new[]
                 {
                     "ClientPath=" + (ClientPath ?? String.Empty),
+                    "ProgramIcon=" + ProgramIconId,
                     "BellSoundPath=" + (BellSoundPath ?? "<none>"),
                     "FontSize=" + FontSize,
                     "StartMinimized=" + StartMinimized,

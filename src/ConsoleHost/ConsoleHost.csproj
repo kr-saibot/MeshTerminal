@@ -6,15 +6,20 @@
     <UseWindowsForms>true</UseWindowsForms>
     <UseWPF>true</UseWPF>
     <AssemblyName>MeshtasticConsoleHost</AssemblyName>
+    <Product>Meshtastic / Meshcore Console Client</Product>
+    <Title>Meshtastic / Meshcore Console Client</Title>
     <RootNamespace>Meshtastic.ConsoleHost</RootNamespace>
-    <Version>1.4.0</Version>
-    <AssemblyVersion>1.4.0.0</AssemblyVersion>
-    <FileVersion>1.4.0.0</FileVersion>
+    <Version>1.4.3</Version>
+    <AssemblyVersion>1.4.3.0</AssemblyVersion>
+    <FileVersion>1.4.3.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Remove="tools\GenerateDefaultAlertSound.cs" />
     <None Update="assets\meshtastic-alert.wav" CopyToOutputDirectory="PreserveNewest" />
+    <EmbeddedResource Include="assets\meshtastic-chirp.ico" />
+    <EmbeddedResource Include="assets\icons\*.ico" />
+    <None Update="assets\icons\*.ico" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

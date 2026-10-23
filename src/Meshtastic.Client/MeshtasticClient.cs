@@ -32,7 +32,7 @@ namespace Meshtastic.Client
     }
 
     /// <summary>Thread-safe native Meshtastic Protobuf client for Serial and TCP transports.</summary>
-    public sealed class MeshtasticClient : IDisposable
+    public sealed partial class MeshtasticClient : IDisposable
     {
         public const int MaximumTextPayloadBytes = 233;
         private const uint BroadcastNode = UInt32.MaxValue;
@@ -50,6 +50,9 @@ namespace Meshtastic.Client
         private int _connectionGeneration;
         private Exception _lastConnectionError;
         private TaskCompletionSource<bool> _configComplete;
+        private readonly SemaphoreSlim _configurationRequests = new SemaphoreSlim(1, 1);
+        private readonly object _configurationGate = new object();
+        private CancellationTokenSource _configurationInactivity;
         private uint _expectedConfigId;
         private bool _manualDisconnect;
         private ConnectionState _state = ConnectionState.Disconnected;
@@ -71,7 +74,7 @@ namespace Meshtastic.Client
             HeartbeatInterval = TimeSpan.FromSeconds(15);
             TransportOperationTimeout = TimeSpan.FromSeconds(10);
             DisconnectTimeout = TimeSpan.FromSeconds(3);
-            ConfigurationTimeout = TimeSpan.FromSeconds(20);
+            ConfigurationTimeout = TimeSpan.FromSeconds(10);
             ReceiveDebugInterval = TimeSpan.FromSeconds(30);
             MaximumMessageHistory = 200;
         }
@@ -101,7 +104,7 @@ namespace Meshtastic.Client
         public TimeSpan TransportOperationTimeout { get; set; }
         /// <summary>Maximum time to wait for a native transport to close.</summary>
         public TimeSpan DisconnectTimeout { get; set; }
-        /// <summary>Maximum time to wait for ConfigComplete after RequestFullStateAsync.</summary>
+        /// <summary>Maximum inactivity during configuration transfer; valid configuration frames renew this interval. There is no fixed total duration limit.</summary>
         public TimeSpan ConfigurationTimeout { get; set; }
         /// <summary>Maximum consecutive connection attempts before stopping. Set to 0 for unlimited retries.</summary>
         public int MaximumConnectionAttempts { get; set; }
@@ -181,7 +184,7 @@ namespace Meshtastic.Client
             portName = portName.Trim();
             if (!System.IO.Ports.SerialPort.GetPortNames().Any(p => String.Equals(p, portName, StringComparison.OrdinalIgnoreCase)))
                 throw new IOException("Serial port " + portName + " is not available. Check the connection settings and whether the device is connected.");
-            return StartAsync(delegate { return new SerialTransport(portName, baudRate, dtrEnable, rtsEnable); }, cancellationToken);
+            return StartAsync(delegate { return new SerialTransport(portName, baudRate, dtrEnable, rtsEnable, Protocol == MeshProtocol.Meshtastic); }, cancellationToken);
         }
 
         public Task ConnectTcpAsync(string host, int port = 4403, CancellationToken cancellationToken = default(CancellationToken))
@@ -190,6 +193,16 @@ namespace Meshtastic.Client
             return StartAsync(delegate { return new TcpTransport(host, port); }, cancellationToken);
         }
 
+        public Task ConnectBluetoothAsync(string deviceId, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            if (String.IsNullOrWhiteSpace(deviceId)) throw new ArgumentException("Select a paired Bluetooth device in the connection settings.", "deviceId");
+            return StartAsync(() => new BluetoothTransport(deviceId.Trim(), Protocol), cancellationToken);
+        }
+
+        public static Task<IList<BluetoothDeviceInfo>> GetBluetoothDevicesAsync(MeshProtocol protocol, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return BlePlatform.ScanAsync(protocol, cancellationToken);
+        }
         private Task StartAsync(Func<ITransport> transportFactory, CancellationToken cancellationToken)
         {
             lock (_gate)
@@ -261,29 +274,31 @@ namespace Meshtastic.Client
         }
         public async Task RequestFullStateAsync(CancellationToken cancellationToken = default(CancellationToken))
         {
-            var nonce = NextUInt();
-            _expectedConfigId = nonce;
-            // ConfigComplete arrives on the RX thread. Do not run the caller's /refresh
-            // continuation synchronously on that thread: a console caller may immediately
-            // enter Console.ReadLine and would then freeze all further receives.
-            _configComplete = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            if (Protocol == MeshProtocol.MeshCore) { await SynchronizeMeshCoreAsync(cancellationToken).ConfigureAwait(false); return; }
+            await _configurationRequests.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                timeout.CancelAfter(ConfigurationTimeout);
-                try
+                var nonce = NextUInt();
+                var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                using (var inactivity = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    await SendAsync(new ToRadio { WantConfigId = nonce }, timeout.Token).ConfigureAwait(false);
-                    using (timeout.Token.Register(delegate { _configComplete.TrySetCanceled(); }))
-                        await _configComplete.Task.ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-                {
-                    CloseCurrentTransport();
-                    throw new TimeoutException("The Meshtastic device did not respond to the configuration request.");
+                    inactivity.CancelAfter(ConfigurationTimeout);
+                    lock (_configurationGate) { _expectedConfigId = nonce; _configComplete = completion; _configurationInactivity = inactivity; }
+                    try
+                    {
+                        await SendAsync(new ToRadio { WantConfigId = nonce }, inactivity.Token).ConfigureAwait(false);
+                        using (inactivity.Token.Register(() => completion.TrySetCanceled())) await completion.Task.ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        CloseCurrentTransport();
+                        throw new TimeoutException("Meshtastic node/configuration synchronization timed out: no new configuration data was received for " + ConfigurationTimeout.TotalSeconds.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + " seconds. The inactivity timeout is reset whenever configuration data arrives.");
+                    }
+                    finally { lock (_configurationGate) { _configurationInactivity = null; _configComplete = null; } }
                 }
             }
+            finally { _configurationRequests.Release(); }
         }
-
         public Task SendBroadcastAsync(string text, int channelIndex = 0, bool wantAck = false, CancellationToken cancellationToken = default(CancellationToken))
         {
             return SendTextAsync(BroadcastNode, text, channelIndex, wantAck, cancellationToken);
@@ -308,6 +323,7 @@ namespace Meshtastic.Client
         /// <summary>Activates packet streaming on firmware that starts forwarding packets only after a local MeshPacket.</summary>
         public Task ActivatePacketStreamingAsync(CancellationToken cancellationToken = default(CancellationToken))
         {
+            if (Protocol == MeshProtocol.MeshCore) { _meshCore.PollMessages = true; return Task.FromResult(0); }
             if (Device.MyNode == null) throw new InvalidOperationException("Local node information has not been received yet.");
             var packet = new MeshPacket
             {
@@ -328,6 +344,7 @@ namespace Meshtastic.Client
         }
         public async Task<uint> SendTextWithIdAsync(uint destination, string text, int channelIndex = 0, bool wantAck = true, CancellationToken cancellationToken = default(CancellationToken))
         {
+            if (Protocol == MeshProtocol.MeshCore) return await SendMeshCoreTextAsync(destination, text, channelIndex, cancellationToken).ConfigureAwait(false);
             if (String.IsNullOrEmpty(text)) throw new ArgumentException("Text must not be empty.", "text");
             var payloadLength = Encoding.UTF8.GetByteCount(text);
             if (payloadLength > MaximumTextPayloadBytes) throw new ArgumentException("Text messages are limited to " + MaximumTextPayloadBytes + " UTF-8 bytes (current: " + payloadLength + ").", "text");
@@ -343,6 +360,7 @@ namespace Meshtastic.Client
         public Task SetLocalPositionAsync(double latitude, double longitude, int? altitudeMeters = null, int channelIndex = 0, CancellationToken cancellationToken = default(CancellationToken))
         {
             ValidateCoordinates(latitude, longitude);
+            if (Protocol == MeshProtocol.MeshCore) return SetAndAdvertiseMeshCorePositionAsync(latitude, longitude, altitudeMeters, cancellationToken);
             var position = CreatePosition(latitude, longitude, altitudeMeters);
             var packet = new MeshPacket { To = BroadcastNode, Channel = (uint)channelIndex, Decoded = new Data { Portnum = PortNum.PositionApp, Payload = position.ToByteString() } };
             return SendAsync(new ToRadio { Packet = packet }, cancellationToken);
@@ -353,6 +371,7 @@ namespace Meshtastic.Client
         {
             ValidateCoordinates(latitude, longitude);
             if (Device.MyNode == null) throw new InvalidOperationException("Local node information has not been received yet.");
+            if (Protocol == MeshProtocol.MeshCore) return SetMeshCorePositionAsync(latitude, longitude, altitudeMeters, cancellationToken);
             var admin = new AdminMessage { SetFixedPosition = CreatePosition(latitude, longitude, altitudeMeters) };
             var packet = new MeshPacket
             {
@@ -365,6 +384,7 @@ namespace Meshtastic.Client
         public Task ClearFixedPositionAsync(CancellationToken cancellationToken = default(CancellationToken))
         {
             if (Device.MyNode == null) throw new InvalidOperationException("Local node information has not been received yet.");
+            if (Protocol == MeshProtocol.MeshCore) return UseMeshCoreGpsAsync(cancellationToken);
             var admin = new AdminMessage { RemoveFixedPosition = true };
             var packet = new MeshPacket { To = Device.MyNode.MyNodeNum, WantAck = true, Decoded = new Data { Portnum = PortNum.AdminApp, WantResponse = true, Payload = admin.ToByteString() } };
             return SendAsync(new ToRadio { Packet = packet }, cancellationToken);
@@ -382,6 +402,7 @@ namespace Meshtastic.Client
 
         private async Task SendAsync(ToRadio message, CancellationToken cancellationToken)
         {
+            if (Protocol == MeshProtocol.MeshCore) throw new NotSupportedException("This Meshtastic device operation is not available in the MeshCore prototype.");
             ITransport transport;
             lock (_gate) transport = _transport;
             if (transport == null || transport.Stream == null || !IsConnected) throw new InvalidOperationException("Meshtastic is not connected.");
@@ -409,10 +430,12 @@ namespace Meshtastic.Client
                 if (await Task.WhenAny(write, Task.Delay(TransportOperationTimeout, cancellationToken)).ConfigureAwait(false) != write)
                 {
                     transport.Close();
+                    cancellationToken.ThrowIfCancellationRequested();
                     throw new TimeoutException("Writing to the Meshtastic transport timed out.");
                 }
                 await write.ConfigureAwait(false);
                 if (!transport.UseSynchronousWrites) await transport.Stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                ReportCommunicationFrame(MeshProtocol.Meshtastic, transport.Kind, "TX", frame, message.ToByteArray());
                 if (String.Equals(transport.Kind, "Serial", StringComparison.OrdinalIgnoreCase)) RaiseSerialTraffic("TX", frame, DescribeToRadio(message));
                 lock (_gate) { _sentFrameCount++; _lastSentUtc = DateTime.UtcNow; }
             }
@@ -443,7 +466,15 @@ namespace Meshtastic.Client
                             _transportKind = transport.Kind; _transportEndpoint = transport.Endpoint; _connectedSinceUtc = DateTime.UtcNow;
                             if (!first) _reconnectCount++;
                         }
-                        if (String.Equals(transport.Kind, "Serial", StringComparison.OrdinalIgnoreCase)) RaiseSerialTraffic("TX", new byte[] { 0x94, 0x94, 0x94, 0x94 }, "serial wake/resynchronization");
+                        if (Protocol == MeshProtocol.Meshtastic && String.Equals(transport.Kind, "Serial", StringComparison.OrdinalIgnoreCase)) { ReportCommunicationFrame(MeshProtocol.Meshtastic, transport.Kind, "TX", new byte[] { 0x94, 0x94, 0x94, 0x94 }, new byte[0]); RaiseSerialTraffic("TX", new byte[] { 0x94, 0x94, 0x94, 0x94 }, "serial wake/resynchronization"); }
+                        if (Protocol == MeshProtocol.MeshCore)
+                        {
+                            _meshCoreRooms.Clear();
+                            _meshCore = new MeshCoreSession(transport.Stream, transport.Close, TransportOperationTimeout, HandleMeshCoreFrame, ConfigurationTimeout);
+                            _meshCore.FrameTraffic = (direction, raw, payload) => ReportCommunicationFrame(MeshProtocol.MeshCore, transport.Kind, direction, raw, payload);
+                            _meshCore.FrameSent = delegate { lock (_gate) { _sentFrameCount++; _lastSentUtc = DateTime.UtcNow; } };
+                            _meshCore.DeliveryChanged = UpdateMeshCoreDelivery;
+                        }
                         SetState(ConnectionState.Connected, null);
                         Debug("Transport open; starting heartbeat and RX reader.");
                         using (var connectionToken = CancellationTokenSource.CreateLinkedTokenSource(token))
@@ -451,7 +482,7 @@ namespace Meshtastic.Client
                             var heartbeat = HeartbeatLoopAsync(transport, connectionToken.Token);
                             // On reconnect the firmware has discarded the previous client session. Start the reader
                             // first, then repeat the normal config handshake and local packet-stream activation.
-                            var reader = ReadLoopAsync(transport.Stream, connectionToken.Token);
+                            var reader = Protocol == MeshProtocol.MeshCore ? _meshCore.ReadAsync(connectionToken.Token) : ReadLoopAsync(transport.Stream, connectionToken.Token);
                             try
                             {
                                 if (!first)
@@ -549,9 +580,11 @@ namespace Meshtastic.Client
                 try { radio = FromRadio.Parser.ParseFrom(bytes); }
                 catch (Exception ex)
                 {
+                    ReportCommunicationFrame(MeshProtocol.Meshtastic, _transportKind, "RX", CreateFrame(bytes), bytes);
                     RaiseSerialTraffic("RX", CreateFrame(bytes), "invalid FromRadio: " + ex.GetType().Name);
                     Debug("RX processing failed: " + ex.GetType().Name + ": " + ex.Message); throw;
                 }
+                ReportCommunicationFrame(MeshProtocol.Meshtastic, _transportKind, "RX", CreateFrame(bytes), bytes);
                 RaiseSerialTraffic("RX", CreateFrame(bytes), DescribeFromRadio(radio));
                 try { Handle(radio); Debug("RX frame processing completed; waiting for next frame."); }
                 catch (Exception ex) { Debug("RX processing failed: " + ex.GetType().Name + ": " + ex.Message); throw; }
@@ -593,19 +626,31 @@ namespace Meshtastic.Client
         private void Handle(FromRadio radio)
         {
             Debug("RX FromRadio: " + radio.PayloadVariantCase);
+            lock (_configurationGate)
+            {
+                if (_configurationInactivity != null && !_configurationInactivity.IsCancellationRequested &&
+                    (radio.PayloadVariantCase == FromRadio.PayloadVariantOneofCase.MyInfo || radio.PayloadVariantCase == FromRadio.PayloadVariantOneofCase.NodeInfo ||
+                     radio.PayloadVariantCase == FromRadio.PayloadVariantOneofCase.Channel || radio.PayloadVariantCase == FromRadio.PayloadVariantOneofCase.Metadata ||
+                     radio.PayloadVariantCase == FromRadio.PayloadVariantOneofCase.Config || radio.PayloadVariantCase == FromRadio.PayloadVariantOneofCase.ModuleConfig ||
+                     (radio.PayloadVariantCase == FromRadio.PayloadVariantOneofCase.ConfigCompleteId && radio.ConfigCompleteId == _expectedConfigId)))
+                    _configurationInactivity.CancelAfter(ConfigurationTimeout);
+            }
             switch (radio.PayloadVariantCase)
             {
                 case FromRadio.PayloadVariantOneofCase.MyInfo:
                     Device.MyNode = radio.MyInfo; UpdateLocalNode(); Raise(DeviceInfoUpdated, EventArgs.Empty); break;
                 case FromRadio.PayloadVariantOneofCase.NodeInfo: UpdateNode(radio.NodeInfo); break;
                 case FromRadio.PayloadVariantOneofCase.Channel: UpdateChannel(radio.Channel); break;
+                case FromRadio.PayloadVariantOneofCase.Config:
+                    if (radio.Config.PayloadVariantCase == Config.PayloadVariantOneofCase.Lora) { Device.LoRaConfig = radio.Config.Lora.Clone(); Raise(DeviceInfoUpdated, EventArgs.Empty); }
+                    break;
                 case FromRadio.PayloadVariantOneofCase.Metadata:
                     Device.Metadata = radio.Metadata; Raise(DeviceInfoUpdated, EventArgs.Empty); break;
                 case FromRadio.PayloadVariantOneofCase.ConfigCompleteId:
                     if (_configComplete != null && radio.ConfigCompleteId == _expectedConfigId)
                     {
                         Debug("RX ConfigComplete matches request; completing refresh without blocking RX thread.");
-                        _configComplete.TrySetResult(true);
+                        _configComplete?.TrySetResult(true);
                     }
                     Raise(ConfigurationReceived, EventArgs.Empty); break;
                 case FromRadio.PayloadVariantOneofCase.QueueStatus: HandleQueueStatus(radio.QueueStatus); break;
@@ -613,12 +658,14 @@ namespace Meshtastic.Client
             }
         }
 
-        private void UpdateNode(NodeInfo value)
+        private void UpdateNode(NodeInfo value, byte? meshCoreContactType = null, DateTime? localReceivedUtc = null)
         {
             MeshNode node; var discovered = false;
             if (!_nodes.TryGetValue(value.Num, out node)) { node = new MeshNode(value); _nodes[value.Num] = node; discovered = true; }
             else node.Update(value);
-            UpdateLocalNode(); Raise(discovered ? NodeDiscovered : NodeUpdated, new NodeEventArgs(node));
+            node.MeshCoreContactType = meshCoreContactType;
+            if (localReceivedUtc.HasValue) node.LocalReceivedUtc = localReceivedUtc;
+            if (Device.MyNode != null && value.Num == Device.MyNode.MyNodeNum) UpdateLocalNode(); Raise(discovered ? NodeDiscovered : NodeUpdated, new NodeEventArgs(node));
         }
         private void UpdateLocalNode()
         {
@@ -661,6 +708,7 @@ namespace Meshtastic.Client
             else if (data.Portnum == PortNum.TelemetryApp)
             {
                 var telemetry = Telemetry.Parser.ParseFrom(data.Payload);
+                if (Device.MyNode != null && packet.From == Device.MyNode.MyNodeNum && telemetry.LocalStats != null) { Device.NoiseFloorDbm = telemetry.LocalStats.NoiseFloor == 0 ? (int?)null : telemetry.LocalStats.NoiseFloor; Raise(DeviceInfoUpdated, EventArgs.Empty); }
                 MeshNode node; if (_nodes.TryGetValue(packet.From, out node) && telemetry.DeviceMetrics != null) { node.Value.DeviceMetrics = telemetry.DeviceMetrics; Raise(NodeUpdated, new NodeEventArgs(node)); }
                 Raise(TelemetryReceived, new MeshTelemetryEventArgs(new MeshTelemetry(packet, telemetry)));
             }
@@ -705,6 +753,39 @@ namespace Meshtastic.Client
         }
         private async Task HeartbeatLoopAsync(ITransport transport, CancellationToken token)
         {
+            if (Protocol == MeshProtocol.MeshCore)
+            {
+                var nextBatteryUtc = DateTime.UtcNow.AddSeconds(30);
+                var batteryPollingEnabled = true;
+                var nextRadioStatisticsUtc = DateTime.MinValue;
+                var radioStatisticsEnabled = true;
+                try
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(2), token).ConfigureAwait(false);
+                        if (_meshCore.PollMessages)
+                        {
+                            await _meshCore.DrainMessagesAsync(token).ConfigureAwait(false);
+                            if (_meshCore.PollMessages && batteryPollingEnabled && DateTime.UtcNow >= nextBatteryUtc)
+                            {
+                                nextBatteryUtc = DateTime.UtcNow.AddSeconds(30);
+                                try { await RefreshMeshCoreBatteryAsync(token).ConfigureAwait(false); }
+                                catch (IOException) { batteryPollingEnabled = false; Device.MeshCoreBatteryVoltage = null; }
+                            }
+                            if (_meshCore.PollMessages && radioStatisticsEnabled && DateTime.UtcNow >= nextRadioStatisticsUtc)
+                            {
+                                nextRadioStatisticsUtc = DateTime.UtcNow.AddSeconds(5);
+                                try { await RefreshRadioStatisticsAsync(token).ConfigureAwait(false); }
+                                catch (IOException) { radioStatisticsEnabled = false; Device.NoiseFloorDbm = null; }
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+                catch { transport.Close(); }
+                return;
+            }
             while (!token.IsCancellationRequested)
             {
                 try { await SendAsync(new ToRadio { Heartbeat = new Heartbeat() }, token).ConfigureAwait(false); }
@@ -732,7 +813,7 @@ namespace Meshtastic.Client
         {
             var output = DebugOutput;
             if (output == null) return;
-            try { output("[Meshtastic RX " + DateTime.Now.ToString("HH:mm:ss.fff") + "] " + message); }
+            try { output("[" + Protocol + " RX " + DateTime.Now.ToString("HH:mm:ss.fff") + "] " + message); }
             catch { }
         }
         private async Task<int> ReadByteAsync(Stream stream, CancellationToken token) { var b = await ReadExactAsync(stream, 1, token).ConfigureAwait(false); return b[0]; }

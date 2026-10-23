@@ -14,6 +14,7 @@ namespace ConsoleClient
         private readonly AutoResetEvent _wake = new AutoResetEvent(false);
         private readonly Thread _worker;
         private readonly int _maximumPending;
+        private bool _paused, _active;
         private bool _accepting = true;
         private bool _completed;
         private long _discarded;
@@ -57,9 +58,11 @@ namespace ConsoleClient
             return true;
         }
 
+        public void Pause() { lock (_gate) { _paused = true; while (_active) Monitor.Wait(_gate); } }
+        public void Resume() { lock (_gate) _paused = false; _wake.Set(); }
         public bool CompleteAndWait(TimeSpan timeout)
         {
-            lock (_gate) _accepting = false;
+            lock (_gate) { _accepting = false; _paused = false; }
             _wake.Set();
             return _worker.Join(timeout);
         }
@@ -71,17 +74,18 @@ namespace ConsoleClient
                 WorkItem item = null;
                 lock (_gate)
                 {
-                    if (_pending.Count > 0)
+                    if (!_paused && _pending.Count > 0)
                     {
                         var node = _pending.First;
                         _pending.RemoveFirst();
-                        item = node.Value;
+                        item = node.Value; _active = true;
                         if (!String.IsNullOrEmpty(item.Key)) _keyed.Remove(item.Key);
                     }
                     else if (!_accepting) { _completed = true; return; }
                 }
                 if (item == null) { _wake.WaitOne(); continue; }
                 try { item.Action(); } catch { }
+                finally { lock (_gate) { _active = false; Monitor.PulseAll(_gate); } }
             }
         }
 

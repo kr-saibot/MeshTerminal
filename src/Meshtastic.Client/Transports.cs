@@ -20,8 +20,8 @@ namespace Meshtastic.Client
 
     internal sealed class SerialTransport : ITransport
     {
-        private readonly string _port; private readonly int _baudRate; private readonly bool _dtrEnable, _rtsEnable; private SerialPort _serial;
-        public SerialTransport(string port, int baudRate, bool dtrEnable, bool rtsEnable) { _port = port; _baudRate = baudRate; _dtrEnable = dtrEnable; _rtsEnable = rtsEnable; }
+        private readonly string _port; private readonly int _baudRate; private readonly bool _dtrEnable, _rtsEnable, _wakeMeshtastic; private SerialPort _serial;
+        public SerialTransport(string port, int baudRate, bool dtrEnable, bool rtsEnable, bool wakeMeshtastic = true) { _port = port; _baudRate = baudRate; _dtrEnable = dtrEnable; _rtsEnable = rtsEnable; _wakeMeshtastic = wakeMeshtastic; }
         public Stream Stream
         {
             get { var serial = Volatile.Read(ref _serial); return serial == null ? null : serial.BaseStream; }
@@ -44,6 +44,8 @@ namespace Meshtastic.Client
             _serial.RtsEnable = _rtsEnable;
             _serial.ReadTimeout = SerialPort.InfiniteTimeout; _serial.WriteTimeout = SerialPort.InfiniteTimeout;
             _serial.Open();
+            if (!_wakeMeshtastic) return Task.FromResult(0);
+            if (!_wakeMeshtastic) return Task.FromResult(0);
             // Four START1 bytes wake the device and resynchronize its stream parser
             // before the first normally framed (0x94, 0xC3, length, protobuf) packet.
             var wake = new byte[] { 0x94, 0x94, 0x94, 0x94 };

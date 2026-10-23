@@ -12,6 +12,7 @@ $StagingRoot = Join-Path $RepositoryRoot ".build-staging"
 $WindowsStaging = Join-Path $StagingRoot "Windows"
 $HostStaging = Join-Path $StagingRoot "WindowsHost"
 $LinuxStaging = Join-Path $StagingRoot "Linux"
+$TestsStaging = Join-Path $StagingRoot "Tests"
 
 function Reset-StagingDirectory([string] $Path) {
     $resolvedRoot = [IO.Path]::GetFullPath($StagingRoot)
@@ -50,6 +51,7 @@ try {
     Reset-StagingDirectory $WindowsStaging
     Reset-StagingDirectory $HostStaging
     Reset-StagingDirectory $LinuxStaging
+    Reset-StagingDirectory $TestsStaging
 
     dotnet restore "src\ConsoleClient\ConsoleClient.csproj" -p:Configuration=Release
     if ($LASTEXITCODE -ne 0) { throw "Windows package restore failed." }
@@ -66,11 +68,26 @@ try {
     dotnet build "src\ConsoleClient\ConsoleClient.csproj" --configuration Linux --no-restore -p:OutputPath="$LinuxStaging\"
     if ($LASTEXITCODE -ne 0) { throw "Linux ConsoleClient build failed." }
 
+    dotnet restore "tests\MeshCore.Tests\MeshCore.Tests.csproj" -p:Configuration=Release
+    if ($LASTEXITCODE -ne 0) { throw "MeshCore test restore failed." }
+    dotnet build "tests\MeshCore.Tests\MeshCore.Tests.csproj" --configuration Release --no-restore -p:OutputPath="$TestsStaging\"
+    if ($LASTEXITCODE -ne 0) { throw "MeshCore test build failed." }
+    & (Join-Path $TestsStaging "MeshCore.Tests.exe")
+    if ($LASTEXITCODE -ne 0) { throw "MeshCore protocol tests failed." }
+
     # Copying with -Force replaces old program files but deliberately does not
     # delete runtime data already present in the destinations. In particular,
     # meshtastic-settings.xml, meshtastic-messages.db and Host\settings.ini survive.
     Copy-BuildFiles $WindowsStaging $WindowsTarget
     Copy-BuildFiles $HostStaging (Join-Path $WindowsTarget "Host")
+    # Resolve the host and client relative to the launcher, even after moving.
+    $hostLauncher = @(
+        '@echo off',
+        'start "" "%~dp0Host\MeshtasticConsoleHost.exe" "%~dp0ConsoleClient.exe"'
+    ) -join [Environment]::NewLine
+    [IO.File]::WriteAllText((Join-Path $WindowsTarget "MeshtasticConsoleHost.cmd"), $hostLauncher, [Text.Encoding]::ASCII)
+    $oldShortcut = Join-Path $WindowsTarget "MeshtasticConsoleHost.lnk"
+    if (Test-Path -LiteralPath $oldShortcut) { Remove-Item -LiteralPath $oldShortcut -Force }
     Copy-BuildFiles $LinuxStaging $LinuxTarget
 
     Write-Host ""
