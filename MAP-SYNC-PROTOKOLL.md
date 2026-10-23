@@ -1,6 +1,6 @@
 # Synchronisierungsprotokoll für Kartenelemente
 
-Diese Beschreibung entspricht der aktuellen Implementierung im ConsoleClient 1.4.0 einschließlich der lokalen MAP-Erweiterungen. Sie beschreibt den Austausch einzelner Kartenelemente über Meshtastic-Kanalnachrichten.
+Diese Beschreibung entspricht der aktuellen Implementierung im MeshTerminal 1.4.0 einschließlich der lokalen MAP-Erweiterungen. Sie beschreibt den Austausch einzelner Kartenelemente über Meshtastic-Kanalnachrichten.
 
 ## Transport und Konfiguration
 
@@ -150,11 +150,11 @@ Der Empfänger prüft keine Eigentümerschaft: Eine empfangene Löschmeldung kan
 
 ## Implementierungsstellen
 
-- `src/ConsoleClient/Program.cs`: `SharedMapPointPrefix`, `SharedMapPointDeletionPrefix`, `BuildSharedMapPointMessage`, `TryParseSharedMapPoint`, `SendSharedMapMessage`, `TryReceiveSharedMapPoint`, Erstellen und Löschen in der Oberfläche.
-- `src/ConsoleClient/MapOverlay.cs`: XML-Datenmodell und effektiver Füllwert.
-- `src/ConsoleClient/NodeMapView.cs`: Geometrie, Kontur und Flächenfüllung.
-- `src/Meshtastic.Client/MeshtasticSettings.cs`: Konfiguration unter `MeshtasticMapSettings`.
-- `src/Meshtastic.Client/MeshtasticClient.cs`: `MaximumTextPayloadBytes = 233`.
+- `src/MeshTerminal/Program.cs`: `SharedMapPointPrefix`, `SharedMapPointDeletionPrefix`, `BuildSharedMapPointMessage`, `TryParseSharedMapPoint`, `SendSharedMapMessage`, `TryReceiveSharedMapPoint`, Erstellen und Löschen in der Oberfläche.
+- `src/MeshTerminal/MapOverlay.cs`: XML-Datenmodell und effektiver Füllwert.
+- `src/MeshTerminal/NodeMapView.cs`: Geometrie, Kontur und Flächenfüllung.
+- `src/MeshTerminal.Client/MeshtasticSettings.cs`: Konfiguration unter `MeshtasticMapSettings`.
+- `src/MeshTerminal.Client/MeshtasticClient.cs`: `MaximumTextPayloadBytes = 233`.
 
 ## Temporäre Positionsmarker: ///MAPPOS+
 
@@ -186,7 +186,7 @@ Je Meshtastic-ID existiert höchstens ein Marker. Ein weiterer Empfang für dies
 
 Darstellung: ein Fadenkreuz aus zwei horizontalen Strichen je Seite und je einem senkrechten Strich darüber und darunter, mit konfigurierbarem Mittelsymbol. Positionsmarker werden nach allen anderen Kartenebenen gezeichnet und sind mit Maus und Pfeiltasten auswählbar. Leertaste zentriert den Marker; Enter oder Doppelklick öffnet dessen Details, einschließlich einer Aktion zum Öffnen gespeicherter Node-Details.
 
-Implementierung: src/ConsoleClient/MapPositionMarker.cs, NodeMapView.cs und Program.cs.
+Implementierung: src/MeshTerminal/MapPositionMarker.cs, NodeMapView.cs und Program.cs.
 
 ### Erweiterte Markerbedienung
 
