@@ -42,7 +42,7 @@ public static class StateBorderSimplifier {
 $data = Get-Content -Raw -LiteralPath $InputGeoJson | ConvertFrom-Json
 $features = @($data.features | Where-Object { $_.properties.GF -eq 4 })
 if (@($features.properties.GEN | Sort-Object -Unique).Count -ne 16) { throw "Expected all 16 states." }
-$target = Join-Path (Split-Path -Parent $PSScriptRoot) "src\ConsoleClient\map\german-federal-state-borders.xml"
+$target = Join-Path (Split-Path -Parent $PSScriptRoot) "src\MeshTerminal\map\german-federal-state-borders.xml"
 $settings = [Xml.XmlWriterSettings]::new()
 $settings.Indent = $true
 $settings.Encoding = [Text.UTF8Encoding]::new($false)

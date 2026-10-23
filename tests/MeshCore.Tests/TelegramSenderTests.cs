@@ -1,5 +1,5 @@
 using System;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 using Meshtastic.Protobufs;
 internal static class TelegramSenderTests
 {

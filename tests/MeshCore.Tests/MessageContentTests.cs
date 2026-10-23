@@ -1,6 +1,6 @@
 using System;
 using System.Linq;
-using ConsoleClient;
+using MeshTerminal;
 internal static class MessageContentTests
 {
     internal static void Run()

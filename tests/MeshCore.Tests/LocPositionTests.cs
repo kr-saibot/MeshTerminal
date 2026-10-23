@@ -1,8 +1,8 @@
 using System;
 using System.IO;
 using System.Linq;
-using ConsoleClient;
-using Meshtastic.Client;
+using MeshTerminal;
+using MeshTerminal.Client;
 using Meshtastic.Protobufs;
 
 internal static class LocPositionTests

@@ -1,8 +1,8 @@
 using System;
 using System.Linq;
-using ConsoleClient;
+using MeshTerminal;
 using Google.Protobuf;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 using Meshtastic.Protobufs;
 
 internal static class CommunicationLogFilterTests

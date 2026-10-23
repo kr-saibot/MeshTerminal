@@ -25,5 +25,5 @@ work/.dotnet/
 *.bak
 
 # Personal logo files
-src/ConsoleClient/logo/*DM2TK*.txt
-src/ConsoleHost/tools/*.exe
+src/MeshTerminal/logo/*DM2TK*.txt
+src/MeshTerminal.Host/tools/*.exe

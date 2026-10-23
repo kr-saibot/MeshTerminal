@@ -6,7 +6,7 @@ $WindowsTarget = Join-Path $BuildRoot "Windows"
 $LinuxTarget = Join-Path $BuildRoot "Linux"
 
 # Build into isolated staging folders. This prevents the Windows host from
-# overwriting ConsoleClient dependencies with assemblies of another version.
+# overwriting MeshTerminal dependencies with assemblies of another version.
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 $StagingRoot = Join-Path $RepositoryRoot ".build-staging"
 $WindowsStaging = Join-Path $StagingRoot "Windows"
@@ -53,20 +53,20 @@ try {
     Reset-StagingDirectory $LinuxStaging
     Reset-StagingDirectory $TestsStaging
 
-    dotnet restore "src\ConsoleClient\ConsoleClient.csproj" -p:Configuration=Release
+    dotnet restore "src\MeshTerminal\MeshTerminal.csproj" -p:Configuration=Release
     if ($LASTEXITCODE -ne 0) { throw "Windows package restore failed." }
-    dotnet build "src\ConsoleClient\ConsoleClient.csproj" --configuration Release --no-restore -p:OutputPath="$WindowsStaging\"
-    if ($LASTEXITCODE -ne 0) { throw "Windows ConsoleClient build failed." }
+    dotnet build "src\MeshTerminal\MeshTerminal.csproj" --configuration Release --no-restore -p:OutputPath="$WindowsStaging\"
+    if ($LASTEXITCODE -ne 0) { throw "Windows MeshTerminal build failed." }
 
-    dotnet restore "src\ConsoleHost\ConsoleHost.csproj" -p:Configuration=Release
+    dotnet restore "src\MeshTerminal.Host\MeshTerminal.Host.csproj" -p:Configuration=Release
     if ($LASTEXITCODE -ne 0) { throw "Windows host package restore failed." }
-    dotnet build "src\ConsoleHost\ConsoleHost.csproj" --configuration Release --no-restore -p:OutputPath="$HostStaging\"
+    dotnet build "src\MeshTerminal.Host\MeshTerminal.Host.csproj" --configuration Release --no-restore -p:OutputPath="$HostStaging\"
     if ($LASTEXITCODE -ne 0) { throw "Windows host build failed." }
 
-    dotnet restore "src\ConsoleClient\ConsoleClient.csproj" -p:Configuration=Linux
+    dotnet restore "src\MeshTerminal\MeshTerminal.csproj" -p:Configuration=Linux
     if ($LASTEXITCODE -ne 0) { throw "Linux package restore failed." }
-    dotnet build "src\ConsoleClient\ConsoleClient.csproj" --configuration Linux --no-restore -p:OutputPath="$LinuxStaging\"
-    if ($LASTEXITCODE -ne 0) { throw "Linux ConsoleClient build failed." }
+    dotnet build "src\MeshTerminal\MeshTerminal.csproj" --configuration Linux --no-restore -p:OutputPath="$LinuxStaging\"
+    if ($LASTEXITCODE -ne 0) { throw "Linux MeshTerminal build failed." }
 
     dotnet restore "tests\MeshCore.Tests\MeshCore.Tests.csproj" -p:Configuration=Release
     if ($LASTEXITCODE -ne 0) { throw "MeshCore test restore failed." }
@@ -83,12 +83,27 @@ try {
     # Resolve the host and client relative to the launcher, even after moving.
     $hostLauncher = @(
         '@echo off',
-        'start "" "%~dp0Host\MeshtasticConsoleHost.exe" "%~dp0ConsoleClient.exe"'
+        'start "" "%~dp0Host\MeshTerminal.Host.exe" "%~dp0MeshTerminal.exe"'
     ) -join [Environment]::NewLine
-    [IO.File]::WriteAllText((Join-Path $WindowsTarget "MeshtasticConsoleHost.cmd"), $hostLauncher, [Text.Encoding]::ASCII)
-    $oldShortcut = Join-Path $WindowsTarget "MeshtasticConsoleHost.lnk"
+    [IO.File]::WriteAllText((Join-Path $WindowsTarget "MeshTerminal.cmd"), $hostLauncher, [Text.Encoding]::ASCII)
+    $oldShortcut = Join-Path $WindowsTarget "MeshTerminal.Host.lnk"
     if (Test-Path -LiteralPath $oldShortcut) { Remove-Item -LiteralPath $oldShortcut -Force }
+    # Compatibility for existing shortcuts; keep all runtime files untouched.
+    $legacyHostLauncher = @('@echo off', 'call "%~dp0MeshTerminal.cmd"') -join [Environment]::NewLine
+    [IO.File]::WriteAllText((Join-Path $WindowsTarget "MeshtasticConsoleHost.cmd"), $legacyHostLauncher, [Text.Encoding]::ASCII)
     Copy-BuildFiles $LinuxStaging $LinuxTarget
+
+    # Remove obsolete program names after successful replacement; never touch data.
+    foreach ($target in @($WindowsTarget, $LinuxTarget)) {
+        foreach ($name in @('ConsoleClient.exe', 'ConsoleClient.exe.config', 'Meshtastic.Client.dll', 'Meshtastic.Client.dll.config')) {
+            $legacyProgram = Join-Path $target $name
+            if (Test-Path -LiteralPath $legacyProgram) { Remove-Item -LiteralPath $legacyProgram -Force }
+        }
+    }
+    foreach ($name in @('MeshtasticConsoleHost.exe', 'MeshtasticConsoleHost.exe.config')) {
+        $legacyProgram = Join-Path (Join-Path $WindowsTarget 'Host') $name
+        if (Test-Path -LiteralPath $legacyProgram) { Remove-Item -LiteralPath $legacyProgram -Force }
+    }
 
     Write-Host ""
     Write-Host "Builds completed successfully:"

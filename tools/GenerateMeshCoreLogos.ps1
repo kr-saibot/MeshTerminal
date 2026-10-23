@@ -1,6 +1,6 @@
 # MeshCore wordmark animations for the existing 32x8 terminal logo viewport.
 $ErrorActionPreference = 'Stop'
-$logoFolder = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\ConsoleClient\logo'
+$logoFolder = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\MeshTerminal\logo'
 $letters = @{
  M = @('# #','###','###','# #','# #')
  E = @('###','#  ','## ','#  ','###')

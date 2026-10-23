@@ -4,7 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 internal static class BluetoothTests
 {
     internal static async Task RunAsync()

@@ -7,7 +7,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 
 internal static class Program
 {
@@ -18,7 +18,7 @@ internal static class Program
             if (args.Length >= 2 && (args[0] == "--ble-admin-read" || args[0] == "--ble-admin-verify")) BleAdminReadProbe.Run(args[1], args[0] == "--ble-admin-verify").GetAwaiter().GetResult();
             else if (args.Contains("--ble-devices")) { using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15))) { var devices = MeshtasticClient.GetBluetoothDevicesAsync(MeshProtocol.MeshCore, timeout.Token).GetAwaiter().GetResult(); Console.WriteLine("Paired Bluetooth devices: " + devices.Count); foreach (var device in devices) Console.WriteLine(device.Name); } }
             else if (args.Length >= 2 && args[0] == "--port") ProbeAsync(args[1], args.Contains("--telemetry"), args.Contains("--channels")).GetAwaiter().GetResult();
-            else { RepeaterDialogTests.Run(); CommunicationLogFilterTests.Run(); CommunicationLogTests.Run(); TelnetEchoTests.RunAsync().GetAwaiter().GetResult(); ArchivedChannelChatTests.Run(); GatewayConfigurationTests.Run(); LocPositionTests.Run(); MeshCoreHashtagTests.Run(); ChannelDraftTests.Run(); SharedLinkImportTests.Run(); MessageOrderingTests.Run(); TelnetServerTests.RunAsync().GetAwaiter().GetResult(); MessageContentTests.Run(); DeferredNodePersistenceTests.Run(); PathMapTests.Run(); MeshCoreTelemetryPaddingTests.Run(); MeshCoreHopTests.Run(); TelegramSenderTests.Run(); NodeReceptionTests.Run(); MeshCoreContactTimeoutTests.RunAsync().GetAwaiter().GetResult(); BluetoothTests.RunAsync().GetAwaiter().GetResult(); MapMarkerTests.Run(); SharingTests.Run(); BluetoothChannelTests.RunAsync().GetAwaiter().GetResult(); ChannelTests.RunAsync().GetAwaiter().GetResult(); TestAsync().GetAwaiter().GetResult(); }
+            else { RenameCompatibilityTests.Run(); RepeaterDialogTests.Run(); CommunicationLogFilterTests.Run(); CommunicationLogTests.Run(); TelnetEchoTests.RunAsync().GetAwaiter().GetResult(); ArchivedChannelChatTests.Run(); GatewayConfigurationTests.Run(); LocPositionTests.Run(); MeshCoreHashtagTests.Run(); ChannelDraftTests.Run(); SharedLinkImportTests.Run(); MessageOrderingTests.Run(); TelnetServerTests.RunAsync().GetAwaiter().GetResult(); MessageContentTests.Run(); DeferredNodePersistenceTests.Run(); PathMapTests.Run(); MeshCoreTelemetryPaddingTests.Run(); MeshCoreHopTests.Run(); TelegramSenderTests.Run(); NodeReceptionTests.Run(); MeshCoreContactTimeoutTests.RunAsync().GetAwaiter().GetResult(); BluetoothTests.RunAsync().GetAwaiter().GetResult(); MapMarkerTests.Run(); SharingTests.Run(); BluetoothChannelTests.RunAsync().GetAwaiter().GetResult(); ChannelTests.RunAsync().GetAwaiter().GetResult(); TestAsync().GetAwaiter().GetResult(); }
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }

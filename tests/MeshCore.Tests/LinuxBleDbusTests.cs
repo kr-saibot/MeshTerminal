@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 using Tmds.DBus;
 
 [DBusInterface("org.freedesktop.DBus.ObjectManager")]

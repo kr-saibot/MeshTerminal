@@ -7,7 +7,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 internal static class TelnetServerTests
 {
     internal static async Task RunAsync()

@@ -6,7 +6,7 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using Google.Protobuf;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 using Meshtastic.Protobufs;
 
 internal static class ChannelTests

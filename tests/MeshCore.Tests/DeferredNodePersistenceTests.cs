@@ -1,8 +1,8 @@
 using System;
 using System.IO;
 using System.Threading;
-using ConsoleClient;
-using Meshtastic.Client;
+using MeshTerminal;
+using MeshTerminal.Client;
 using Microsoft.Data.Sqlite;
 internal static class DeferredNodePersistenceTests
 {

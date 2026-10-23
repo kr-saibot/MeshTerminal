@@ -1,5 +1,5 @@
 using System;
-using ConsoleClient;
+using MeshTerminal;
 
 internal static class MapMarkerTests
 {

@@ -1,9 +1,9 @@
 using System;
 using System.Linq;
 using Google.Protobuf;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 using Meshtastic.Protobufs;
-using ConsoleClient;
+using MeshTerminal;
 internal static class SharedLinkImportTests
 {
     public static void Run()

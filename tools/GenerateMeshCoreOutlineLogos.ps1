@@ -1,6 +1,6 @@
 # Outline-letter MeshCore variants matching 107-meshtastic-animation-06.txt.
 $ErrorActionPreference = 'Stop'
-$folder = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\ConsoleClient\logo'
+$folder = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\MeshTerminal\logo'
 $template = [IO.File]::ReadAllLines((Join-Path $folder '107-meshtastic-animation-06.txt'))
 $thin = @('╔╦╗┌─┐┌─┐┬ ┬┌─┐┌─┐┬─┐┌─┐', '║║║├┤ └─┐├─┤│  │ │├┬┘├┤ ', '╩ ╩└─┘└─┘┴ ┴└─┘└─┘┴└─└─┘')
 $thick = @('╔╦╗╔═╗╔═╗║ ║╔═╗╔═╗╦═╗╔═╗', '║║║╠═ ╚═╗╠═╣║  ║ ║╠╦╝╠═ ', '╩ ╩╚═╝╚═╝╩ ╩╚═╝╚═╝╩╚═╚═╝')

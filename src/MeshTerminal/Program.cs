@@ -1,0 +1,5435 @@
+using MessageBox = MeshTerminal.SafeMessageBox;
+using Dialog = MeshTerminal.SafeDialog;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Net.Http;
+using System.Globalization;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml.Serialization;
+using MeshTerminal.Client;
+using NStack;
+using Terminal.Gui;
+
+namespace MeshTerminal
+{
+    internal enum ChatKind { Channel, Direct }
+    internal enum NodeSortMode { Name, NodeId, LastReceived, Distance, Hops, Signal }
+    internal sealed class ChatItem
+    {
+        public ChatKind Kind;
+        public uint Id;
+        public string Name;
+        public int NewCount;
+        public override string ToString() { return (Kind == ChatKind.Channel ? "// " : "@ ") + Name + (NewCount > 0 ? " [" + NewCount + "]" : ""); }
+    }
+
+    internal sealed class ChatTranscriptView : View
+    {
+        private readonly List<Tuple<string, bool>> _lines = new List<Tuple<string, bool>>();
+        private readonly List<StoredMeshMessage> _messageItems = new List<StoredMeshMessage>();
+        private const string DaySeparatorPrefix = "\u0001DAY:";
+        private const int TrailingBlankLineCount = 5;
+        private int _scrollOffset;
+        private int _selectedEmojiIndex = -1;
+        private Guid? _selectedMessageId;
+        private sealed class EmojiPosition
+        {
+            public int Index;
+            public int Row;
+            public int Column;
+            public int Width;
+            public string Token;
+        }
+        private sealed class SelectablePosition
+        {
+            public int? EmojiIndex;
+            public Guid? MessageId;
+            public int Row;
+            public int Column;
+        }
+        public event Action ScrollPositionChanged;
+        public event Action SelectionChanged;
+        public Func<string, string> EmojiResolver { get; set; }
+        public Action<string> EmojiActivated { get; set; }
+        public Action<string> EmojiUnavailable { get; set; }
+        public Action<StoredMeshMessage> MessageActivated { get; set; }
+        public Color IncomingColor { get; set; } = Color.BrightCyan;
+        public Color OutgoingColor { get; set; } = Color.BrightYellow;
+        public Color EmojiTextColor { get; set; } = Color.BrightMagenta;
+        public Color BackgroundColor { get; set; } = Color.Black;
+        public Color NormalTextColor { get; set; } = Color.Gray;
+        public Color DaySeparatorColor { get; set; } = Color.DarkGray;
+
+        public void SetMessages(IEnumerable<StoredMeshMessage> messages, Func<StoredMeshMessage, string> formatter)
+        {
+            _lines.Clear();
+            _messageItems.Clear();
+            DateTime? previousDate = null;
+            foreach (var message in messages)
+            {
+                var messageDate = message.OccurredUtc.ToLocalTime().Date;
+                if (!previousDate.HasValue || messageDate != previousDate.Value)
+                {
+                    _lines.Add(Tuple.Create(DaySeparatorPrefix + FormatDayOffset(messageDate), false));
+                    _messageItems.Add(null);
+                }
+                _lines.Add(Tuple.Create(formatter(message), message.Direction == MessageDirection.Outgoing));
+                _messageItems.Add(message);
+                previousDate = messageDate;
+            }
+            _scrollOffset = 0;
+            _selectedEmojiIndex = -1;
+            _selectedMessageId = null;
+            SetNeedsDisplay();
+            NotifyScrollPositionChanged();
+            NotifySelectionChanged();
+        }
+
+        public int MessageCount { get { return _messageItems.Count(item => item != null); } }
+        public string SelectedEmojiToken { get { return GetSelectedEmojiToken(); } }
+        public int FirstVisibleMessageNumber
+        {
+            get
+            {
+                if (_lines.Count == 0) return 0;
+                var width = Math.Max(2, Bounds.Width);
+                var height = Math.Max(1, Bounds.Height);
+                var displayLines = new List<Tuple<string, bool>>();
+                var messageNumbers = new List<int>();
+                var messageNumber = 0;
+                for (var itemIndex = 0; itemIndex < _lines.Count; itemIndex++)
+                {
+                    if (_messageItems[itemIndex] != null) messageNumber++;
+                    var lineCountBefore = displayLines.Count;
+                    AddWrappedLines(displayLines, _lines[itemIndex], width - 1);
+                    for (var lineIndex = lineCountBefore; lineIndex < displayLines.Count; lineIndex++) messageNumbers.Add(Math.Max(1, messageNumber));
+                }
+                for (var blank = 0; blank < TrailingBlankLineCount; blank++)
+                {
+                    displayLines.Add(Tuple.Create("", false));
+                    messageNumbers.Add(Math.Max(1, messageNumber));
+                }
+                var maximumOffset = Math.Max(0, displayLines.Count - height);
+                var offset = Math.Min(_scrollOffset, maximumOffset);
+                var start = Math.Max(0, displayLines.Count - height - offset);
+                return messageNumbers.Count == 0 ? 0 : messageNumbers[Math.Min(start, messageNumbers.Count - 1)];
+            }
+        }
+
+        public override void Redraw(Rect bounds)
+        {
+            base.Redraw(bounds);
+            var width = Math.Max(2, Bounds.Width);
+            var height = Math.Max(0, Bounds.Height);
+            var displayLines = BuildDisplayLines(width);
+            List<StoredMeshMessage> displayOwners;
+            List<bool> displayStarts;
+            BuildDisplayMetadata(width, out displayOwners, out displayStarts);
+            var emojiCount = CountEmojis(displayLines);
+            if (HasFocus && _selectedEmojiIndex < 0 && !_selectedMessageId.HasValue && emojiCount > 0) _selectedEmojiIndex = emojiCount - 1;
+            if (_selectedEmojiIndex >= emojiCount) _selectedEmojiIndex = emojiCount - 1;
+            for (var row = 0; row < height; row++)
+            {
+                Move(0, row);
+                Application.Driver.SetAttribute(Application.Driver.MakeAttribute(NormalTextColor, BackgroundColor));
+                Application.Driver.AddStr(new string(' ', width));
+            }
+            var maximumOffset = Math.Max(0, displayLines.Count - height);
+            if (_scrollOffset > maximumOffset) _scrollOffset = maximumOffset;
+            var start = Math.Max(0, displayLines.Count - height - _scrollOffset);
+            var emojiIndex = CountEmojis(displayLines.Take(start));
+            for (var index = start; index < displayLines.Count && index - start < height; index++)
+            {
+                var row = index - start;
+                var line = displayLines[index];
+                Move(0, row);
+                DrawMessageLine(line.Item1, line.Item2 ? OutgoingColor : IncomingColor, ref emojiIndex, HasFocus && displayStarts[index] && displayOwners[index] != null && _selectedMessageId == displayOwners[index].Id);
+            }
+            if (displayLines.Count > height && height > 0)
+            {
+                var thumb = Math.Min(height - 1, (int)Math.Round((double)(height - 1) * (displayLines.Count - height - _scrollOffset) / Math.Max(1, displayLines.Count - height)));
+                Move(width - 1, thumb);
+                Application.Driver.SetAttribute(Application.Driver.MakeAttribute(Color.White, BackgroundColor));
+                Application.Driver.AddStr("█");
+            }
+        }
+
+
+        public override void PositionCursor()
+        {
+            Application.Driver.SetCursorVisibility(CursorVisibility.Invisible);
+        }
+
+        public override bool OnLeave(View view)
+        {
+            _selectedEmojiIndex = -1;
+            _selectedMessageId = null;
+            SetNeedsDisplay();
+            NotifySelectionChanged();
+            return base.OnLeave(view);
+        }
+        public override bool OnEnter(View view)
+        {
+            var lastMessage = _messageItems.LastOrDefault(item => item != null);
+            if (lastMessage != null)
+            {
+                _selectedMessageId = lastMessage.Id;
+                _selectedEmojiIndex = -1;
+                var lines = BuildDisplayLines(Math.Max(2, Bounds.Width));
+                List<StoredMeshMessage> owners;
+                List<bool> starts;
+                BuildDisplayMetadata(Math.Max(2, Bounds.Width), out owners, out starts);
+                var row = owners.FindLastIndex(item => item != null && item.Id == lastMessage.Id);
+                if (row >= 0) EnsureEmojiVisible(row, lines.Count);
+                SetNeedsDisplay();
+                NotifySelectionChanged();
+            }
+            return base.OnEnter(view);
+        }
+        public override bool ProcessKey(KeyEvent keyEvent)
+        {
+            if (keyEvent.Key == Key.Enter)
+            {
+                if (_selectedMessageId.HasValue)
+                {
+                    var message = _messageItems.FirstOrDefault(item => item != null && item.Id == _selectedMessageId.Value);
+                    if (message != null && MessageActivated != null) MessageActivated(message);
+                    return true;
+                }
+                ActivateSelectedEmoji();
+                return true;
+            }
+            if (keyEvent.Key == Key.CursorLeft) { MoveEmojiSelection(-1); return true; }
+            if (keyEvent.Key == Key.CursorRight) { MoveEmojiSelection(1); return true; }
+            if (keyEvent.Key == Key.CursorUp) { MoveEmojiSelectionByRow(-1); return true; }
+            if (keyEvent.Key == Key.CursorDown) { MoveEmojiSelectionByRow(1); return true; }
+            if (keyEvent.Key == Key.PageUp) { _scrollOffset += Math.Max(1, Bounds.Height - 1); SetNeedsDisplay(); NotifyScrollPositionChanged(); return true; }
+            if (keyEvent.Key == Key.PageDown) { _scrollOffset = Math.Max(0, _scrollOffset - Math.Max(1, Bounds.Height - 1)); SetNeedsDisplay(); NotifyScrollPositionChanged(); return true; }
+            return base.ProcessKey(keyEvent);
+        }
+
+        public override bool MouseEvent(MouseEvent mouseEvent)
+        {
+            if (mouseEvent.Flags.HasFlag(MouseFlags.WheeledUp) || mouseEvent.Flags.HasFlag(MouseFlags.WheeledDown))
+            {
+                if (mouseEvent.Flags.HasFlag(MouseFlags.WheeledUp)) _scrollOffset += 3;
+                else _scrollOffset = Math.Max(0, _scrollOffset - 3);
+                SetNeedsDisplay();
+                NotifyScrollPositionChanged();
+                mouseEvent.Handled = true;
+                return true;
+            }
+            var isClick = mouseEvent.Flags.HasFlag(MouseFlags.Button1Clicked) || mouseEvent.Flags.HasFlag(MouseFlags.Button1Pressed) || mouseEvent.Flags.HasFlag(MouseFlags.Button1DoubleClicked);
+            if (!isClick) return base.MouseEvent(mouseEvent);
+            SetFocus();
+            var lines = BuildDisplayLines(Math.Max(2, Bounds.Width));
+            List<StoredMeshMessage> owners;
+            List<bool> starts;
+            BuildDisplayMetadata(Math.Max(2, Bounds.Width), out owners, out starts);
+            var height = Math.Max(1, Bounds.Height);
+            var start = Math.Max(0, lines.Count - height - Math.Min(_scrollOffset, Math.Max(0, lines.Count - height)));
+            var clickedRow = start + mouseEvent.Y;
+            var clickedEmoji = GetEmojiPositions(lines).FirstOrDefault(item => item.Row == clickedRow && mouseEvent.X >= item.Column && mouseEvent.X < item.Column + item.Width);
+            if (clickedEmoji != null)
+            {
+                _selectedEmojiIndex = clickedEmoji.Index;
+                _selectedMessageId = null;
+                if (mouseEvent.Flags.HasFlag(MouseFlags.Button1DoubleClicked)) ActivateSelectedEmoji();
+            }
+            else if (clickedRow >= 0 && clickedRow < owners.Count && starts[clickedRow] && mouseEvent.X >= 0 && mouseEvent.X < GetTimestampLength(lines[clickedRow].Item1))
+            {
+                _selectedMessageId = owners[clickedRow].Id;
+                _selectedEmojiIndex = -1;
+                if (mouseEvent.Flags.HasFlag(MouseFlags.Button1DoubleClicked) && MessageActivated != null) MessageActivated(owners[clickedRow]);
+            }
+            else if (_selectedEmojiIndex < 0 && !_selectedMessageId.HasValue) SelectLastEmoji();
+            SetNeedsDisplay();
+            NotifySelectionChanged();
+            mouseEvent.Handled = true;
+            return true;
+        }
+
+        private void ActivateSelectedEmoji()
+        {
+            var token = GetSelectedEmojiToken();
+            if (token == null) return;
+            var emoji = EmojiResolver == null ? null : EmojiResolver(token);
+            if (!String.IsNullOrEmpty(emoji) && EmojiActivated != null) EmojiActivated(emoji);
+            else if (EmojiUnavailable != null) EmojiUnavailable(token);
+        }
+        private List<Tuple<string, bool>> BuildDisplayLines(int width)
+        {
+            var displayLines = new List<Tuple<string, bool>>();
+            foreach (var line in _lines) AddWrappedLines(displayLines, line, width - 1);
+            for (var blank = 0; blank < TrailingBlankLineCount; blank++) displayLines.Add(Tuple.Create("", false));
+            return displayLines;
+        }
+
+        private void BuildDisplayMetadata(int width, out List<StoredMeshMessage> owners, out List<bool> starts)
+        {
+            owners = new List<StoredMeshMessage>();
+            starts = new List<bool>();
+            for (var index = 0; index < _lines.Count; index++)
+            {
+                var wrapped = new List<Tuple<string, bool>>();
+                AddWrappedLines(wrapped, _lines[index], width - 1);
+                for (var row = 0; row < wrapped.Count; row++)
+                {
+                    owners.Add(_messageItems[index]);
+                    starts.Add(row == 0 && _messageItems[index] != null);
+                }
+            }
+            for (var blank = 0; blank < TrailingBlankLineCount; blank++)
+            {
+                owners.Add(null);
+                starts.Add(false);
+            }
+        }
+        private void SelectLastEmoji()
+        {
+            var count = CountEmojis(BuildDisplayLines(Math.Max(2, Bounds.Width)));
+            _selectedEmojiIndex = count - 1;
+            _selectedMessageId = null;
+            SetNeedsDisplay();
+        }
+
+        private void MoveEmojiSelection(int direction)
+        {
+            var lines = BuildDisplayLines(Math.Max(2, Bounds.Width));
+            var positions = GetSelectablePositions(lines);
+            if (positions.Count == 0) return;
+            var current = GetCurrentSelectable(positions);
+            var currentIndex = current == null ? positions.Count - 1 : positions.IndexOf(current);
+            var targetIndex = Math.Max(0, Math.Min(positions.Count - 1, currentIndex + direction));
+            ApplySelection(positions[targetIndex], lines.Count);
+        }
+
+        private void MoveEmojiSelectionByRow(int direction)
+        {
+            var lines = BuildDisplayLines(Math.Max(2, Bounds.Width));
+            var positions = GetSelectablePositions(lines);
+            if (positions.Count == 0) return;
+            var current = GetCurrentSelectable(positions) ?? positions[positions.Count - 1];
+            var targetRows = positions.Where(item => direction < 0 ? item.Row < current.Row : item.Row > current.Row).Select(item => item.Row);
+            if (!targetRows.Any()) return;
+            var targetRow = direction < 0 ? targetRows.Max() : targetRows.Min();
+            var target = positions.Where(item => item.Row == targetRow).OrderBy(item => Math.Abs(item.Column - current.Column)).First();
+            ApplySelection(target, lines.Count);
+        }
+
+        private List<SelectablePosition> GetSelectablePositions(IList<Tuple<string, bool>> lines)
+        {
+            var result = GetEmojiPositions(lines).Select(item => new SelectablePosition { EmojiIndex = item.Index, Row = item.Row, Column = item.Column }).ToList();
+            List<StoredMeshMessage> owners;
+            List<bool> starts;
+            BuildDisplayMetadata(Math.Max(2, Bounds.Width), out owners, out starts);
+            for (var row = 0; row < starts.Count; row++)
+            {
+                if (starts[row]) result.Add(new SelectablePosition { MessageId = owners[row].Id, Row = row, Column = 0 });
+            }
+            return result.OrderBy(item => item.Row).ThenBy(item => item.Column).ToList();
+        }
+
+        private SelectablePosition GetCurrentSelectable(IEnumerable<SelectablePosition> positions)
+        {
+            if (_selectedMessageId.HasValue) return positions.FirstOrDefault(item => item.MessageId == _selectedMessageId);
+            if (_selectedEmojiIndex >= 0) return positions.FirstOrDefault(item => item.EmojiIndex == _selectedEmojiIndex);
+            return null;
+        }
+
+        private void ApplySelection(SelectablePosition target, int lineCount)
+        {
+            _selectedEmojiIndex = target.EmojiIndex.HasValue ? target.EmojiIndex.Value : -1;
+            _selectedMessageId = target.MessageId;
+            EnsureEmojiVisible(target.Row, lineCount);
+            SetNeedsDisplay();
+            NotifyScrollPositionChanged();
+            NotifySelectionChanged();
+        }
+
+        private void EnsureEmojiVisible(int row, int lineCount)
+        {
+            var height = Math.Max(1, Bounds.Height);
+            var maximumOffset = Math.Max(0, lineCount - height);
+            var start = Math.Max(0, lineCount - height - Math.Min(_scrollOffset, maximumOffset));
+            if (row < start) _scrollOffset = Math.Min(maximumOffset, lineCount - height - row);
+            else if (row >= start + height) _scrollOffset = Math.Max(0, lineCount - row - 1);
+        }
+        private static List<EmojiPosition> GetEmojiPositions(IList<Tuple<string, bool>> lines)
+        {
+            var result = new List<EmojiPosition>();
+            var index = 0;
+            for (var row = 0; row < lines.Count; row++)
+            {
+                var text = lines[row].Item1;
+                var position = 0;
+                while (position < text.Length)
+                {
+                    var start = text.IndexOf("[:", position, StringComparison.Ordinal);
+                    if (start < 0) break;
+                    var end = text.IndexOf(":]", start + 2, StringComparison.Ordinal);
+                    if (end < 0) break;
+                    var token = text.Substring(start, end - start + 2);
+                    result.Add(new EmojiPosition { Index = index++, Row = row, Column = GetTextDisplayWidth(text.Substring(0, start)), Width = token.Length, Token = token });
+                    position = end + 2;
+                }
+            }
+            return result;
+        }
+
+        private static int GetTextDisplayWidth(string text)
+        {
+            var width = 0;
+            var elements = StringInfo.GetTextElementEnumerator(text);
+            while (elements.MoveNext()) width += GetDisplayWidth((string)elements.Current);
+            return width;
+        }
+        private string GetSelectedEmojiToken()
+        {
+            if (_selectedEmojiIndex < 0) return null;
+            var current = 0;
+            foreach (var line in BuildDisplayLines(Math.Max(2, Bounds.Width)))
+            {
+                var position = 0;
+                while (position < line.Item1.Length)
+                {
+                    var start = line.Item1.IndexOf("[:", position, StringComparison.Ordinal);
+                    if (start < 0) break;
+                    var end = line.Item1.IndexOf(":]", start + 2, StringComparison.Ordinal);
+                    if (end < 0) break;
+                    if (current++ == _selectedEmojiIndex) return line.Item1.Substring(start, end - start + 2);
+                    position = end + 2;
+                }
+            }
+            return null;
+        }
+
+        private static int CountEmojis(IEnumerable<Tuple<string, bool>> lines)
+        {
+            var count = 0;
+            foreach (var line in lines)
+            {
+                var position = 0;
+                while (position < line.Item1.Length)
+                {
+                    var start = line.Item1.IndexOf("[:", position, StringComparison.Ordinal);
+                    if (start < 0) break;
+                    var end = line.Item1.IndexOf(":]", start + 2, StringComparison.Ordinal);
+                    if (end < 0) break;
+                    count++;
+                    position = end + 2;
+                }
+            }
+            return count;
+        }
+
+        private void NotifyScrollPositionChanged()
+        {
+            var handler = ScrollPositionChanged;
+            if (handler != null) handler();
+        }
+
+        private void NotifySelectionChanged()
+        {
+            var handler = SelectionChanged;
+            if (handler != null) handler();
+        }
+
+        private void DrawMessageLine(string text, Color messageColor, ref int emojiIndex, bool selectedTimestamp)
+        {
+            if (text.StartsWith(DaySeparatorPrefix, StringComparison.Ordinal))
+            {
+                DrawText(text.Substring(DaySeparatorPrefix.Length), DaySeparatorColor, false);
+                return;
+            }
+            var position = 0;
+            var timestampLength = GetTimestampLength(text);
+            if (selectedTimestamp && timestampLength > 0)
+            {
+                DrawText(text.Substring(0, timestampLength), messageColor, true);
+                position = timestampLength;
+            }
+            while (position < text.Length)
+            {
+                var emojiStart = text.IndexOf("[:", position, StringComparison.Ordinal);
+                if (emojiStart < 0) { DrawText(text.Substring(position), messageColor, false); break; }
+                if (emojiStart > position) DrawText(text.Substring(position, emojiStart - position), messageColor, false);
+                var emojiEnd = text.IndexOf(":]", emojiStart + 2, StringComparison.Ordinal);
+                if (emojiEnd < 0) { DrawText(text.Substring(emojiStart), messageColor, false); break; }
+                DrawText(text.Substring(emojiStart, emojiEnd - emojiStart + 2), EmojiTextColor, HasFocus && emojiIndex == _selectedEmojiIndex);
+                emojiIndex++;
+                position = emojiEnd + 2;
+            }
+        }
+
+
+        private static int GetTimestampLength(string text)
+        {
+            if (String.IsNullOrEmpty(text) || text[0] != '[') return 0;
+            var closingBracket = text.IndexOf(']');
+            return closingBracket < 0 ? 0 : closingBracket + 1;
+        }
+
+        private void DrawText(string text, Color foreground, bool selected)
+        {
+            if (String.IsNullOrEmpty(text)) return;
+            Application.Driver.SetAttribute(selected
+                ? Application.Driver.MakeAttribute(BackgroundColor, foreground)
+                : Application.Driver.MakeAttribute(foreground, BackgroundColor));
+            Application.Driver.AddStr(text);
+        }
+
+        private static void AddWrappedLines(ICollection<Tuple<string, bool>> target, Tuple<string, bool> line, int width)
+        {
+            if (line.Item1.StartsWith(DaySeparatorPrefix, StringComparison.Ordinal))
+            {
+                var label = line.Item1.Substring(DaySeparatorPrefix.Length);
+                var availableWidth = Math.Max(1, width);
+                const int rightPadding = 4;
+                var labelWidth = Math.Min(label.Length, Math.Max(1, availableWidth - rightPadding - 1));
+                var visibleLabel = label.Length > labelWidth ? label.Substring(label.Length - labelWidth) : label;
+                var rightDashCount = Math.Min(rightPadding, Math.Max(0, availableWidth - visibleLabel.Length - 1));
+                var dashCount = Math.Max(0, availableWidth - visibleLabel.Length - rightDashCount - 2);
+                var separator = new string('-', dashCount) + (dashCount > 0 ? " " : "") + visibleLabel + (rightDashCount > 0 ? " " : "") + new string('-', rightDashCount);
+                target.Add(Tuple.Create(DaySeparatorPrefix + separator, false));
+                return;
+            }
+            foreach (var part in line.Item1.Replace("\r", "").Split('\n'))
+            {
+                if (part.Length == 0) { target.Add(Tuple.Create("", line.Item2)); continue; }
+                var current = new StringBuilder();
+                var currentWidth = 0;
+                var position = 0;
+                while (position < part.Length)
+                {
+                    string element;
+                    if (part.IndexOf("[:", position, StringComparison.Ordinal) == position)
+                    {
+                        var tokenEnd = part.IndexOf(":]", position + 2, StringComparison.Ordinal);
+                        element = tokenEnd < 0 ? StringInfo.GetNextTextElement(part, position) : part.Substring(position, tokenEnd - position + 2);
+                    }
+                    else element = StringInfo.GetNextTextElement(part, position);
+                    var elementWidth = element.StartsWith("[:", StringComparison.Ordinal) && element.EndsWith(":]", StringComparison.Ordinal) ? element.Length : GetDisplayWidth(element);
+                    if (currentWidth > 0 && currentWidth + elementWidth > width)
+                    {
+                        target.Add(Tuple.Create(current.ToString(), line.Item2));
+                        current.Clear();
+                        currentWidth = 0;
+                    }
+                    current.Append(element);
+                    currentWidth += elementWidth;
+                    position += element.Length;
+                }
+                if (current.Length > 0) target.Add(Tuple.Create(current.ToString(), line.Item2));
+            }
+        }
+
+        private static string FormatDayOffset(DateTime date)
+        {
+            var days = Math.Max(0, (DateTime.Today - date.Date).Days);
+            var dayOffset = days == 0 ? "0" : "-" + days.ToString(CultureInfo.InvariantCulture);
+            return date.ToString("dddd dd. MMM", CultureInfo.InvariantCulture) + " / Day " + dayOffset;
+        }
+        private static int GetDisplayWidth(string textElement)
+        {
+            var hasVisibleCharacter = false;
+            for (var index = 0; index < textElement.Length; index++)
+            {
+                var codePoint = Char.ConvertToUtf32(textElement, index);
+                if (Char.IsHighSurrogate(textElement[index])) index++;
+                if (codePoint == 0x200D || (codePoint >= 0xFE00 && codePoint <= 0xFE0F) || (codePoint >= 0x1F3FB && codePoint <= 0x1F3FF)) continue;
+                var category = CharUnicodeInfo.GetUnicodeCategory(Char.ConvertFromUtf32(codePoint), 0);
+                if (category == UnicodeCategory.NonSpacingMark || category == UnicodeCategory.EnclosingMark || category == UnicodeCategory.Format) continue;
+                hasVisibleCharacter = true;
+                if ((codePoint >= 0x1100 && codePoint <= 0x115F) ||
+                    (codePoint >= 0x2E80 && codePoint <= 0xA4CF) ||
+                    (codePoint >= 0xAC00 && codePoint <= 0xD7A3) ||
+                    (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||
+                    (codePoint >= 0xFE10 && codePoint <= 0xFE6F) ||
+                    (codePoint >= 0xFF01 && codePoint <= 0xFF60) ||
+                    (codePoint >= 0x1F000 && codePoint <= 0x1FAFF)) return 2;
+            }
+            return hasVisibleCharacter ? 1 : 0;
+        }
+    }
+    internal sealed class MessageInputView : TextView
+    {
+
+        public override bool ProcessKey(KeyEvent keyEvent)
+        {
+            // Let the parent view process Tab so keyboard focus can leave the multiline editor.
+            if (keyEvent.Key == Key.Tab) return false;
+            return base.ProcessKey(keyEvent);
+        }
+    }
+
+    [XmlRoot("EmojiReplacements")]
+    public sealed class EmojiReplacementFile
+    {
+        [XmlElement("Emoji")]
+        public List<EmojiReplacementEntry> Items { get; set; } = new List<EmojiReplacementEntry>();
+    }
+
+    public sealed class EmojiReplacementEntry
+    {
+        [XmlAttribute("value")]
+        public string Value { get; set; }
+        [XmlAttribute("text")]
+        public string Text { get; set; }
+        [XmlAttribute("category")]
+        public string Category { get; set; }
+        [XmlAttribute("subCategory")]
+        public string SubCategory { get; set; }
+    }
+
+    [XmlRoot("emojiBlockText")]
+    public sealed class EmojiBlockFile
+    {
+        [XmlElement("glyph")]
+        public List<EmojiBlockEntry> Items { get; set; } = new List<EmojiBlockEntry>();
+    }
+
+    public sealed class EmojiBlockEntry
+    {
+        [XmlAttribute("character")]
+        public string Character { get; set; }
+        [XmlAttribute("name")]
+        public string Name { get; set; }
+        [XmlElement("text")]
+        public string Text { get; set; }
+    }
+    internal static partial class Program
+    {
+        private static MeshtasticClient _mesh;
+        private static MeshtasticMessageStore _store;
+        private static DatabaseWriteQueue _databaseWrites;
+        private static MeshtasticApplicationSettings _settings;
+        private static MeshtasticTelegramGatewayManager _telegramGateways;
+        private static readonly HttpClient HttpBotHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        private static readonly HttpClient AlertHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+        private static readonly object ComLogGate = new object();
+        private static readonly object TerminalGuiErrorLogGate = new object();
+        private const string ComLogFileName = "com.log";
+        private const string TerminalGuiErrorLogFileName = "terminal-gui-errors.log";
+        private const int MaximumDisplayedComLogBytes = 1024 * 1024;
+        private static readonly Dictionary<string, string> DefaultEmojiReplacements = new Dictionary<string, string>
+        {
+            { "\U0001F600", "[:grin:]" }, { "\U0001F603", "[:smile:]" }, { "\U0001F604", "[:smile:]" }, { "\U0001F60A", "[:smile:]" },
+            { "\U0001F602", "[:laugh:]" }, { "\U0001F923", "[:rofl:]" }, { "\U0001F622", "[:sad:]" }, { "\U0001F62D", "[:cry:]" },
+            { "\U0001F44D", "[:thumbs-up:]" }, { "\U0001F44E", "[:thumbs-down:]" }, { "\u2764\uFE0F", "[:heart:]" }, { "\u2764", "[:heart:]" },
+            { "\U0001F525", "[:fire:]" }, { "\U0001F680", "[:rocket:]" }, { "\u2705", "[:ok:]" }, { "\u274C", "[:no:]" },
+            { "\u26A0\uFE0F", "[:warning:]" }, { "\u26A0", "[:warning:]" }, { "\U0001F4CD", "[:location:]" }, { "\U0001F4E1", "[:antenna:]" }
+        };
+        private static readonly Dictionary<string, string> EmojiReplacements = new Dictionary<string, string>();
+        private static readonly List<EmojiReplacementEntry> EmojiPickerEntries = new List<EmojiReplacementEntry>();
+        private static readonly Dictionary<string, string> EmojiByReplacement = new Dictionary<string, string>();
+        private static readonly Dictionary<string, EmojiBlockEntry> EmojiBlocksFull = new Dictionary<string, EmojiBlockEntry>();
+        private static readonly Dictionary<string, EmojiBlockEntry> EmojiBlocksHalf = new Dictionary<string, EmojiBlockEntry>();
+        private static string _lastChatBotRequest = "No local bot has run yet.";
+        private static string _lastChatBotOutput = "No local bot has run yet.";
+        private static string _lastHttpBotRequest = "No HTTP bot has run yet.";
+        private static string _lastHttpBotOutput = "No HTTP bot has run yet.";
+        private static string _lastAlertHttpRequest = "No alert HTTP request has run yet.";
+        private static string _lastAlertHttpOutput = "No alert HTTP request has run yet.";
+        private static string _lastAlertProcessRequest = "No alert shell command has run yet.";
+        private static string _lastAlertProcessOutput = "No alert shell command has run yet.";
+        private static DateTime _lastAlertBeepUtc = DateTime.MinValue;
+        private static DateTime _nextRepeatedAlertCheckUtc = DateTime.MinValue;
+        private static int _lastKnownUnreadCount = -1;
+        private static bool _logoColorsSwapped;
+        private static bool _disconnectedStatusVisible = true;
+        private static bool _nodeStartedChat;
+        private static ListView _channelList;
+        private static ListView _directList;
+        private static ChatTranscriptView _messages;
+        private static FrameView _messagesFrame;
+        private static MessageInputView _input;
+        private static Label _header;
+        private static Label _latestTelemetry;
+        private static Label _nodeConnectionInfo;
+        private static Label _status;
+        private static Dialog _pleaseWait;
+        private static Label _pleaseWaitText;
+        private static ProgressBar _pleaseWaitProgress;
+        private static int _pleaseWaitPulseGeneration;
+        private static int _connectionAttemptId;
+        private static CancellationTokenSource _connectionAttemptCancellation;
+        private static int _shutdownStarted;
+        private static Task _shutdownTask;
+        private static Window _chatPage;
+        private static Window _nodesPage;
+        private static Window _mapPage;
+        private static Window _telemetryPage;
+        private static NodeMapView _nodeMap;
+        private static Label _mapInfo;
+        private static ListView _nodeList;
+        private static ListView _telemetryList;
+        private static Label _telemetryHeader;
+        private static Label _telemetryScrollInfo;
+        private static uint? _telemetryNodeFilter;
+        private static readonly List<StoredTelemetry> TelemetryItems = new List<StoredTelemetry>();
+        private static readonly List<StoredMeshNode> NodeItems = new List<StoredMeshNode>();
+        private static readonly List<ChatItem> ChannelChats = new List<ChatItem>();
+        private static readonly List<ChatItem> DirectChats = new List<ChatItem>();
+        private static NodeSortMode _nodeSort = NodeSortMode.Name;
+        private static bool _nodeSortAscending = true;
+        private static bool _refreshingChatLists;
+        private static bool _favoritesOnly;
+        private static bool _nodeRefreshPending;
+        private static int _deviceRefreshActive;
+        private static Label _nodeScrollInfo;
+        private static Button _sortButton;
+        private static Button _nodeSortDirectionButton;
+        private static TextField _nodeSearch;
+        private static FrameView _logoFrame;
+        private static FrameView _channelsFrame;
+        private static FrameView _directChatsFrame;
+        private static FrameView _nodeInfoFrame;
+        private static FrameView _inputFrame;
+        private static Label _messageCharacterCounter;
+        private const string MessageInputTitle = "New message [F5] emoji [F6]";
+        private static Label _logoText;
+        private static readonly List<string> LogoFiles = new List<string>();
+        private static int _logoIndex;
+        private static DateTime _nextLogoChangeUtc;
+        private static string[] _animatedLogoLines;
+        private static int _animatedLogoVerticalOffset;
+        private static int _animatedLogoHorizontalOffset;
+        private static int _animatedLogoVerticalDirection = 1;
+        private static int _animatedLogoHorizontalDirection = 1;
+        private static int _animatedLogoScheduleGeneration;
+        private static readonly List<ChatItem> Chats = new List<ChatItem>();
+        private static ChatItem _selected;
+        private static readonly List<FrameView> Frames = new List<FrameView>();
+        private static readonly List<Window> PageFrames = new List<Window>();
+        private static readonly List<Button> MainButtons = new List<Button>();
+        private static readonly List<MapOverlayPoint> TemporaryMeshCorePaths = new List<MapOverlayPoint>();
+        private static bool _temporaryMeshCorePathsVisible;
+        private static readonly List<MapOverlayFile> MapOverlayFiles = new List<MapOverlayFile>();
+        private static MenuBarItem _mapMenu;
+        private static ListView _mapOverlayOrderList;
+        private static string _lastMapPointFile = "";
+        private static string _lastMapPointColor = "Green";
+        private static string _lastMapPointShortName = "";
+        private static string _lastMapPointDescription = "";
+        private const string SharedMapPointPrefix = "///MAP+";
+        private const string SharedMapPointDeletionPrefix = "///MAP-";
+        private static bool _mapFollowGps;
+        private static int _deviceTimeSyncActive;
+        private static System.Windows.Forms.NotifyIcon _desktopNotificationIcon;
+
+        private static void Main(string[] args)
+        {
+            try { Console.InputEncoding = Encoding.UTF8; Console.OutputEncoding = Encoding.UTF8; } catch { }
+            NormalizeUnixTerminalType();
+            LoadEmojiReplacements();
+            LoadEmojiBlocks("emoji-blocks-full.xml", EmojiBlocksFull);
+            LoadEmojiBlocks("emoji-blocks-12line-full.xml", EmojiBlocksHalf);
+            _settings = MeshtasticSettingsStore.Load("meshtastic-settings.xml");
+            DeviceCommunicationLog.LoRaOnly = _settings.CommunicationLogLoRaOnly;
+            DeviceCommunicationLog.SetCapacity(_settings.CommunicationLogCapacity >= 1 && _settings.CommunicationLogCapacity <= 10000 ? _settings.CommunicationLogCapacity : 500);
+            MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+            _store = MeshtasticMessageStore.CreateSqlite(_settings.Connection.Protocol == MeshProtocol.MeshCore ? "meshcore-messages.db" : "meshtastic-messages.db");
+            _store.Initialize();
+            _databaseWrites = new DatabaseWriteQueue();
+            _lastKnownUnreadCount = _store.CountNewMessages(_settings.Alerts.SuppressMapMessageAlerts);
+            _mesh = new MeshtasticClient();
+            _mesh.Protocol = _settings.Connection.Protocol;
+            if (_settings.Connection.Protocol == MeshProtocol.MeshCore) _store.EnableDeferredMeshCoreIdentities();
+            _mesh.MeshCoreIdentityResolver = _store.GetOrCreateMeshCoreIdentity;
+            ApplyConnectionReconnectSettings();
+            SubscribeMeshEvents();
+            _store.MessageStored += message => { if (message.Kind == StoredMessageKind.Channel && message.ChannelIndex.HasValue && !(message.Direction == MessageDirection.Incoming && _mesh.Device.MyNode != null && message.FromNode == _mesh.Device.MyNode.MyNodeNum)) _telnetServers?.Publish(message.ChannelIndex.Value, serverSettings => FormatTelnetMessage(message, serverSettings), message.Direction == MessageDirection.Outgoing); };
+
+            Application.Init();
+            InitializeDesktopNotifications();
+            BuildUi();
+            Task.Run(async () => { try { await RestartTelnetServersAsync(); } catch { } });
+            // Start only after the first UI cycle so the waiting window can be drawn first.
+            Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(500), delegate(MainLoop loop) { if (Volatile.Read(ref _shutdownStarted) == 0) StartConnect(); return false; });
+            Application.Run(HandleTerminalGuiException);
+            WriteShutdownLog("UI loop returned");
+            RunShutdownStep("save settings", delegate { SaveMapViewState(); SaveNodeListState(); MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); });
+            RunShutdownStep("wait for shutdown worker", EnsureShutdownCompleted);
+            if (_mesh != null && Environment.OSVersion.Platform == PlatformID.Win32NT) RunShutdownStep("dispose mesh", _mesh.Dispose);
+            if (_databaseWrites != null) RunShutdownStep("dispose database writer", _databaseWrites.Dispose);
+            if (_store != null) RunShutdownStep("close database", _store.Dispose);
+            if (_desktopNotificationIcon != null) RunShutdownStep("dispose notification icon", delegate { _desktopNotificationIcon.Visible = false; _desktopNotificationIcon.Dispose(); });
+            RunShutdownStep("Terminal.Gui shutdown", Application.Shutdown);
+            RunShutdownStep("restore terminal state", RestoreUnixTerminalState);
+            WriteShutdownLog("cleanup finished; exiting process");
+            // Mono can keep native SerialPort/HttpClient helper threads alive for about a minute.
+            // All application data has already been flushed above, so end the Unix process explicitly.
+            if (Environment.OSVersion.Platform != PlatformID.Win32NT) Environment.Exit(0);
+        }
+
+        private static bool HandleTerminalGuiException(Exception error)
+        {
+            var recoverable = IsRecoverableCursesInputException(error);
+            try
+            {
+                lock (TerminalGuiErrorLogGate)
+                {
+                    File.AppendAllText(
+                        TerminalGuiErrorLogFileName,
+                        DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)
+                        + " | " + (recoverable ? "RECOVERED" : "FATAL")
+                        + " | Platform: " + Environment.OSVersion.Platform
+                        + " | TERM: " + (Environment.GetEnvironmentVariable("TERM") ?? "")
+                        + Environment.NewLine + error + Environment.NewLine + Environment.NewLine);
+                }
+            }
+            catch { }
+
+            return recoverable;
+        }
+
+        private static bool IsRecoverableCursesInputException(Exception error)
+        {
+            for (var current = error; current != null; current = current.InnerException)
+            {
+                var stackTrace = current.StackTrace ?? "";
+                if (stackTrace.IndexOf("Terminal.Gui.CursesDriver.ProcessInput", StringComparison.Ordinal) >= 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void InitializeDesktopNotifications()
+        {
+            if (Environment.OSVersion.Platform != PlatformID.Win32NT) return;
+            try
+            {
+                _desktopNotificationIcon = new System.Windows.Forms.NotifyIcon
+                {
+                    Icon = System.Drawing.SystemIcons.Information,
+                    Text = "MeshTerminal",
+                    Visible = true
+                };
+            }
+            catch { _desktopNotificationIcon = null; }
+        }
+
+        private static void ShowDesktopNotification(MeshMessage message)
+        {
+            var sender = message == null ? "Meshtastic" : DisplayNodeName(message.From);
+            ShowDesktopNotification("New message from " + sender, message == null ? "" : message.Text);
+        }
+
+        private static void ShowDesktopNotification(string title, string text)
+        {
+            if (_desktopNotificationIcon == null) return;
+            try
+            {
+                var body = text ?? "";
+                if (body.Length > 240) body = body.Substring(0, 237) + "...";
+                _desktopNotificationIcon.ShowBalloonTip(7000, title ?? "Meshtastic", body, System.Windows.Forms.ToolTipIcon.Info);
+            }
+            catch { }
+        }
+        private static void NormalizeUnixTerminalType()
+        {
+            if (Environment.OSVersion.Platform == PlatformID.Win32NT) return;
+            var term = Environment.GetEnvironmentVariable("TERM");
+            if (String.Equals(term, "xterm", StringComparison.OrdinalIgnoreCase) || String.Equals(term, "xterm-color", StringComparison.OrdinalIgnoreCase))
+                Environment.SetEnvironmentVariable("TERM", "xterm-256color");
+
+        }
+
+        private static void RestoreUnixTerminalState()
+        {
+            if (Environment.OSVersion.Platform == PlatformID.Win32NT) return;
+            try
+            {
+                var sttyPath = File.Exists("/bin/stty") ? "/bin/stty" : "/usr/bin/stty";
+                if (File.Exists(sttyPath))
+                {
+                    using (var stty = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = sttyPath,
+                        Arguments = "sane",
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    }))
+                    {
+                        if (stty != null && !stty.WaitForExit(1000))
+                        {
+                            try { stty.Kill(); } catch { }
+                        }
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                // Disable mouse/focus/paste modes, restore attributes, cursor and
+                // wrapping, leave the alternate screen and start a clean prompt line.
+                Console.Write("\x1b[0m\x1b[?25h\x1b[?7h\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\r\n");
+                Console.Out.Flush();
+            }
+            catch { }
+        }
+        private static void BuildUi()
+        {
+            var top = Application.Top;
+            LoadMapOverlayFiles();
+            RestoreNodeListState();
+            _mapMenu = new MenuBarItem("_Map", BuildMapMenuItems());
+            var menu = new MenuBar(new[]
+            {
+                new MenuBarItem("_Chats", new[] { new MenuItem("_Show chats", "", ShowChatPage), new MenuItem("_Refresh", "", RefreshChats), new MenuItem("_Send", "", SendCurrentMessage), new MenuItem("_Delete active chat", "", DeleteActiveChat) }),
+                new MenuBarItem("_Nodes", new[] { new MenuItem("_Show nodes", "", ShowNodesPage), new MenuItem("_Copy node list", "", CopyNodeList), new MenuItem("_Create node", "", CreateNode), new MenuItem("_Refresh from device", "", RefreshNodesFromDevice), new MenuItem("_Delete all nodes", "", DeleteAllNodes) }),
+                _mapMenu,
+                new MenuBarItem("_Telemetry", new[] { new MenuItem("_Show telemetry", "", ShowAllTelemetry), new MenuItem("Request _MeshCore telemetry", "", RequestMeshCoreTelemetry), new MenuItem("_Delete current node telemetry", "", DeleteCurrentNodeTelemetry), new MenuItem("_Delete all telemetry", "", DeleteAllTelemetry) }),
+                new MenuBarItem("Mes_htastic", new[] { new MenuItem("Import channel _link", "", PasteMeshtasticChannelLink, () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("Import _contact link", "", () => PasteSharedContactLink(MeshProtocol.Meshtastic), () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("Edit _channels", "", ShowChannelEditor, () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("_Device info", "", ShowOwnDeviceInfo, () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("Own contact _QR", "", ShowOwnMeshtasticContact, () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("Send _advert", "", SendNodeAnnouncement, () => _mesh.Protocol == MeshProtocol.Meshtastic) }),
+                new MenuBarItem("Mesh_Core", new[] { new MenuItem("Import contact _link", "", () => PasteSharedContactLink(MeshProtocol.MeshCore), () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("_Import channel link", "", PasteMeshCoreChannelLink, () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("Remove all device _contacts", "", RemoveAllMeshCoreDeviceContacts, () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("Edit _channels", "", ShowChannelEditor, () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("_Device info", "", ShowOwnDeviceInfo, () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("_Room Server login", "", ShowRoomLogin), new MenuItem("Send _advert", "", SendMeshCoreAdvert), new MenuItem("Own contact _QR", "", ShowOwnMeshCoreContact), new MenuItem("_Find repeaters", "", ShowMeshCoreRepeaterDiscovery), new MenuItem("Repeater _administration", "", ShowMeshCoreRepeaterAdmin) }),
+                new MenuBarItem("_Connection", new[] { new MenuItem("_Connect", "", StartConnect), new MenuItem("_Disconnect", "", Disconnect), new MenuItem("Connection _status", "", ShowConnectionStatus) }),
+                new MenuBarItem("_Settings", new[] { new MenuItem("_Connection settings", "", ShowSettings), new MenuItem("_Telemetry storage", "", ShowTelemetryStorageSettings), new MenuItem("_GPS position", "", ShowPositionSettings), new MenuItem("_Use device GPS", "", UseDeviceGps), new MenuItem("_Telegram Gateways", "", ShowTelegramGateways), new MenuItem("_Alerts", "", ShowAlertSettings), new MenuItem("_Appearance", "", ShowAppearanceSettings), new MenuItem("_Logo", "", ShowLogoSettings), new MenuItem("_Chat bots", "", ShowChatBots), new MenuItem("_HTTP bots", "", ShowHttpBots), new MenuItem("Telnet _Server", "", ShowTelnetServers) }),
+                new MenuBarItem("_Debug", new[] { new MenuItem("_Telegram gateway status", "", ShowTelegramGatewayStatus), new MenuItem("_Chat bot", "", ShowChatBotDebug), new MenuItem("_HTTP bot", "", ShowHttpBotDebug), new MenuItem("_Alert HTTP", "", ShowAlertHttpDebug), new MenuItem("Alert shell _command", "", ShowAlertProcessDebug), new MenuItem("Serial _COM log", "", ShowSerialComLog), new MenuItem("Device communication _log", "", ShowCommunicationLog), new MenuItem("_Delete current logo", "", DeleteCurrentLogo), new MenuItem("Telnet _Server status", "", ShowTelnetServerDebug) }),
+                new MenuBarItem("_Info", new[] { new MenuItem("_About", "", ShowInfo) }),
+                new MenuBarItem("_Quit", new[] { new MenuItem("_Exit", "", RequestQuit) })
+            }) { Key = Key.F10 };
+            top.Add(menu);
+            top.KeyPress += e =>
+            {
+                if (e.KeyEvent.Key == Key.F1)
+                {
+                    ShowChatPage();
+                    if ((_selected == null || _selected.Kind != ChatKind.Channel) && ChannelChats.Count > 0)
+                    {
+                        _refreshingChatLists = true;
+                        _channelList.SelectedItem = 0;
+                        _refreshingChatLists = false;
+                        _nodeStartedChat = false; _selected = ChannelChats[0];
+                        ShowSelectedChat();
+                    }
+                    _channelList.SetFocus();
+                    e.Handled = true;
+                }
+                else if (e.KeyEvent.Key == Key.F2)
+                {
+                    ShowChatPage();
+                    if ((_selected == null || _selected.Kind != ChatKind.Direct) && DirectChats.Count > 0)
+                    {
+                        _refreshingChatLists = true;
+                        _directList.SelectedItem = 0;
+                        _refreshingChatLists = false;
+                        _nodeStartedChat = false; _selected = DirectChats[0];
+                        ShowSelectedChat();
+                    }
+                    _directList.SetFocus();
+                    e.Handled = true;
+                }
+                else if (e.KeyEvent.Key == Key.F3)
+                {
+                    ShowNodesPage();
+                    _nodeList.SetFocus();
+                    e.Handled = true;
+                }
+                else if (e.KeyEvent.Key == Key.F4)
+                {
+                    ShowAllTelemetry();
+                    _telemetryList.SetFocus();
+                    e.Handled = true;
+                }
+                else if (e.KeyEvent.Key == Key.F5)
+                {
+                    ShowChatPage();
+                    _input.SetFocus();
+                    e.Handled = true;
+                }
+                else if (e.KeyEvent.Key == Key.F6)
+                {
+                    ShowEmojiPicker();
+                    e.Handled = true;
+                }
+                else if (e.KeyEvent.Key == Key.F10)
+                {
+                    menu.OpenMenu();
+                    e.Handled = true;
+                }
+                else if (e.KeyEvent.Key == Key.F9) { ShowMapPage(); e.Handled = true; }
+                else if (e.KeyEvent.Key == Key.F7)
+                {
+                    ShowPreviousLogo();
+                    e.Handled = true;
+                }
+                else if (e.KeyEvent.Key == Key.F8)
+                {
+                    ShowNextLogo();
+                    e.Handled = true;
+                }
+            };
+
+            _chatPage = new Window("Chat") { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1) };
+            UpdateChatPageTitle();
+            PageFrames.Add(_chatPage);
+            var sidebarOuterWidth = GetSidebarOuterWidth();
+            _logoFrame = new FrameView("") { X = 0, Y = 0, Width = sidebarOuterWidth, Height = GetLogoOuterHeight() };
+            _logoText = new Label("") { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
+            _logoFrame.Add(_logoText);
+            Frames.Add(_logoFrame);
+            _channelsFrame = new FrameView("Channels [F1]") { X = 0, Y = GetLogoOuterHeight(), Width = sidebarOuterWidth, Height = 10 };
+            Frames.Add(_channelsFrame);
+            _channelList = new ListView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
+            _channelList.SelectedItemChanged += delegate(ListViewItemEventArgs e) { if (!_refreshingChatLists && e.Item >= 0 && e.Item < ChannelChats.Count) { _nodeStartedChat = false; _selected = ChannelChats[e.Item]; ShowSelectedChat(); } };
+            _channelList.KeyPress += e =>
+            {
+                if (e.KeyEvent.Key == Key.CursorDown && ChannelChats.Count > 0 && _channelList.SelectedItem >= ChannelChats.Count - 1 && DirectChats.Count > 0)
+                {
+                    e.Handled = true;
+                    _refreshingChatLists = true;
+                    _directList.SelectedItem = 0;
+                    _refreshingChatLists = false;
+                    _nodeStartedChat = false; _selected = DirectChats[0];
+                    _directList.SetFocus();
+                    ShowSelectedChat();
+                    return;
+                }
+                if (e.KeyEvent.Key == Key.CursorUp && ChannelChats.Count > 0 && _channelList.SelectedItem <= 0 && DirectChats.Count > 0)
+                {
+                    e.Handled = true;
+                    _refreshingChatLists = true;
+                    _directList.SelectedItem = DirectChats.Count - 1;
+                    _refreshingChatLists = false;
+                    _nodeStartedChat = false; _selected = DirectChats[DirectChats.Count - 1];
+                    _directList.SetFocus();
+                    ShowSelectedChat();
+                    return;
+                }
+                if (e.KeyEvent.Key != Key.Enter) return;
+                e.Handled = true;
+                var index = _channelList.SelectedItem;
+                if (index < 0 || index >= ChannelChats.Count) return;
+                _nodeStartedChat = false; _selected = ChannelChats[index];
+                ActivateSelectedChat();
+            };
+            _channelList.Enter += delegate { if (_nodeStartedChat && !_refreshingChatLists && _channelList.SelectedItem >= 0 && _channelList.SelectedItem < ChannelChats.Count) { _nodeStartedChat = false; _selected = ChannelChats[_channelList.SelectedItem]; ShowSelectedChat(); } };
+            _channelsFrame.Add(_channelList);
+            _directChatsFrame = new FrameView("Direct chats [F2]") { X = 0, Y = Pos.Bottom(_channelsFrame), Width = sidebarOuterWidth, Height = Dim.Fill() };
+            Frames.Add(_directChatsFrame);
+            _directList = new ListView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
+            _directList.SelectedItemChanged += delegate(ListViewItemEventArgs e) { if (!_refreshingChatLists && e.Item >= 0 && e.Item < DirectChats.Count) { _nodeStartedChat = false; _selected = DirectChats[e.Item]; ShowSelectedChat(); } };
+            _directList.KeyPress += e =>
+            {
+                if (e.KeyEvent.Key == Key.CursorDown && DirectChats.Count > 0 && _directList.SelectedItem >= DirectChats.Count - 1 && ChannelChats.Count > 0)
+                {
+                    e.Handled = true;
+                    _refreshingChatLists = true;
+                    _channelList.SelectedItem = 0;
+                    _refreshingChatLists = false;
+                    _nodeStartedChat = false; _selected = ChannelChats[0];
+                    _channelList.SetFocus();
+                    ShowSelectedChat();
+                    return;
+                }
+                if (e.KeyEvent.Key == Key.CursorUp && DirectChats.Count > 0 && _directList.SelectedItem <= 0 && ChannelChats.Count > 0)
+                {
+                    e.Handled = true;
+                    _refreshingChatLists = true;
+                    _channelList.SelectedItem = ChannelChats.Count - 1;
+                    _refreshingChatLists = false;
+                    _nodeStartedChat = false; _selected = ChannelChats[ChannelChats.Count - 1];
+                    _channelList.SetFocus();
+                    ShowSelectedChat();
+                    return;
+                }
+                if (e.KeyEvent.Key != Key.Enter) return;
+                e.Handled = true;
+                var index = _directList.SelectedItem;
+                if (index < 0 || index >= DirectChats.Count) return;
+                _nodeStartedChat = false; _selected = DirectChats[index];
+                ActivateSelectedChat();
+            };
+            _directList.Enter += delegate { if (_nodeStartedChat && !_refreshingChatLists && _directList.SelectedItem >= 0 && _directList.SelectedItem < DirectChats.Count) { _nodeStartedChat = false; _selected = DirectChats[_directList.SelectedItem]; ShowSelectedChat(); } };
+            _directChatsFrame.Add(_directList);
+            _nodeInfoFrame = new FrameView("Chat / node info") { X = sidebarOuterWidth + 1, Y = 0, Width = Dim.Fill(), Height = 5 };
+            Frames.Add(_nodeInfoFrame);
+            _header = new Label("Select a chat") { X = 0, Y = 0, Width = Dim.Fill(14) };
+            _latestTelemetry = new Label("") { X = 0, Y = 1, Width = Dim.Fill() };
+            _nodeConnectionInfo = new Label("") { X = 0, Y = 2, Width = Dim.Fill() };
+            var chatInfo = new Button("Info") { X = Pos.AnchorEnd(8), Y = 0 };
+            MainButtons.Add(chatInfo);
+            chatInfo.Clicked += ShowCurrentChatNodeDetails;
+            _nodeInfoFrame.Add(_header, _latestTelemetry, _nodeConnectionInfo, chatInfo);
+            _messagesFrame = new FrameView("Messages") { X = sidebarOuterWidth + 1, Y = Pos.Bottom(_nodeInfoFrame), Width = Dim.Fill(), Height = Dim.Fill(4) };
+            Frames.Add(_messagesFrame);
+            _messages = new ChatTranscriptView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
+            _messages.EmojiResolver = ResolveEmojiReplacement;
+            _messages.EmojiActivated = ShowEmojiPreview;
+            _messages.EmojiUnavailable = ShowEmojiUnavailable;
+            _messages.MessageActivated = ShowMessageContent;
+            _messages.ScrollPositionChanged += UpdateMessageScrollPosition;
+            _messages.SelectionChanged += ShowCurrentLogo;
+            _messagesFrame.Add(_messages);
+            _inputFrame = new FrameView(MessageInputTitle) { X = sidebarOuterWidth + 1, Y = Pos.AnchorEnd(4), Width = Dim.Fill(10), Height = 4 };
+            Frames.Add(_inputFrame);
+            _input = new MessageInputView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), WordWrap = true };
+            _input.TextChanged += delegate { UpdateMessageCharacterCounter(); };
+            _input.KeyPress += e => { if (e.KeyEvent.Key == Key.F6) { ShowEmojiPicker(); e.Handled = true; } };
+            _inputFrame.Add(_input);
+            _messageCharacterCounter = new Label("") { X = Pos.Right(_inputFrame) - 1, Y = Pos.Top(_inputFrame), Width = 0 };
+            UpdateMessageCharacterCounter();
+            var send = new Button("Send") { X = Pos.AnchorEnd(9), Y = Pos.AnchorEnd(2) };
+            MainButtons.Add(send);
+            send.Clicked += SendCurrentMessage;
+            _chatPage.Add(_logoFrame, _channelsFrame, _directChatsFrame, _nodeInfoFrame, _messagesFrame, _inputFrame, _messageCharacterCounter, send);
+            top.Add(_chatPage);
+
+            _nodesPage = new Window("Nodes") { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1), Visible = false };
+            PageFrames.Add(_nodesPage);
+            var nodeListFrame = new FrameView("Known nodes [F3]") { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(3) };
+            Frames.Add(nodeListFrame);
+            _nodeList = new ListView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
+            _nodeList.SelectedItemChanged += delegate { UpdateNodeScrollInfo(); };
+            _nodeList.KeyPress += e => { if (e.KeyEvent.Key == Key.Enter) { ShowSelectedNodeDetails(); e.Handled = true; } };
+            _nodeList.OpenSelectedItem += delegate { ShowSelectedNodeDetails(); };
+            var favoriteFilter = new Button(_favoritesOnly ? "Favorites only: on" : "Favorites only: off") { X = 0, Y = Pos.AnchorEnd(2) };
+            MainButtons.Add(favoriteFilter);
+            favoriteFilter.Clicked += delegate { _favoritesOnly = !_favoritesOnly; favoriteFilter.Text = _favoritesOnly ? "Favorites only: on" : "Favorites only: off"; SaveNodeListState(); RefreshNodePage(); };
+            _sortButton = new Button("Sort: " + NodeSortLabel()) { X = Pos.Right(favoriteFilter) + 2, Y = Pos.AnchorEnd(2) };
+            MainButtons.Add(_sortButton);
+            _sortButton.Clicked += CycleNodeSort;
+            _nodeSortDirectionButton = new Button(_nodeSortAscending ? "Order: asc" : "Order: desc") { X = Pos.Right(_sortButton) + 2, Y = Pos.AnchorEnd(2) };
+            MainButtons.Add(_nodeSortDirectionButton);
+            _nodeSortDirectionButton.Clicked += ToggleNodeSortDirection;
+            var contactFilter = new Button(MeshCoreContactFilterLabel) { X = Pos.Right(_nodeSortDirectionButton) + 2, Y = Pos.AnchorEnd(2), Enabled = _mesh.Protocol == MeshProtocol.MeshCore };
+            _nodeContactFilterButton = contactFilter;
+            MainButtons.Add(contactFilter);
+            contactFilter.Clicked += () => { _meshCoreContactFilter = (_meshCoreContactFilter + 1) % 3; RefreshNodePage(true); };
+            var searchLabel = new Label("Search:") { X = Pos.Right(contactFilter) + 2, Y = Pos.AnchorEnd(2) };
+            _nodeSearch = new TextField(_settings.Nodes == null ? "" : _settings.Nodes.SearchText ?? "") { X = Pos.Right(searchLabel) + 1, Y = Pos.AnchorEnd(2), Width = Dim.Fill() };
+            _nodeSearch.TextChanged += delegate { SaveNodeListState(); RefreshNodePage(); };
+            _nodeScrollInfo = new Label("") { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill() };
+            nodeListFrame.Add(_nodeList);
+            _nodesPage.Add(nodeListFrame, favoriteFilter, _sortButton, _nodeSortDirectionButton, contactFilter, searchLabel, _nodeSearch, _nodeScrollInfo);
+            top.Add(_nodesPage);
+
+            _mapPage = new Window("Node map [F9] Help [H]") { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1), Visible = false };
+            PageFrames.Add(_mapPage);
+            _nodeMap = new NodeMapView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(3) };
+            _nodeMap.NodeActivated = ShowNodeDetails;
+            _nodeMap.ClusterActivated = ShowMapClusterNodes;
+            _nodeMap.OwnPositionMarkerRequested = SetOwnPositionMarker;
+            _nodeMap.PositionMarkerListRequested = ShowPositionMarkerList;
+            _nodeMap.PositionMarkerSelected = UpdatePositionMarkerInfo;
+            _nodeMap.PositionMarkerActivated = ShowPositionMarkerDetails;
+            _nodeMap.SelectionChanged = UpdateMapInfo;
+            _nodeMap.OverlaySelectionChanged = UpdateMapOverlayInfo;
+            _nodeMap.MapFeatureSelectionChanged = delegate(string description) { if (_mapInfo != null) _mapInfo.Text = description; };
+            _nodeMap.OverlayActivated = ShowMapOverlayDetails;
+            _nodeMap.NewOverlayPointRequested = CreateMapOverlayPoint;
+            _nodeMap.HelpRequested = ShowMapHelp;
+            _nodeMap.OverlayToggleRequested = ToggleMapOverlayByNumber;
+            Application.MainLoop.AddTimeout(TimeSpan.FromSeconds(30), loop => { if (Volatile.Read(ref _shutdownStarted) != 0) return false; if (_mapPage.Visible && _nodeMap.NodeAgeLimitEnabled) _nodeMap.SetNeedsDisplay(); return true; });
+            _nodeMap.BackgroundMapToggleRequested = ToggleBackgroundMapFromMap;
+            _nodeMap.PositionHistoryToggleRequested = TogglePositionHistoryFromMap;
+            _nodeMap.KnownNodesToggleRequested = delegate { ToggleKnownNodesFromMap(true); };
+            _nodeMap.ViewChanged = SaveMapViewState;
+            var mapInfoFrame = new FrameView("Selected Item") { X = 0, Y = Pos.AnchorEnd(3), Width = Dim.Fill(), Height = 3 };
+            Frames.Add(mapInfoFrame);
+            _mapInfo = new Label("No node selected") { X = 0, Y = 0, Width = Dim.Fill() };
+            mapInfoFrame.Add(_mapInfo);
+            _mapPage.Add(_nodeMap, mapInfoFrame);
+            top.Add(_mapPage);
+
+            _telemetryPage = new Window("Telemetry") { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1), Visible = false };
+            PageFrames.Add(_telemetryPage);
+            _telemetryHeader = new Label("") { X = 0, Y = 0, Width = Dim.Fill() };
+            var telemetryFrame = new FrameView("Stored telemetry [F4]") { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(3) };
+            Frames.Add(telemetryFrame);
+            _telemetryList = new ListView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
+            _telemetryList.OpenSelectedItem += delegate { ShowSelectedTelemetryDetails(); };
+            _telemetryList.SelectedItemChanged += delegate { UpdateTelemetryScrollInfo(); };
+            telemetryFrame.Add(_telemetryList);
+            var telemetryRefresh = new Button("Refresh") { X = 0, Y = Pos.AnchorEnd(2) };
+            MainButtons.Add(telemetryRefresh);
+            telemetryRefresh.Clicked += RefreshTelemetryPage;
+            var copyCsv = new Button("Copy CSV") { X = Pos.Right(telemetryRefresh) + 2, Y = Pos.AnchorEnd(2) };
+            MainButtons.Add(copyCsv);
+            copyCsv.Clicked += delegate { CopyTelemetryToClipboard(false); };
+            var copyExcel = new Button("Copy for spreadsheet") { X = Pos.Right(copyCsv) + 2, Y = Pos.AnchorEnd(2) };
+            MainButtons.Add(copyExcel);
+            copyExcel.Clicked += delegate { CopyTelemetryToClipboard(true); };
+            _telemetryScrollInfo = new Label("") { X = Pos.Right(copyExcel) + 2, Y = Pos.AnchorEnd(2), Width = Dim.Fill() };
+            _telemetryPage.Add(_telemetryHeader, telemetryFrame, telemetryRefresh, copyCsv, copyExcel, _telemetryScrollInfo);
+            top.Add(_telemetryPage);
+
+            _status = new Label("") { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill() };
+            top.Add(_status);
+            RefreshChats();
+            UpdateStatus();
+            ApplyAppearanceSettings();
+            ApplyLogoSettings();
+            InstallReadOnInteractionHandlers();
+            Application.MainLoop.AddTimeout(TimeSpan.FromSeconds(1), delegate(MainLoop loop) { if (Volatile.Read(ref _shutdownStarted) != 0) return false; UpdateStatus(); UpdateMapGpsPosition(); CheckRepeatingAlertBeep(); UpdateLogoBlink(); RotateLogoIfDue(); if (_nodeMap != null) _nodeMap.RefreshPositionMarkerInfo(); return true; });
+        }
+
+        private static void InstallReadOnInteractionHandlers()
+        {
+            Application.RootKeyEvent += delegate(KeyEvent keyEvent)
+            {
+                Ui(MarkSelectedChatMessagesRead);
+                return false;
+            };
+            Application.RootMouseEvent += delegate(MouseEvent mouseEvent)
+            {
+                var clicked = mouseEvent.Flags.HasFlag(MouseFlags.Button1Clicked)
+                    || mouseEvent.Flags.HasFlag(MouseFlags.Button1DoubleClicked)
+                    || mouseEvent.Flags.HasFlag(MouseFlags.Button2Clicked)
+                    || mouseEvent.Flags.HasFlag(MouseFlags.Button3Clicked);
+                if (clicked) Ui(MarkSelectedChatMessagesRead);
+            };
+        }
+
+        private static void MarkSelectedChatMessagesRead()
+        {
+            if (_chatPage == null || !_chatPage.Visible || _selected == null || _store == null) return;
+            var unreadCount = _selected.Kind == ChatKind.Channel
+                ? _store.CountNewChannelMessages((int)_selected.Id)
+                : _store.CountNewDirectMessages(_selected.Id);
+            if (unreadCount <= 0) return;
+            if (_selected.Kind == ChatKind.Channel) _store.MarkChannelMessagesRead((int)_selected.Id);
+            else _store.MarkDirectMessagesRead(_selected.Id);
+            NotifyAlertStateChanged(null);
+            RefreshChats();
+        }
+
+        private static void SubscribeMeshEvents()
+        {
+            _mesh.ConnectionStateChanged += delegate(object sender, ConnectionStateChangedEventArgs e) { if (e.State == ConnectionState.Disconnected) Interlocked.Exchange(ref _deviceTimeSyncActive, 0); Ui(UpdateStatus); };
+            _mesh.ConfirmSynchronizationRetryAsync = ConfirmSynchronizationRetryAsync;
+            _mesh.SynchronizationProgress += (sender, e) => Ui(() => { if (_connectionAttemptCancellation != null || _manualNodeRefreshCancellation != null) ShowConnectionProgress(e.Text); });
+            _mesh.CommunicationFrame += (sender, frame) => DeviceCommunicationLog.Add(frame);
+            _mesh.SerialTraffic += delegate(object sender, SerialTrafficEventArgs e) { WriteSerialComLog(e); };
+            _mesh.DeviceInfoUpdated += delegate { TrySynchronizeDeviceTime(); Ui(delegate { UpdateStatus(); UpdateChatPageTitle(); UpdateMapGpsPosition(); }); };
+            _mesh.NodeDiscovered += delegate(object sender, NodeEventArgs e) { if (Volatile.Read(ref _bufferNodeSynchronization) != 0) return; Save(delegate { _store.AddOrUpdateNode(e.Node); Ui(QueueNodePageRefresh); }, "node:" + e.Node.Number.ToString(CultureInfo.InvariantCulture)); };
+            _mesh.NodeUpdated += delegate(object sender, NodeEventArgs e) { if (Volatile.Read(ref _bufferNodeSynchronization) != 0) return; Save(delegate { _store.AddOrUpdateNode(e.Node); Ui(QueueNodePageRefresh); }, "node:" + e.Node.Number.ToString(CultureInfo.InvariantCulture)); };
+            _mesh.MeshCoreDeviceContactsChanged += delegate { Ui(() => { QueueNodePageRefresh(); }); };
+            _mesh.MeshCoreRoomsChanged += delegate { Ui(delegate { RefreshChats(); UpdateStatus(); }); };
+            _mesh.MessageReceived += delegate(object sender, MeshMessageEventArgs e)
+            {
+                var node = _mesh.Nodes.FirstOrDefault(n => n.Number == e.Message.From);
+                var ownEcho = _mesh.Device.MyNode != null && e.Message.From == _mesh.Device.MyNode.MyNodeNum;
+                var receivedPositionUtc = DateTime.UtcNow;
+                Save(delegate
+                {
+                    _store.AddIncoming(e.Message, node == null ? (double?)null : node.Latitude, node == null ? (double?)null : node.Longitude, !ownEcho);
+                    if (!ownEcho) ReceiveLocPosition(e.Message, receivedPositionUtc);
+                    if (!ownEcho) NotifyAlertStateChanged(e.Message);
+                    RefreshChatsUi();
+                });
+                if (!ownEcho) TryReceiveSharedMapPoint(e.Message);
+                if (!ownEcho) Task.Run(async delegate { await RunMatchingChatBotsAsync(e.Message); await RunMatchingHttpBotsAsync(e.Message); });
+            };
+            _mesh.MessageDeliveryChanged += delegate(object sender, MessageDeliveryEventArgs e)
+            {
+                Save(delegate { _store.UpdateDeliveryStatus(e.PacketId, e.State, e.Error == Meshtastic.Protobufs.Routing.Types.Error.None ? null : e.Error.ToString()); Ui(ShowSelectedChat); });
+            };
+            _mesh.TelemetryReceived += delegate(object sender, MeshTelemetryEventArgs e)
+            {
+                if (!_settings.StoreTelemetryData) return;
+                Save(delegate
+                {
+                    if (_settings.StoreTelemetryFavoritesOnly && !IsFavoriteNode(e.Telemetry.From)) return;
+                    _store.AddTelemetry(e.Telemetry);
+                    RefreshTelemetryViews(e.Telemetry.From);
+                });
+            };
+            _mesh.MeshCorePositionReceived += delegate(object sender, MeshCorePositionEventArgs e)
+            {
+                if (!_settings.StorePositionData) return;
+                Save(delegate
+                {
+                    if (_settings.StorePositionFavoritesOnly && !IsFavoriteNode(e.NodeNumber)) return;
+                    _store.AddPosition(e.NodeNumber, e.Position, e.ReceivedUtc);
+                    RefreshTelemetryViews(e.NodeNumber, true);
+                });
+            };
+            _mesh.PacketReceived += delegate(object sender, PacketEventArgs e)
+            {
+                if (!_settings.StorePositionData || e.Packet.PayloadVariantCase != Meshtastic.Protobufs.MeshPacket.PayloadVariantOneofCase.Decoded || e.Packet.Decoded.Portnum != Meshtastic.Protobufs.PortNum.PositionApp) return;
+                var receivedAtUtc = DateTime.UtcNow;
+                Save(delegate
+                {
+                    if (_settings.StorePositionFavoritesOnly && !IsFavoriteNode(e.Packet.From)) return;
+                    var position = Meshtastic.Protobufs.Position.Parser.ParseFrom(e.Packet.Decoded.Payload);
+                    _store.AddPosition(e.Packet.From, position, receivedAtUtc);
+                    RefreshTelemetryViews(e.Packet.From, true);
+                });
+            };
+        }
+
+        private static void TrySynchronizeDeviceTime()
+        {
+            if (_mesh == null || _mesh.Protocol != MeshProtocol.Meshtastic || !_mesh.IsConnected || _mesh.Device.MyNode == null) return;
+            if (Interlocked.CompareExchange(ref _deviceTimeSyncActive, 1, 0) != 0) return;
+            // DeviceInfoUpdated is raised as soon as MyNodeInfo arrives during the
+            // configuration stream. Complete this small write before the reader
+            // accepts subsequently replayed packets so firmware can attach rxTime.
+            try { _mesh.SetDeviceTimeAsync().GetAwaiter().GetResult(); }
+            catch { }
+        }
+
+        private static bool IsFavoriteNode(uint nodeNumber)
+        {
+            return _store.GetNodes(StoredNodeSort.NodeId).Any(node => node.NodeNumber == nodeNumber && node.IsFavorite);
+        }
+        private static void RefreshTelemetryViews(uint nodeNumber, bool positionChanged = false)
+        {
+            Ui(delegate
+            {
+                if (_telemetryPage != null && _telemetryPage.Visible) RefreshTelemetryPage();
+                if (positionChanged && _mapPage != null && _mapPage.Visible && _settings.Map != null && _settings.Map.PositionTrackVisible && _settings.Map.PositionTrackNodeNumber == nodeNumber) RefreshMapOverlays();
+                if (_chatPage != null && _chatPage.Visible && _selected != null && _selected.Kind == ChatKind.Direct && _selected.Id == nodeNumber) ShowSelectedChat();
+            });
+        }
+        private static void UpdateChatPageTitle()
+        {
+            if (_chatPage == null) return;
+            var localNode = _mesh == null ? null : _mesh.Device.LocalNode;
+            var nodeName = localNode == null ? null : (localNode.LongName ?? localNode.ShortName);
+            _chatPage.Title = String.IsNullOrWhiteSpace(nodeName) ? "Chat" : "Chat (" + nodeName + ")";
+        }
+
+        private static void ApplyConnectionReconnectSettings()
+        {
+            if (_mesh == null || _settings == null || _settings.Connection == null) return;
+            var seconds = Math.Max(1, Math.Min(86400, _settings.Connection.ReconnectIntervalSeconds));
+            _mesh.ReconnectDelay = TimeSpan.FromSeconds(seconds);
+            _mesh.MaximumConnectionAttempts = _settings.Connection.AutomaticReconnect ? 0 : 1;
+        }
+
+        private static string ConnectionTarget()
+        {
+            var c = _settings.Connection;
+            if (c.Transport == MeshtasticTransportType.Serial) return c.SerialPort;
+            if (c.Transport == MeshtasticTransportType.Tcp) return c.TcpHost + ":" + c.TcpPort;
+            return "Bluetooth: " + (String.IsNullOrWhiteSpace(c.BluetoothDeviceName) ? c.BluetoothDeviceId : c.BluetoothDeviceName);
+        }
+        private static void ShowConnectionProgress(string text) { ShowPleaseWait(ConnectionTarget() + "\n" + text); }
+        private static void StartConnect()
+        {
+            if (_settings.Connection.Protocol != _mesh.Protocol) { MessageBox.Query("Connection", "Restart the program to apply the selected protocol and load its chat history.", "OK"); return; }
+            if (_mesh.State != ConnectionState.Disconnected) { MessageBox.Query("Connection", "A connection is already active.", "OK"); return; }
+            ApplyConnectionReconnectSettings();
+            var attemptId = ++_connectionAttemptId;
+            var cancellation = new CancellationTokenSource();
+            _connectionAttemptCancellation = cancellation;
+            ShowConnectionProgress("Connecting to " + _mesh.Protocol + "...");
+            // Give Terminal.Gui a complete drawing cycle before the transport starts its
+            // potentially expensive initial node/configuration synchronization.
+            Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(150), delegate(MainLoop loop)
+            {
+                Task.Run(async delegate
+                {
+                    try
+                    {
+                        if (attemptId != _connectionAttemptId) return;
+                        var c = _settings.Connection;
+                        if (c.Transport == MeshtasticTransportType.Serial) await _mesh.ConnectSerialAsync(c.SerialPort, c.SerialBaudRate, c.SerialDtrEnable, c.SerialRtsEnable, cancellation.Token);
+                                                else if (c.Transport == MeshtasticTransportType.Bluetooth)
+                        {
+                            if (String.IsNullOrWhiteSpace(c.BluetoothDeviceName))
+                            {
+                                try
+                                {
+                                    using (var lookup = CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token))
+                                    {
+                                        lookup.CancelAfter(TimeSpan.FromSeconds(5));
+                                        var devices = await MeshtasticClient.GetBluetoothDevicesAsync(c.Protocol, lookup.Token);
+                                        var device = devices.FirstOrDefault(d => String.Equals(d.Id.Replace(":", ""), c.BluetoothDeviceId.Replace(":", ""), StringComparison.OrdinalIgnoreCase));
+                                        if (device != null) c.BluetoothDeviceName = device.Name;
+                                    }
+                                }
+                                catch (Exception) { cancellation.Token.ThrowIfCancellationRequested(); }
+                                Ui(() => ShowConnectionProgress("Connecting to " + _mesh.Protocol + "..."));
+                            }
+                            await _mesh.ConnectBluetoothAsync(c.BluetoothDeviceId, cancellation.Token);
+                        }
+                        else await _mesh.ConnectTcpAsync(c.TcpHost, c.TcpPort, cancellation.Token);
+                        if (attemptId != _connectionAttemptId) return;
+                        Ui(delegate { if (attemptId == _connectionAttemptId) ShowConnectionProgress("Loading nodes and device data..."); });
+                        // The client bounds configuration inactivity and total duration.
+                        // A second fixed UI deadline would cancel progressing BLE transfers.
+                        await ReceiveDeviceStateAsync(cancellation.Token);
+                        if (attemptId != _connectionAttemptId) return;
+                        Ui(() => ShowConnectionProgress("Starting message reception..."));
+                        await _mesh.ActivatePacketStreamingAsync(cancellation.Token);
+                        if (attemptId != _connectionAttemptId) return;
+                        Ui(() => ShowConnectionProgress("Starting Telegram gateways..."));
+                        await RestartTelegramGatewaysAsync();
+                        await RestartTelnetServersAsync();
+                        if (_connectionAttemptCancellation == cancellation) _connectionAttemptCancellation = null;
+                        cancellation.Dispose();
+                        Ui(delegate { if (attemptId == _connectionAttemptId) { HidePleaseWait(); RefreshChats(); } });
+                    }
+                    catch (Exception ex)
+                    {
+                        try { await _mesh.DisconnectAsync(); } catch { }
+                        if (_connectionAttemptCancellation == cancellation) _connectionAttemptCancellation = null;
+                        if (attemptId != _connectionAttemptId) return;
+                        Ui(delegate { if (attemptId == _connectionAttemptId) { HidePleaseWait(); MessageBox.ErrorQuery("Connection", ex.Message, "OK"); } });
+                    }
+                });
+                return false;
+            });
+        }
+
+        private static void ShowPleaseWait(string text, Action cancelAction = null)
+        {
+            if (_pleaseWait == null)
+            {
+                _pleaseWait = new Dialog("Please wait", 76, 9) { Modal = true };
+                _pleaseWaitText = new Label("") { X = 2, Y = 1, Height = 3, Width = Dim.Fill(4), TextAlignment = TextAlignment.Centered };
+                _pleaseWaitProgress = new ProgressBar { X = 2, Y = 4, Width = Dim.Fill(4), ProgressBarStyle = ProgressBarStyle.MarqueeBlocks };
+                var cancel = new Button("Cancel") { X = Pos.Center(), Y = 6 };
+                cancel.Clicked += () => { if (cancelAction != null) cancelAction(); else CancelConnectionAttempt(); };
+                _pleaseWait.Add(_pleaseWaitText, _pleaseWaitProgress, cancel);
+                // Do not call Application.Run(dialog) here. A nested Terminal.Gui run loop
+                // leaves a stale Unix event descriptor under Mono and can busy-spin at 100% CPU.
+                Application.Top.Add(_pleaseWait);
+                _pleaseWait.SetFocus();
+                SchedulePleaseWaitPulse(++_pleaseWaitPulseGeneration);
+            }
+            _pleaseWaitText.Text = text;
+            _pleaseWait.SetNeedsDisplay();
+        }
+        private static void SchedulePleaseWaitPulse(int generation)
+        {
+            Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(200), delegate(MainLoop loop)
+            {
+                if (generation != _pleaseWaitPulseGeneration || _pleaseWait == null || Volatile.Read(ref _shutdownStarted) != 0) return false;
+                _pleaseWaitProgress.Pulse();
+                _pleaseWaitProgress.SetNeedsDisplay();
+                SchedulePleaseWaitPulse(generation);
+                return false;
+            });
+        }
+        private static void UpdateNodeLoadingProgress()
+        {
+            if (_pleaseWait != null && _pleaseWait.Visible && _mesh.Protocol == MeshProtocol.Meshtastic) ShowConnectionProgress("Loading nodes: " + _mesh.Nodes.Count);
+        }
+        private static void QueueNodePageRefresh()
+        {
+            UpdateNodeLoadingProgress();
+            if (_nodeRefreshPending) return;
+            _nodeRefreshPending = true;
+            Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(250), delegate(MainLoop loop)
+            {
+                _nodeRefreshPending = false;
+                if (Volatile.Read(ref _shutdownStarted) != 0) return false;
+                RefreshNodePage(true);
+               
+                UpdateNodeLoadingProgress();
+                if (_mapPage != null && _mapPage.Visible && _nodeMap != null) _nodeMap.SetData(_store.GetNodes(StoredNodeSort.Name), _mesh.Device.Latitude, _mesh.Device.Longitude, true);
+                if (_chatPage != null && _chatPage.Visible && _selected != null && _selected.Kind == ChatKind.Direct) _nodeConnectionInfo.Text = BuildNodeConnectionLine(_selected);
+                return false;
+            });
+        }
+        private static void HidePleaseWait()
+        {
+            _pleaseWaitPulseGeneration++;
+            if (_pleaseWait == null) return;
+            var waitDialog = _pleaseWait;
+            _pleaseWait = null;
+            Application.Top.Remove(waitDialog);
+            _chatPage.SetFocus();
+            Application.Top.SetNeedsDisplay();
+        }
+
+        private static void CancelConnectionAttempt()
+        {
+            if (_mesh.Protocol == MeshProtocol.MeshCore && _mesh.IsSynchronizingMeshCoreNodes)
+            {
+                var choice = MessageBox.Query("Stop node synchronization", "Stop loading nodes and continue loading channels?", "Load channels", "Disconnect", "Back");
+                if (choice == 2) return;
+                if (choice == 0 && _mesh.SkipMeshCoreNodeSynchronization()) { ShowConnectionProgress("Stopping node transfer; loading channels..."); return; }
+            }
+            if (_manualNodeRefreshCancellation != null) { _manualNodeRefreshCancellation.Cancel(); return; }
+            _connectionAttemptId++;
+            var cancellation = _connectionAttemptCancellation;
+            _connectionAttemptCancellation = null;
+            if (cancellation != null) cancellation.Cancel();
+            HidePleaseWait();
+            DisconnectInBackground();
+        }
+
+        private static void Disconnect()
+        {
+            _connectionAttemptId++;
+            var cancellation = _connectionAttemptCancellation;
+            _connectionAttemptCancellation = null;
+            if (cancellation != null) cancellation.Cancel();
+            HidePleaseWait();
+            DisconnectInBackground();
+        }
+
+        private static void DisconnectInBackground()
+        {
+            Task.Run(async delegate
+            {
+                try
+                {
+                    if (_telegramGateways != null) await _telegramGateways.StopAsync();
+                    await _mesh.DisconnectAsync();
+                }
+                catch { }
+                Ui(UpdateStatus);
+            });
+        }
+
+        private static void ShowConnectionStatus()
+        {
+            var info = _mesh.ConnectionInfo;
+            var configured = _settings.Connection;
+            var text =
+                "State: " + _mesh.State + "\n" +
+                "Protocol: " + _mesh.Protocol + "\n" +
+                "Transport: " + (info.Transport ?? "-") + "\n" +
+                "Endpoint: " + (info.Endpoint ?? "-") + "\n" +
+                "Configured transport: " + configured.Transport + "\n" +
+                "Configured serial port: " + (configured.SerialPort ?? "-") + "\n" +
+                "Configured baud rate: " + configured.SerialBaudRate + "\n" +
+                "Configured DTR: " + (configured.SerialDtrEnable ? "enabled" : "disabled") + "\n" +
+                "Configured RTS: " + (configured.SerialRtsEnable ? "enabled" : "disabled") + "\n" +
+                "Configured TCP host: " + (configured.TcpHost ?? "-") + "\n" +
+                "Configured TCP port: " + configured.TcpPort + "\n" +
+                "Configured Bluetooth ID: " + (configured.BluetoothDeviceId ?? "-") + "\n\n" +
+                "Connected since: " + FormatConnectionTime(info.ConnectedSinceUtc) + "\n" +
+                "Current connection duration: " + info.CurrentConnectionDuration.ToString(@"d\.hh\:mm\:ss") + "\n" +
+                "Total connected duration: " + info.TotalConnectedDuration.ToString(@"d\.hh\:mm\:ss") + "\n" +
+                "Reconnects: " + info.ReconnectCount + "\n\n" +
+                "Sent frames: " + info.SentFrameCount + "\n" +
+                "Received frames: " + info.ReceivedFrameCount + "\n" +
+                "Last sent frame: " + FormatConnectionTime(info.LastSentUtc) + "\n" +
+                "Last received frame: " + FormatConnectionTime(info.LastReceivedUtc);
+
+            var dialog = new Dialog("Connection status", 78, 25);
+            var details = new TextView { X = 1, Y = 1, Width = Dim.Fill(2), Height = Dim.Fill(3), ReadOnly = true, WordWrap = true, Text = text };
+            var close = new Button("Close", true) { X = 1, Y = Pos.AnchorEnd(2) };
+            close.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(details, close);
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static string FormatConnectionTime(DateTime? value)
+        {
+            return value.HasValue ? value.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "-";
+        }
+
+        private static void RefreshChatsUi() { Ui(RefreshChats); }
+        private static void RefreshChats()
+        {
+            var current = _selected == null ? (ChatItem)null : _selected;
+            _refreshingChatLists = true;
+            Chats.Clear();
+            ChannelChats.Clear();
+            DirectChats.Clear();
+            foreach (var channel in ChannelChatCatalog.Build(_mesh.Channels, _store.GetChannelMessageStatistics()))
+                ChannelChats.Add(new ChatItem { Kind = ChatKind.Channel, Id = (uint)channel.Index, Name = channel.Name + (channel.OnDevice ? "" : " [stored]"), NewCount = channel.UnreadCount });
+            foreach (var stat in _store.GetDirectMessageStatistics().OrderBy(x => DisplayNodeName(x.NodeNumber))) DirectChats.Add(new ChatItem { Kind = ChatKind.Direct, Id = stat.NodeNumber, Name = DisplayNodeName(stat.NodeNumber), NewCount = stat.NewCount });
+            if (_mesh.Protocol == MeshProtocol.MeshCore)
+            {
+                foreach (var node in _mesh.Nodes.Where(node => (node.MeshCoreContactType == 1 || node.MeshCoreContactType == 3) && (_mesh.Device.MyNode == null || node.Number != _mesh.Device.MyNode.MyNodeNum)))
+                {
+                    var existing = DirectChats.FirstOrDefault(chat => chat.Id == node.Number);
+                    var name = node.MeshCoreContactType == 3 ? "[Room] " + node.LongName : node.LongName;
+                    if (existing != null) existing.Name = name;
+                }
+            }
+            Chats.AddRange(ChannelChats); Chats.AddRange(DirectChats);
+            _channelList.SetSource(ChannelChats);
+            _directList.SetSource(DirectChats);
+            if (current != null) _selected = Chats.FirstOrDefault(c => c.Kind == current.Kind && c.Id == current.Id) ?? (_nodeStartedChat ? current : null);
+            if (_selected == null && Chats.Count > 0) _selected = Chats[0];
+            if (_selected != null && _selected.Kind == ChatKind.Channel)
+            {
+                var index = ChannelChats.IndexOf(_selected);
+                if (index >= 0) _channelList.SelectedItem = index;
+            }
+            if (_selected != null && _selected.Kind == ChatKind.Direct)
+            {
+                var index = DirectChats.IndexOf(_selected);
+                if (index >= 0) _directList.SelectedItem = index;
+            }
+            _refreshingChatLists = false;
+            ShowSelectedChat();
+        }
+
+        private static void ShowSelectedChat()
+        {
+            ApplyChatListSelectionColors();
+            if (_selected == null) { _header.Text = "No chat selected"; _latestTelemetry.Text = ""; _nodeConnectionInfo.Text = ""; _messages.SetMessages(new StoredMeshMessage[0], FormatMessage); return; }
+            _header.Text = BuildChatHeader(_selected);
+            IList<StoredMeshMessage> entries;
+            if (_selected.Kind == ChatKind.Channel) entries = _store.GetChannelMessages((int)_selected.Id);
+            else entries = _store.GetDirectMessages(_selected.Id);
+            _messages.SetMessages(entries, FormatMessage);
+            _latestTelemetry.Text = BuildLatestTelemetryLine(_selected);
+            _nodeConnectionInfo.Text = BuildNodeConnectionLine(_selected);
+        }
+
+        private static void UpdateMessageScrollPosition()
+        {
+            if (_messagesFrame == null || _messages == null) return;
+            _messagesFrame.Title = _messages.MessageCount == 0 ? "Messages" : "Messages [" + _messages.FirstVisibleMessageNumber + "/" + _messages.MessageCount + "]";
+            _messagesFrame.SetNeedsDisplay();
+        }
+
+        private static string BuildLatestTelemetryLine(ChatItem chat)
+        {
+            if (chat.Kind != ChatKind.Direct) return "";
+            var telemetry = _store.GetTelemetry(chat.Id, 1).FirstOrDefault();
+            return telemetry == null ? "" : "Last telemetry: " + FormatTelemetrySummary(telemetry, false);
+        }
+
+        private static string BuildNodeConnectionLine(ChatItem chat)
+        {
+            if (chat.Kind != ChatKind.Direct) return "";
+            var roomNode = _mesh.Nodes.FirstOrDefault(node => node.Number == chat.Id && node.MeshCoreContactType == 3);
+            if (roomNode != null)
+            {
+                var room = _mesh.GetMeshCoreRoomSession(chat.Id);
+                return room == null ? "Room Server: not logged in | Rooms > Log in" : "Room Server: " + (room.CanPost ? "read/write access" : "read-only access");
+            }
+            var storedNode = _store.GetNodes(StoredNodeSort.Name).FirstOrDefault(node => node.NodeNumber == chat.Id);
+            var liveNode = _mesh.Nodes.FirstOrDefault(node => node.Number == chat.Id);
+            var hops = liveNode != null && liveNode.HopsAway.HasValue ? liveNode.HopsAway : (storedNode == null ? (uint?)null : storedNode.HopsAway);
+            var rssi = (liveNode?.LastRssi ?? storedNode?.LastRssi).HasValue ? (liveNode?.LastRssi ?? storedNode?.LastRssi).Value.ToString(CultureInfo.InvariantCulture) + " dBm" : "-";
+            var snr = (liveNode?.LastSnr ?? storedNode?.LastSnr).HasValue ? (liveNode?.LastSnr ?? storedNode?.LastSnr).Value.ToString("F1", CultureInfo.InvariantCulture) + " dB" : "-";
+            var battery = storedNode == null || !storedNode.BatteryLevel.HasValue ? "-" : storedNode.BatteryLevel.Value.ToString(CultureInfo.InvariantCulture) + "%";
+            return "Connection: Battery " + battery + " | Hops " + (hops.HasValue ? hops.Value.ToString(CultureInfo.InvariantCulture) : "-") + " | SNR " + snr + " | RSSI " + rssi;
+        }
+
+        private static void DeleteActiveChat()
+        {
+            if (_selected == null)
+            {
+                MessageBox.Query("Delete messages", "Please select a chat first.", "OK");
+                return;
+            }
+            var chatName = _selected.Kind == ChatKind.Channel ? "channel // " + _selected.Name : "direct chat with " + _selected.Name;
+            if (MessageBox.Query("Delete messages", "Delete all messages in the " + chatName + "?", "Delete", "Cancel") != 0) return;
+            if (_selected.Kind == ChatKind.Channel) _store.DeleteChannelMessages((int)_selected.Id);
+            else _store.DeleteDirectMessages(_selected.Id);
+            NotifyAlertStateChanged(null);
+            RefreshChats();
+        }
+
+        private static string FormatMessage(StoredMeshMessage m)
+        {
+            var who = m.Direction == MessageDirection.Outgoing ? "You" : (String.IsNullOrEmpty(m.SenderName) ? DisplayNodeName(m.FromNode.GetValueOrDefault()) : m.SenderName);
+            var delivery = m.Direction == MessageDirection.Outgoing && !String.IsNullOrEmpty(m.DeliveryStatus) ? " [" + m.DeliveryStatus + "]" : "";
+            var timePrefix = "[" + m.OccurredUtc.ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture) + "] ";
+            return timePrefix + who + delivery + ": " + ConvertEmojiForTerminal(m.Text ?? "").Replace("\r\n", "\n").Replace("\n", "\n" + new string(' ', timePrefix.Length));
+        }
+
+        private static string ConvertEmojiForTerminal(string text)
+        {
+            var result = new StringBuilder();
+            var elements = StringInfo.GetTextElementEnumerator(text);
+            while (elements.MoveNext())
+            {
+                var element = (string)elements.Current;
+                string replacement;
+                if (EmojiReplacements.TryGetValue(element, out replacement)) result.Append(replacement);
+                else if (ContainsEmoji(element)) result.Append("[:emoji:]");
+                else result.Append(element);
+            }
+            return result.ToString();
+        }
+
+        private static void LoadEmojiReplacements()
+        {
+            EmojiReplacements.Clear();
+            EmojiPickerEntries.Clear();
+            EmojiByReplacement.Clear();
+            var filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "emoji-replacements.xml");
+            try
+            {
+                if (File.Exists(filePath))
+                {
+                    var serializer = new XmlSerializer(typeof(EmojiReplacementFile));
+                    using (var stream = File.OpenRead(filePath))
+                    {
+                        var file = serializer.Deserialize(stream) as EmojiReplacementFile;
+                        if (file != null && file.Items != null)
+                        {
+                            foreach (var item in file.Items.Where(item => item != null && !String.IsNullOrEmpty(item.Value) && !String.IsNullOrEmpty(item.Text)))
+                            {
+                                EmojiReplacements[item.Value] = item.Text;
+                                if (!EmojiByReplacement.ContainsKey(item.Text)) EmojiByReplacement[item.Text] = item.Value;
+                                EmojiPickerEntries.Add(item);
+                            }
+                        }
+                    }
+                }
+            }
+            catch { EmojiReplacements.Clear(); }
+            if (EmojiReplacements.Count == 0)
+            {
+                foreach (var item in DefaultEmojiReplacements)
+                {
+                    EmojiReplacements[item.Key] = item.Value;
+                    if (!EmojiByReplacement.ContainsKey(item.Value)) EmojiByReplacement[item.Value] = item.Key;
+                    EmojiPickerEntries.Add(new EmojiReplacementEntry { Value = item.Key, Text = item.Value, Category = "Other" });
+                }
+            }
+        }
+
+        private static string ReplaceGraphicalSymbols(string text)
+        {
+            var result = new StringBuilder();
+            var elements = StringInfo.GetTextElementEnumerator(text ?? "");
+            while (elements.MoveNext())
+            {
+                var element = (string)elements.Current;
+                var category = CharUnicodeInfo.GetUnicodeCategory(element, 0);
+                var graphical = ContainsEmoji(element) || category == UnicodeCategory.OtherSymbol || category == UnicodeCategory.MathSymbol || category == UnicodeCategory.ModifierSymbol || Char.IsSurrogate(element[0]);
+                result.Append(graphical ? "?" : element);
+            }
+            return result.ToString();
+        }
+        private static bool ContainsEmoji(string textElement)
+        {
+            for (var index = 0; index < textElement.Length; index++)
+            {
+                var codePoint = Char.ConvertToUtf32(textElement, index);
+                if (Char.IsHighSurrogate(textElement[index])) index++;
+                if ((codePoint >= 0x1F000 && codePoint <= 0x1FAFF) || (codePoint >= 0x2600 && codePoint <= 0x27BF)) return true;
+            }
+            return false;
+        }
+
+        private static string BuildChatHeader(ChatItem chat)
+        {
+            if (chat.Kind == ChatKind.Channel) return "// " + chat.Name;
+            var node = _store.GetNodes(StoredNodeSort.Name).FirstOrDefault(n => n.NodeNumber == chat.Id);
+            if (node == null) return "@ " + chat.Name;
+            var distance = MeshtasticClient.GetDistanceMeters(_mesh.Device.Latitude, _mesh.Device.Longitude, node.Latitude, node.Longitude);
+            var bearing = MeshtasticClient.GetInitialBearingDegrees(_mesh.Device.Latitude, _mesh.Device.Longitude, node.Latitude, node.Longitude);
+            var distanceText = distance.HasValue ? (distance.Value < 1000 ? Math.Round(distance.Value) + " m" : (distance.Value / 1000d).ToString("F1", CultureInfo.InvariantCulture) + " km") : "-";
+            var direction = bearing.HasValue ? MeshtasticClient.GetCompassDirection(bearing.Value) : "-";
+            var directionText = bearing.HasValue ? Math.Round(bearing.Value) + "° " + direction : "-";
+            return "@ " + chat.Name + " | " + (String.IsNullOrWhiteSpace(node.ShortName) ? "-" : node.ShortName) + " | " + distanceText + " " + directionText;
+        }
+
+        private static void ShowEmojiPicker()
+        {
+            if (_input == null) return;
+            var terminalWidth = Math.Max(40, Application.Driver.Cols);
+            var terminalHeight = Math.Max(16, Application.Driver.Rows);
+            var useFullPreview = terminalWidth >= 106 && terminalHeight >= 34 && EmojiBlocksFull.Count > 0;
+            var previewColumns = useFullPreview ? 48 : 24;
+            var previewRows = useFullPreview ? 24 : 12;
+            var previewBlocks = useFullPreview ? EmojiBlocksFull : EmojiBlocksHalf;
+            var dialogWidth = Math.Min(terminalWidth - 2, useFullPreview ? 112 : 86);
+            var dialogHeight = Math.Min(terminalHeight - 2, useFullPreview ? 34 : 21);
+            var dialog = new Dialog("Emoji picker", dialogWidth, dialogHeight);
+            var categories = new[] { "All" }.Concat(EmojiPickerEntries.Select(entry => String.IsNullOrWhiteSpace(entry.Category) ? "Other" : entry.Category).Distinct().OrderBy(category => category)).ToList();
+            var selectedCategory = "All";
+            var visibleEntries = new List<EmojiReplacementEntry>();
+            var showCategories = dialogWidth >= 80;
+            var categoryWidth = showCategories ? 20 : 0;
+            var pickerX = showCategories ? categoryWidth + 3 : 1;
+            var previewWidth = previewColumns + 2;
+            var previewX = dialogWidth - previewWidth - 4;
+            var categoryLabel = new Label("Category") { X = 1, Y = 1, Visible = showCategories };
+            var categoryList = new ListView(categories) { X = 1, Y = 2, Width = categoryWidth, Height = Dim.Fill(4), Visible = showCategories };
+            var searchLabel = new Label("Search") { X = pickerX, Y = 1 };
+            var search = new TextField("") { X = pickerX + 8, Y = 1, Width = previewX - pickerX - 9 };
+            var list = new ListView { X = pickerX, Y = 3, Width = previewX - pickerX - 1, Height = Dim.Fill(5) };
+            var previewFrame = new FrameView("Preview " + previewColumns + "x" + previewRows) { X = previewX, Y = 2, Width = previewWidth + 2, Height = previewRows + 2 };
+            var preview = new Label("") { X = 0, Y = 0, Width = previewColumns, Height = previewRows };
+            var description = new Label("") { X = previewX, Y = Pos.Bottom(previewFrame), Width = previewWidth + 2, Height = 2 };
+            previewFrame.Add(preview);
+            Action updatePreview = delegate
+            {
+                if (list.SelectedItem < 0 || list.SelectedItem >= visibleEntries.Count)
+                {
+                    preview.Text = "";
+                    description.Text = "";
+                    return;
+                }
+                EmojiBlockEntry block;
+                if (previewBlocks.TryGetValue(visibleEntries[list.SelectedItem].Value, out block))
+                {
+                    preview.Text = block.Text;
+                    description.Text = block.Name ?? "";
+                }
+                else
+                {
+                    preview.Text = "No ASCII preview";
+                    description.Text = "";
+                }
+            };
+            Action refresh = delegate
+            {
+                var query = search.Text == null ? "" : search.Text.ToString().Trim();
+                visibleEntries.Clear();
+                visibleEntries.AddRange(EmojiPickerEntries.Where(entry =>
+                    (selectedCategory == "All" || String.Equals(String.IsNullOrWhiteSpace(entry.Category) ? "Other" : entry.Category, selectedCategory, StringComparison.Ordinal)) &&
+                    (query.Length == 0 || (entry.Text ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 || (entry.Category ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 || (entry.SubCategory ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0))
+                    .OrderBy(entry => entry.Text));
+                list.SetSource(visibleEntries.Select(entry => entry.Text).ToList());
+                if (visibleEntries.Count > 0) list.SelectedItem = 0;
+                updatePreview();
+            };
+            categoryList.SelectedItemChanged += delegate(ListViewItemEventArgs e)
+            {
+                if (e.Item < 0 || e.Item >= categories.Count) return;
+                selectedCategory = categories[e.Item];
+                refresh();
+            };
+            search.TextChanged += delegate { refresh(); };
+            list.SelectedItemChanged += delegate { updatePreview(); };
+            refresh();
+            Action insert = delegate
+            {
+                if (list.SelectedItem < 0 || list.SelectedItem >= visibleEntries.Count) return;
+                InsertEmojiIntoMessage(visibleEntries[list.SelectedItem].Value);
+                Application.RequestStop();
+            };
+            list.KeyPress += e => { if (e.KeyEvent.Key == Key.Enter) { insert(); e.Handled = true; } };
+            list.OpenSelectedItem += delegate { insert(); };
+            var insertButton = new Button("Insert", true);
+            insertButton.Clicked += delegate { insert(); };
+            var cancel = new Button("Cancel");
+            cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(categoryLabel, categoryList, searchLabel, search, list, previewFrame, description);
+            dialog.AddButton(insertButton);
+            dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+            _input.SetFocus();
+        }
+
+        private static string ResolveEmojiReplacement(string replacement)
+        {
+            string emoji;
+            return EmojiByReplacement.TryGetValue(replacement, out emoji) ? emoji : null;
+        }
+
+        private static void ShowMessageDetails(StoredMeshMessage message)
+        {
+            if (message == null) return;
+            var details = new StringBuilder();
+            details.AppendLine("Message:");
+            details.AppendLine(message.Text ?? "");
+            details.AppendLine();
+            details.AppendLine("Metadata:");
+            details.AppendLine("ID: " + message.Id);
+            details.AppendLine("Occurred (local): " + message.OccurredUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+            details.AppendLine("Occurred (UTC): " + message.OccurredUtc.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'", CultureInfo.InvariantCulture));
+            details.AppendLine("Created (UTC): " + message.CreatedUtc.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'", CultureInfo.InvariantCulture));
+            details.AppendLine("Direction: " + message.Direction);
+            details.AppendLine("Kind: " + message.Kind);
+            if (message.IsMeshCoreMessage) details.AppendLine("Received hops: " + (message.MeshCoreHops.HasValue ? message.MeshCoreHops.Value.ToString(CultureInfo.InvariantCulture) : "not available (fixed route or no path information)"));
+            details.AppendLine("Packet ID: " + (message.PacketId.HasValue ? message.PacketId.Value.ToString(CultureInfo.InvariantCulture) : "-"));
+            details.AppendLine("From node: " + (message.FromNode.HasValue ? "!" + message.FromNode.Value.ToString("x8") : "-"));
+            details.AppendLine("To node: " + (message.ToNode.HasValue ? "!" + message.ToNode.Value.ToString("x8") : "-"));
+            details.AppendLine("Channel index: " + (message.ChannelIndex.HasValue ? message.ChannelIndex.Value.ToString(CultureInfo.InvariantCulture) : "-"));
+            details.AppendLine("Channel name: " + (String.IsNullOrEmpty(message.ChannelName) ? "-" : message.ChannelName));
+            details.AppendLine("RSSI: " + (message.ReceivedRssi.HasValue ? message.ReceivedRssi.Value.ToString(CultureInfo.InvariantCulture) + " dBm" : "not available"));
+            details.AppendLine("SNR: " + (message.ReceivedSnr.HasValue ? message.ReceivedSnr.Value.ToString("F1", CultureInfo.InvariantCulture) + " dB" : "not available"));
+            details.AppendLine("Delivery status: " + (String.IsNullOrEmpty(message.DeliveryStatus) ? "-" : message.DeliveryStatus));
+            details.AppendLine("Delivery error: " + (String.IsNullOrEmpty(message.DeliveryError) ? "-" : message.DeliveryError));
+            details.AppendLine("Unread: " + message.IsNew);
+            details.AppendLine("Latitude: " + (message.Latitude.HasValue ? message.Latitude.Value.ToString("F6", CultureInfo.InvariantCulture) : "-"));
+            details.AppendLine("Longitude: " + (message.Longitude.HasValue ? message.Longitude.Value.ToString("F6", CultureInfo.InvariantCulture) : "-"));
+            details.AppendLine("Raw metadata: " + (String.IsNullOrEmpty(message.RawMetadata) ? "-" : message.RawMetadata));
+
+            var width = Math.Min(Math.Max(54, Application.Driver.Cols - 4), 100);
+            var height = Math.Min(Math.Max(18, Application.Driver.Rows - 4), 32);
+            var dialog = new Dialog("Message details", width, height);
+            var view = new TextView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(4), ReadOnly = true, WordWrap = true, CanFocus = true, Text = details.ToString() };
+            var senderAction = 0;
+            var senderDetails = new Button("Sender details") { X = 0, Y = 0, Enabled = message.FromNode.HasValue };
+            var senderChat = new Button("Direct chat") { X = Pos.Right(senderDetails) + 2, Y = 0, Enabled = message.FromNode.HasValue };
+            var showOnMap = new Button("Show on map") { X = Pos.Right(senderChat) + 2, Y = 0, Enabled = message.FromNode.HasValue };
+            var senderButtons = new View { X = Pos.Center(), Y = Pos.AnchorEnd(3), Width = senderDetails.Frame.Width + 2 + senderChat.Frame.Width + 2 + showOnMap.Frame.Width, Height = 1, CanFocus = true };
+            senderButtons.Add(senderDetails, senderChat, showOnMap);
+            senderDetails.Clicked += delegate { senderAction = 1; Application.RequestStop(); };
+            senderChat.Clicked += delegate { senderAction = 2; Application.RequestStop(); };
+            showOnMap.Clicked += delegate { senderAction = 3; Application.RequestStop(); };
+            var deleted = false;
+            var copy = new Button("Copy message");
+            copy.Clicked += delegate
+            {
+                CopyTextWithFallback(message.Text ?? "", "Message copied.");
+            };
+            var copyChat = new Button("Copy chat");
+            copyChat.Clicked += delegate { CopyActiveChatToClipboard(); };
+            var delete = new Button("Delete");
+            delete.Clicked += delegate
+            {
+                if (MessageBox.Query("Delete message", "Delete this single message?", "Delete", "Cancel") != 0) return;
+                _store.Delete(message.Id);
+                deleted = true;
+                Application.RequestStop();
+            };
+            var close = new Button("Close", true);
+            close.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(view, senderButtons);
+            dialog.AddButton(copy);
+            dialog.AddButton(copyChat);
+            dialog.AddButton(delete);
+            dialog.AddButton(close);
+            Application.Run(dialog, HandleTerminalGuiException);
+            if (deleted)
+            {
+                NotifyAlertStateChanged(null);
+                ShowSelectedChat();
+            }
+            if (_messages != null) _messages.SetFocus();
+            if (senderAction != 0 && message.FromNode.HasValue)
+            {
+                var number = message.FromNode.Value;
+                var sender = _store.GetNodes(StoredNodeSort.Name).FirstOrDefault(node => node.NodeNumber == number);
+                if (senderAction == 1)
+                {
+                    if (sender == null && _mesh.Protocol == MeshProtocol.MeshCore && message.Kind == StoredMessageKind.Channel && !String.IsNullOrWhiteSpace(message.SenderName))
+                    {
+                        var candidates = _store.GetNodes(StoredNodeSort.Name).Where(n =>
+                            n.NodeId != null && n.NodeId.Length == 64 && n.NodeId.All(Uri.IsHexDigit) &&
+                            String.Equals(n.LongName, message.SenderName, StringComparison.Ordinal)).ToList();
+                        if (candidates.Count == 1) sender = candidates[0];
+                        else if (candidates.Count > 1)
+                        {
+                            var chooser = new Dialog("Select sender: " + message.SenderName, 90, 17);
+                            var choices = new ListView(candidates.Select(n => n.LongName + " | " + MeshCoreNodeType(n) + " | " + n.NodeId).ToList())
+                            { X = 1, Y = 1, Width = Dim.Fill(2), Height = Dim.Fill(3) };
+                            var open = new Button("Open");
+                            Action choose = () => { if (choices.SelectedItem >= 0 && choices.SelectedItem < candidates.Count) { sender = candidates[choices.SelectedItem]; Application.RequestStop(); } };
+                            open.Clicked += choose; choices.OpenSelectedItem += args => choose();
+                            var cancel = new Button("Cancel"); cancel.Clicked += () => Application.RequestStop();
+                            chooser.Add(choices); chooser.AddButton(open); chooser.AddButton(cancel);
+                            Application.Run(chooser, HandleTerminalGuiException);
+                            if (sender == null) return;
+                        }
+                    }
+                    if (sender != null) ShowNodeDetails(sender);
+                    else MessageBox.Query("Sender details", "Node: !" + number.ToString("x8") + "\nNo stored node details are available for this sender.", "OK");
+                }
+                else if (senderAction == 2)
+                {
+                    _selected = new ChatItem { Kind = ChatKind.Direct, Id = number, Name = sender == null || String.IsNullOrWhiteSpace(sender.LongName) ? "!" + number.ToString("x8") : sender.LongName };
+                    ShowChatPage(); ShowSelectedChat(); _input.SetFocus();
+                }
+                else
+                {
+                    ShowMapPage();
+                    if (!_nodeMap.CenterOnNode(number)) ShowBriefMapPopup("No visible map position is available for this node.");
+                    else _nodeMap.SetFocus();
+                }
+            }
+        }
+        private static void CopyMapToClipboard()
+        {
+            if (_nodeMap == null) return;
+            CopyTextWithFallback(_nodeMap.GetMapText(), "Current map copied.");
+        }
+
+        private static void CopyTextWithFallback(string text, string successMessage, string title = "Clipboard")
+        {
+            text = text ?? "";
+            if (Clipboard.TrySetClipboardData(text)) { MessageBox.Query(title, successMessage, "OK"); return; }
+            var fileName = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "clipboard.txt");
+            try { File.WriteAllText(fileName, text, new UTF8Encoding(false)); MessageBox.Query(title, "The clipboard is not available. The information was written to:\n" + fileName, "OK"); }
+            catch (Exception ex) { MessageBox.ErrorQuery(title, "The clipboard is not available and clipboard.txt could not be written:\n" + ex.Message, "OK"); }
+        }
+        private static void CopyActiveChatToClipboard()
+        {
+            if (_selected == null)
+            {
+                MessageBox.Query("Clipboard", "Please select a chat first.", "OK");
+                return;
+            }
+
+            IList<StoredMeshMessage> entries = _selected.Kind == ChatKind.Channel
+                ? _store.GetChannelMessages((int)_selected.Id)
+                : _store.GetDirectMessages(_selected.Id);
+            var transcript = String.Join(Environment.NewLine, entries.Select(FormatMessageForClipboard));
+            CopyTextWithFallback(transcript, entries.Count == 0 ? "The empty chat was copied." : "Chat history copied.");
+        }
+
+        private static string FormatMessageForClipboard(StoredMeshMessage message)
+        {
+            var who = message.Direction == MessageDirection.Outgoing ? "You" : (String.IsNullOrEmpty(message.SenderName) ? DisplayNodeName(message.FromNode.GetValueOrDefault()) : message.SenderName);
+            var delivery = message.Direction == MessageDirection.Outgoing && !String.IsNullOrEmpty(message.DeliveryStatus) ? " [" + message.DeliveryStatus + "]" : "";
+            var prefix = "[" + message.OccurredUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) + "] " + who + delivery + ": ";
+            return prefix + (message.Text ?? "").Replace("\r\n", "\n").Replace("\r", "\n").Replace("\n", Environment.NewLine + new string(' ', prefix.Length));
+        }
+
+        private static void ShowEmojiUnavailable(string emoji)
+        {
+            MessageBox.Query("Emoji", "No ASCII representation is available for " + (String.IsNullOrEmpty(emoji) ? "this emoji." : emoji + "."), "OK");
+        }
+        private static void ShowEmojiPreview(string emoji)
+        {
+            if (String.IsNullOrEmpty(emoji)) { ShowEmojiUnavailable(emoji); return; }
+            var terminalWidth = Math.Max(32, Application.Driver.Cols);
+            var terminalHeight = Math.Max(18, Application.Driver.Rows);
+            var useFullPreview = terminalWidth >= 56 && terminalHeight >= 34 && EmojiBlocksFull.ContainsKey(emoji);
+            var blocks = useFullPreview ? EmojiBlocksFull : EmojiBlocksHalf;
+            var columns = useFullPreview ? 48 : 24;
+            var rows = useFullPreview ? 24 : 12;
+            EmojiBlockEntry block;
+            if (!blocks.TryGetValue(emoji, out block))
+            {
+                if (!EmojiBlocksFull.TryGetValue(emoji, out block) && !EmojiBlocksHalf.TryGetValue(emoji, out block))
+                {
+                    ShowEmojiUnavailable(emoji);
+                    return;
+                }
+            }
+            var dialogWidth = Math.Min(terminalWidth - 2, columns + 6);
+            var dialogHeight = Math.Min(terminalHeight - 2, rows + 8);
+            var dialog = new Dialog("", dialogWidth, dialogHeight);
+            var frame = new FrameView("") { X = 1, Y = 1, Width = columns + 2, Height = rows + 2 };
+            var preview = new Label(block.Text ?? "") { X = 0, Y = 0, Width = columns, Height = rows };
+            var description = new Label(block.Name ?? "") { X = 1, Y = Pos.Bottom(frame), Width = Dim.Fill(1), Height = 2, TextAlignment = TextAlignment.Centered };
+            frame.Add(preview);
+            var close = new Button("Close", true);
+            close.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(frame, description);
+            dialog.AddButton(close);
+            Application.Run(dialog, HandleTerminalGuiException);
+            if (_messages != null) _messages.SetFocus();
+        }
+        private static void LoadEmojiBlocks(string fileName, Dictionary<string, EmojiBlockEntry> target)
+        {
+            target.Clear();
+            var filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, fileName);
+            if (!File.Exists(filePath)) return;
+            try
+            {
+                var serializer = new XmlSerializer(typeof(EmojiBlockFile));
+                using (var stream = File.OpenRead(filePath))
+                {
+                    var file = serializer.Deserialize(stream) as EmojiBlockFile;
+                    if (file == null) return;
+                    foreach (var item in file.Items)
+                    {
+                        if (String.IsNullOrEmpty(item.Character) || String.IsNullOrEmpty(item.Text)) continue;
+                        item.Text = item.Text.Replace("\r\n", "\n").Trim('\r', '\n');
+                        target[item.Character] = item;
+                    }
+                }
+            }
+            catch { target.Clear(); }
+        }
+        private static void InsertEmojiIntoMessage(string emoji)
+        {
+            var text = _input.Text.ToString().Replace("\r\n", "\n");
+            var cursor = _input.CursorPosition;
+            var lines = text.Split('\n');
+            var row = Math.Max(0, Math.Min(cursor.Y, lines.Length - 1));
+            var column = Math.Max(0, Math.Min(cursor.X, lines[row].Length));
+            var index = column;
+            for (var line = 0; line < row; line++) index += lines[line].Length + 1;
+            _input.Text = text.Insert(index, emoji);
+            _input.CursorPosition = new Point(column + emoji.Length, row);
+        }
+
+        private static void SendCurrentMessage()
+        {
+            var text = _input.Text == null ? "" : _input.Text.ToString();
+            if (_selected == null || String.IsNullOrWhiteSpace(text)) return;
+            if (_selected.Kind == ChatKind.Channel && !_mesh.Channels.Any(c => c.Index == _selected.Id && c.Role != Meshtastic.Protobufs.Channel.Types.Role.Disabled))
+            {
+                MessageBox.Query("Stored channel chat", "This channel is not configured on the device. You can read or delete its stored messages. Configure the channel on the device before sending.", "OK");
+                return;
+            }
+            var chat = _selected;
+            Task.Run(async delegate
+            {
+                try
+                {
+                    uint packetId = chat.Kind == ChatKind.Channel ? await _mesh.SendTextToChannelWithIdAsync((int)chat.Id, text) : await _mesh.SendTextWithIdAsync(chat.Id, text);
+                    _store.AddOutgoing(packetId, _mesh.Device.MyNode == null ? 0u : _mesh.Device.MyNode.MyNodeNum, chat.Kind == ChatKind.Channel ? UInt32.MaxValue : chat.Id, text, chat.Kind == ChatKind.Channel ? (int?)chat.Id : null, chat.Kind == ChatKind.Channel ? chat.Name : null);
+                    var delivery = _mesh.GetMessageDelivery(packetId);
+                    if (delivery != null) _store.UpdateDeliveryStatus(packetId, delivery.State);
+                    Ui(delegate { _input.Text = ""; RefreshChats(); _input.SetFocus(); });
+                }
+                catch (Exception ex) { Ui(delegate { MessageBox.ErrorQuery("Send failed", ex.Message, "OK"); }); }
+            });
+        }
+
+        private static void UpdateMessageCharacterCounter()
+        {
+            if (_inputFrame == null || _input == null || _messageCharacterCounter == null) return;
+            var text = _input.Text == null ? "" : _input.Text.ToString();
+            var characterCount = new StringInfo(text).LengthInTextElements;
+            var byteCount = Encoding.UTF8.GetByteCount(text);
+            var counter = " " + characterCount + " chars | " + byteCount + "/" + _mesh.GetMaximumTextPayloadBytes(_selected == null || _selected.Kind == ChatKind.Channel, _selected == null ? (uint?)null : _selected.Id) + " bytes ";
+            _messageCharacterCounter.Text = counter;
+            _messageCharacterCounter.Width = counter.Length;
+            _messageCharacterCounter.X = Pos.Right(_inputFrame) - counter.Length - 1;
+            _messageCharacterCounter.SetNeedsDisplay();
+        }
+
+        private static void ActivateSelectedChat()
+        {
+            ShowChatPage();
+            ShowSelectedChat();
+            _input.SetFocus();
+        }
+
+        private static void ShowChatPage()
+        {
+            _nodesPage.Visible = false;
+            _mapPage.Visible = false;
+            _telemetryPage.Visible = false;
+            _chatPage.Visible = true;
+            _chatPage.SetFocus();
+        }
+        private static void ShowNodesPage()
+        {
+            RefreshNodePage();
+            _chatPage.Visible = false;
+            _mapPage.Visible = false;
+            _telemetryPage.Visible = false;
+            _nodesPage.Visible = true;
+            _nodesPage.SetFocus();
+        }
+        private static void ShowMapHelp()
+        {
+            var text = "Keyboard" +
+                "\nF9          Open the map" +
+                "\nH           Show this help" +
+                "\n+ / -       Zoom in / out" +
+                "\nArrow keys  Select visible items" +
+                "\nW A S D     Pan the map" +
+                "\nShift+WASD  Pan by a larger step" +
+                "\nC           Center the map" +
+                "\nSpace       Center the selected item" +
+                "\nM           Cycle measurement: off / line / circle / rectangle" +
+                "\nN           Create a new overlay item" +
+                "\nO           Set/share own position marker" +
+                "\nL           List position markers" +
+                "\nEnter       Activate the selected item" +
+                "\nF           Next/newer stored position" +
+                "\nR           Previous/older stored position" +
+                "\n1-6         Toggle overlays 1 through 6" +
+                "\n7           Toggle MeshCore path layer (FROM yellow / TO white)" +
+                "\n8           Toggle offline background map" +
+                "\n9           Toggle position history" +
+                "\n0           Toggle known nodes" +
+                "\n\nMouse" +
+                "\nWheel       Zoom in / out" +
+                "\nLeft click  Select an item" +
+                "\nDouble click Activate the selected item" +
+                "\nRight click Center the map at the pointer";
+            var dialog = new Dialog("Map help", 68, 25);
+            var help = new TextView { X = 1, Y = 1, Width = Dim.Fill(1), Height = Dim.Fill(2), ReadOnly = true, WordWrap = false, Text = text };
+            var close = new Button("Close", true); close.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(help); dialog.AddButton(close); Application.Run(dialog, HandleTerminalGuiException);
+            if (_nodeMap != null) _nodeMap.SetFocus();
+        }
+        private static void ShowMapPage()
+        {
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            var savedLatitude = _settings.Map.CenterLatitude;
+            var savedLongitude = _settings.Map.CenterLongitude;
+            var savedScale = _settings.Map.MetersPerRow;
+            _nodeMap.ShowKnownNodes = _settings.Map.ShowKnownNodes;
+            _nodeMap.ShowBackgroundMap = _settings.Map.ShowBackgroundMap;
+            _nodeMap.HopLimitEnabled = _settings.Map.HopLimitEnabled;
+            _nodeMap.HopLimit = _settings.Map.HopLimit;
+            _nodeMap.NodeAgeLimitEnabled = _settings.Map.NodeAgeLimitEnabled;
+            _nodeMap.NodeAgeLimitHours = _settings.Map.NodeAgeLimitHours;
+            _nodeMap.SetData(_store.GetNodes(StoredNodeSort.Name), _mesh.Device.Latitude, _mesh.Device.Longitude);
+            RefreshMapOverlays();
+            if (savedLatitude.HasValue && savedLongitude.HasValue) _nodeMap.RestoreView(savedLatitude.Value, savedLongitude.Value, savedScale);
+            SaveMapViewState();
+            _chatPage.Visible = false; _nodesPage.Visible = false; _telemetryPage.Visible = false; _mapPage.Visible = true;
+            _nodeMap.SetFocus();
+        }
+        private static void UpdateMapGpsPosition()
+        {
+            if (_nodeMap == null || _mesh == null) return;
+            _nodeMap.UpdateOwnPosition(_mesh.Device.Latitude, _mesh.Device.Longitude, _mapFollowGps);
+        }
+        private static MenuItem MapLayerMenuItem(string title, string key, bool enabled, Action toggle, Func<bool> available = null)
+        {
+            return new MenuItem(title, key, delegate { toggle(); if (_mapMenu != null) _mapMenu.Children = BuildMapMenuItems(); }, available)
+                { CheckType = MenuItemCheckStyle.Checked, Checked = enabled };
+        }
+        private static MenuItem[] BuildMapMenuItems()
+        {
+            var items = new List<MenuItem>
+            {
+                new MenuItem("_Show map", "", ShowMapPage),
+                MapLayerMenuItem("_Follow GPS position", "", _mapFollowGps, () => { _mapFollowGps = !_mapFollowGps; UpdateMapGpsPosition(); }),
+                new MenuItem("_Hop / age filters", "", ShowMapHopLimitSettings),
+                new MenuItem("Map point _sharing", "", ShowMapPointSharingSettings),
+                new MenuItem("Position _Markers", "", ShowPositionMarkerSettings),
+                new MenuItem("_Position history", "", ShowPositionTrackSettings),
+                new MenuItem("_Overlays", "", ShowMapOverlayOrderPopup),
+                new MenuItem("_Copy current map", "", CopyMapToClipboard),
+                null // Terminal.Gui menu separator.
+            };
+            for (var index = 0; index < MapOverlayFiles.Count; index++)
+            {
+                var file = MapOverlayFiles[index];
+                var shortcut = index < 6 ? (index + 1).ToString(CultureInfo.InvariantCulture) : "";
+                items.Add(MapLayerMenuItem(file.DisplayName.Replace("_", "__"), shortcut, file.Enabled, () =>
+                {
+                    file.Enabled = !file.Enabled; SaveMapOverlayState();
+                    MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); RefreshMapOverlays();
+                }));
+            }
+            if (_mesh.Protocol == MeshProtocol.MeshCore || TemporaryMeshCorePaths.Count > 0)
+                items.Add(MapLayerMenuItem("MeshCore paths (FROM yellow / TO white)", "7", _temporaryMeshCorePathsVisible && TemporaryMeshCorePaths.Count > 0, () => ToggleMapOverlayByNumber(6), () => TemporaryMeshCorePaths.Count > 0));
+            if (_nodeMap != null && _nodeMap.HasBackgroundMap)
+                items.Add(MapLayerMenuItem("Offline background map", "8", _settings.Map.ShowBackgroundMap, ToggleBackgroundMapFromMap));
+            items.Add(MapLayerMenuItem("Position history", "9", _settings.Map.PositionTrackVisible && _settings.Map.PositionTrackNodeNumber.HasValue, TogglePositionHistoryFromMap, () => _settings.Map.PositionTrackNodeNumber.HasValue));
+            items.Add(MapLayerMenuItem("Known nodes", "0", _settings.Map.ShowKnownNodes, () => ToggleKnownNodesFromMap(false)));
+            if (_nodeMap != null && _nodeMap.GetPositionMarkers().Count > 0)
+                items.Add(MapLayerMenuItem("Position markers", "", _nodeMap.ShowPositionMarkers, () => { _nodeMap.ShowPositionMarkers = !_nodeMap.ShowPositionMarkers; _nodeMap.SetNeedsDisplay(); }));
+            return items.ToArray();
+        }
+        private static void ShowPositionMarkerSettings()
+        {
+            var map = _settings.Map;
+            var dialog = new Dialog("Position Markers", 90, 25);
+            var info = new MessageInputView { X = 49, Y = 3, Width = Dim.Fill(2), Height = 8, WordWrap = true, Text = map.PositionMarkerInfo ?? "" };
+            var receive = new CheckBox("Evaluate received markers") { X = 49, Y = 14, Checked = map.ReceivePositionMarkers };
+            var confirm = new CheckBox("Confirm setting own marker") { X = 49, Y = 16, Checked = map.ConfirmPositionMarkerPlacement };
+            var positionSource = new RadioGroup(new Rect(49, 19, 36, 2), new ustring[] { "Crosshair position", "Current GPS position" }) { SelectedItem = map.PositionMarkerUseGps ? 1 : 0 };
+            var callSign = new TextField(map.PositionMarkerCallSign ?? "") { X = 16, Y = 1, Width = 30 };
+            var symbol = new TextField(map.PositionMarkerSymbol ?? "+") { X = 16, Y = 3, Width = 4 };
+            var picker = new Button("Symbol") { X = 23, Y = 3 };
+            picker.Clicked += delegate { ShowMapPointSymbolPicker(symbol); };
+            var colors = MapPositionMarkerProtocol.Colors;
+            var color = new RadioGroup(new Rect(16, 5, 30, colors.Length), colors.Select(value => (ustring)value).ToArray());
+            color.SelectedItem = Math.Max(0, Array.FindIndex(colors, value => String.Equals(value, map.PositionMarkerColor, StringComparison.OrdinalIgnoreCase)));
+            dialog.Add(new Label("Call sign:") { X = 1, Y = 1 }, callSign, new Label("Centre symbol:") { X = 1, Y = 3 }, symbol, picker,
+                new Label("Color:") { X = 1, Y = 5 }, color, new Label("Info text:") { X = 49, Y = 1 }, info,
+                new Label("Shared message limit: " + _mesh.GetMaximumTextPayloadBytes(true) + " UTF-8 bytes") { X = 49, Y = 12, Width = Dim.Fill(2) },
+                receive, confirm, new Label("Position source:") { X = 49, Y = 18 }, positionSource);
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                var name = callSign.Text.ToString().Trim();
+                if (String.IsNullOrWhiteSpace(name) || name.Length > 80 || name.IndexOfAny(new[] { '\r', '\n', '\t' }) >= 0)
+                { MessageBox.ErrorQuery("Position Markers", "Enter a call sign with 1 to 80 characters.", "OK"); return; }
+                if (!MapPositionMarkerProtocol.ValidSymbol(symbol.Text.ToString()))
+                { MessageBox.ErrorQuery("Position Markers", "Choose one single-cell symbol.", "OK"); return; }
+                if (color.SelectedItem < 0 || color.SelectedItem >= colors.Length) return;
+                map.PositionMarkerInfo = info.Text.ToString();
+                map.ReceivePositionMarkers = receive.Checked;
+                map.ConfirmPositionMarkerPlacement = confirm.Checked;
+                map.PositionMarkerUseGps = positionSource.SelectedItem == 1;
+                map.PositionMarkerCallSign = name; map.PositionMarkerSymbol = symbol.Text.ToString(); map.PositionMarkerColor = colors[color.SelectedItem];
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException);
+        }
+        private static void SetOwnPositionMarker(double latitude, double longitude)
+        {
+            var localNode = _mesh.Device.MyNode;
+            if (localNode == null || localNode.MyNodeNum == 0)
+            { MessageBox.ErrorQuery("Position Markers", "Connect to a mesh device first so its node ID is known.", "OK"); return; }
+            var map = _settings.Map;
+            if (String.IsNullOrWhiteSpace(map.PositionMarkerCallSign)) ShowPositionMarkerSettings();
+            if (String.IsNullOrWhiteSpace(map.PositionMarkerCallSign)) return;
+            if (map.PositionMarkerUseGps)
+            {
+                var gpsLatitude = _mesh.Device.Latitude; var gpsLongitude = _mesh.Device.Longitude;
+                if (!gpsLatitude.HasValue || !gpsLongitude.HasValue ||
+                    Double.IsNaN(gpsLatitude.Value) || Double.IsInfinity(gpsLatitude.Value) || gpsLatitude.Value < -90 || gpsLatitude.Value > 90 ||
+                    Double.IsNaN(gpsLongitude.Value) || Double.IsInfinity(gpsLongitude.Value) || gpsLongitude.Value < -180 || gpsLongitude.Value > 180)
+                { MessageBox.ErrorQuery("Position Markers", "No valid GPS position is available. The marker was not set.", "OK"); return; }
+                latitude = gpsLatitude.Value; longitude = gpsLongitude.Value;
+            }
+            var marker = new MapPositionMarker { NodeNumber = localNode.MyNodeNum, Identity = _mesh.Protocol == MeshProtocol.MeshCore ? _mesh.Device.NodeId : null, Latitude = latitude, Longitude = longitude,
+                Color = map.PositionMarkerColor ?? "BrightYellow", Symbol = map.PositionMarkerSymbol ?? "+",
+                CallSign = map.PositionMarkerCallSign.Trim(), Info = map.PositionMarkerInfo ?? "", UpdatedUtc = DateTime.UtcNow };
+            if (!MapPositionMarkerProtocol.ValidSymbol(marker.Symbol))
+            { MessageBox.ErrorQuery("Position Markers", "Configure a valid centre symbol first.", "OK"); return; }
+            var message = MapPositionMarkerProtocol.Build(marker);
+            if (map.MapPointSharingEnabled && Encoding.UTF8.GetByteCount(message) > _mesh.GetMaximumTextPayloadBytes(true))
+            { MessageBox.ErrorQuery("Position Markers", "The call sign and info text exceed the sharing limit of " + _mesh.GetMaximumTextPayloadBytes(true) + " UTF-8 bytes. Shorten them in Position Markers.", "OK"); return; }
+            if (map.ConfirmPositionMarkerPlacement &&
+                MessageBox.Query("Set position marker", "Set " + marker.CallSign + " at " +
+                    latitude.ToString("F6", CultureInfo.InvariantCulture) + ", " + longitude.ToString("F6", CultureInfo.InvariantCulture) +
+                    "\nSource: " + (map.PositionMarkerUseGps ? "GPS" : "Crosshair") +
+                    (map.MapPointSharingEnabled ? "\nThe position will also be shared." : ""), "Cancel", "Set") != 1) return;
+            _nodeMap.SetPositionMarker(marker);
+            UpdatePositionMarkerInfo(marker);
+            if (map.MapPointSharingEnabled)
+            {
+                try { SendSharedMapMessage(message); }
+                catch (Exception error) { MessageBox.ErrorQuery("Position Markers", "Marker set locally, but sharing failed:\n" + error.Message, "OK"); }
+            }
+        }
+
+        private static double? PositionMarkerDistance(MapPositionMarker marker)
+        {
+            double? latitude = _mesh.Device.Latitude, longitude = _mesh.Device.Longitude;
+            if (_mesh.Device.MyNode != null)
+            {
+                var own = _nodeMap.GetPositionMarker(_mesh.Device.MyNode.MyNodeNum);
+                if (own != null) { latitude = own.Latitude; longitude = own.Longitude; }
+            }
+            return MeshtasticClient.GetDistanceMeters(latitude, longitude, marker.Latitude, marker.Longitude);
+        }
+        private static string PositionMarkerDistanceText(MapPositionMarker marker)
+        {
+            var distance = PositionMarkerDistance(marker);
+            return distance.HasValue ? (distance.Value < 1000 ? distance.Value.ToString("F0", CultureInfo.InvariantCulture) + " m" : (distance.Value / 1000).ToString("F2", CultureInfo.InvariantCulture) + " km") : "-";
+        }
+        private static string PositionMarkerDirection(MapPositionMarker marker)
+        {
+            double? latitude = _mesh.Device.Latitude, longitude = _mesh.Device.Longitude;
+            if (_mesh.Device.MyNode != null)
+            {
+                var own = _nodeMap.GetPositionMarker(_mesh.Device.MyNode.MyNodeNum);
+                if (own != null) { latitude = own.Latitude; longitude = own.Longitude; }
+            }
+            var bearing = MeshtasticClient.GetInitialBearingDegrees(latitude, longitude, marker.Latitude, marker.Longitude);
+            return bearing.HasValue && PositionMarkerDistance(marker).GetValueOrDefault() > .01
+                ? Math.Round(bearing.Value) + "° " + MeshtasticClient.GetCompassDirection(bearing.Value) : "-";
+        }
+        private static void UpdatePositionMarkerInfo(MapPositionMarker marker)
+        {
+            if (_mapInfo != null) _mapInfo.Text = "Position marker | " + marker.CallSign + " | Distance " + PositionMarkerDistanceText(marker) +
+                " | Direction " + PositionMarkerDirection(marker) + " | Updated " + FormatDetailedAge(marker.UpdatedUtc);
+        }
+        private static void StartPositionMarkerChat(MapPositionMarker marker)
+        {
+            _selected = new ChatItem { Kind = ChatKind.Direct, Id = marker.NodeNumber, Name = marker.CallSign };
+            ShowChatPage(); ShowSelectedChat(); _input.SetFocus();
+        }
+        private static void ShowPositionMarkerDetails(MapPositionMarker marker)
+        {
+            if (ShowPositionMarkerInfoBox(marker)) StartPositionMarkerChat(marker);
+        }
+        // Return the chat action to the caller so enclosing dialogs can close first.
+        private static bool ShowPositionMarkerInfoBox(MapPositionMarker marker)
+        {
+            var dialog = new Dialog("Position marker", Math.Max(30, Math.Min(90, Application.Top.Frame.Width - 2)), Math.Max(12, Math.Min(24, Application.Top.Frame.Height - 2)));
+            var text = new TextView { X = 1, Y = 1, Width = Dim.Fill(1), Height = Dim.Fill(2), ReadOnly = true, WordWrap = true };
+            Action refresh = delegate
+            {
+                marker = _nodeMap.GetPositionMarker(marker.NodeNumber) ?? marker;
+                text.Text = marker.CallSign + "\nMeshtastic ID: !" + marker.NodeNumber.ToString("x8") +
+                    "\nPosition: " + marker.Latitude.ToString("F6", CultureInfo.InvariantCulture) + ", " + marker.Longitude.ToString("F6", CultureInfo.InvariantCulture) +
+                    "\nDistance to me: " + PositionMarkerDistanceText(marker) + "\nDirection from me: " + PositionMarkerDirection(marker) +
+                    "\nLast update: " + marker.UpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") + " (" + FormatDetailedAge(marker.UpdatedUtc) + ")" +
+                    "\n\nInfo:\n" + (String.IsNullOrWhiteSpace(marker.Info) ? "-" : marker.Info);
+            };
+            refresh(); dialog.Add(text);
+            var action = 0;
+            foreach (var option in new[] { "Center", "Node details", "Delete", "Direct message", "Close" }.Select((label, index) => new { label, index }))
+            {
+                var chosen = option.index;
+                var button = new Button(option.label);
+                button.Clicked += delegate { action = chosen + 1; Application.RequestStop(); };
+                dialog.AddButton(button);
+            }
+            var timer = Application.MainLoop.AddTimeout(TimeSpan.FromSeconds(1), delegate(MainLoop loop) { refresh(); return true; });
+            try { Application.Run(dialog, HandleTerminalGuiException); }
+            finally { Application.MainLoop.RemoveTimeout(timer); }
+            if (action == 1) _nodeMap.SelectPositionMarker(marker.NodeNumber);
+            else if (action == 2)
+            {
+                var node = _store.GetNodes(StoredNodeSort.Name).FirstOrDefault(item => item.NodeNumber == marker.NodeNumber);
+                if (node != null) ShowNodeDetails(node);
+                else MessageBox.Query("Position marker", "No node details are stored for this Meshtastic ID.", "OK");
+            }
+            else if (action == 3 && MessageBox.Query("Delete position marker",
+                "Delete " + marker.CallSign + " (!" + marker.NodeNumber.ToString("x8") + ") locally?", "Cancel", "Delete") == 1)
+                _nodeMap.RemovePositionMarker(marker.NodeNumber);
+            return action == 4;
+        }
+        private static void ShowPositionMarkerList()
+        {
+            var markers = _nodeMap.GetPositionMarkers().ToList();
+            if (markers.Count == 0) { MessageBox.Query("Position markers", "No position markers are available.", "OK"); return; }
+            var width = Math.Min(Application.Top.Frame.Width - 2, Math.Max(28, Application.Top.Frame.Width / 4));
+            var dialog = new Dialog("Position markers", width, Math.Max(8, Math.Min(25, Application.Top.Frame.Height - 2))) { X = Pos.AnchorEnd(width + 2), Y = 3 };
+            var nameWidth = Math.Max(2, width - 22);
+            Func<string, int, string> column = (value, length) => (value.Length > length ? value.Substring(0, Math.Max(0, length - 1)) + "~" : value).PadRight(length);
+            Func<MapPositionMarker, string> distance = marker =>
+            {
+                var meters = PositionMarkerDistance(marker);
+                return !meters.HasValue ? "-" : meters.Value < 1000 ? meters.Value.ToString("F0", CultureInfo.InvariantCulture) + "m" :
+                    (meters.Value / 1000).ToString(meters.Value < 100000 ? "F1" : "F0", CultureInfo.InvariantCulture) + "km";
+            };
+            Func<DateTime, string> age = updated =>
+            {
+                var elapsed = DateTime.UtcNow - updated.ToUniversalTime();
+                return elapsed.TotalDays >= 1 ? ((int)elapsed.TotalDays).ToString() + "d" :
+                    elapsed.TotalHours >= 1 ? ((int)elapsed.TotalHours).ToString() + "h" :
+                    elapsed.TotalMinutes >= 1 ? ((int)elapsed.TotalMinutes).ToString() + "m" :
+                    Math.Max(0, (int)elapsed.TotalSeconds).ToString() + "s";
+            };
+            var list = new ListView { X = 1, Y = 2, Width = Dim.Fill(1), Height = Dim.Fill(2) };
+            dialog.Add(new Label(column("Callsign", nameWidth) + " | " + column("Dist", 6) + " | " + column("Age", 6)) { X = 1, Y = 1, Width = Dim.Fill(1) }, list);
+            var updating = false;
+            Action refresh = delegate
+            {
+                var selectedId = list.SelectedItem >= 0 && list.SelectedItem < markers.Count ? (uint?)markers[list.SelectedItem].NodeNumber : null;
+                updating = true;
+                markers = _nodeMap.GetPositionMarkers().ToList();
+                list.SetSource(markers.Select(marker => column(marker.CallSign, nameWidth) +
+                    " | " + column(distance(marker), 6) + " | " + column(age(marker.UpdatedUtc), 6)).ToList());
+                if (markers.Count > 0)
+                {
+                    var index = selectedId.HasValue ? markers.FindIndex(marker => marker.NodeNumber == selectedId.Value) : 0;
+                    list.SelectedItem = index >= 0 ? index : Math.Min(Math.Max(0, list.SelectedItem), markers.Count - 1);
+                }
+                updating = false;
+            };
+            Action select = delegate { if (!updating && list.SelectedItem >= 0 && list.SelectedItem < markers.Count) _nodeMap.SelectPositionMarker(markers[list.SelectedItem].NodeNumber); };
+            list.SelectedItemChanged += delegate { select(); };
+            MapPositionMarker chat = null;
+            Action details = delegate
+            {
+                if (list.SelectedItem < 0 || list.SelectedItem >= markers.Count) return;
+                var selected = markers[list.SelectedItem];
+                if (ShowPositionMarkerInfoBox(selected)) { chat = selected; Application.RequestStop(); return; }
+                refresh(); select();
+            };
+            list.OpenSelectedItem += delegate { details(); };
+            var open = new Button("Details", true); open.Clicked += delegate { details(); };
+            var close = new Button("Close"); close.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(open); dialog.AddButton(close);
+            refresh(); select();
+            var timer = Application.MainLoop.AddTimeout(TimeSpan.FromSeconds(1), delegate(MainLoop loop) { refresh(); select(); return true; });
+            try { Application.Run(dialog, HandleTerminalGuiException); }
+            finally { Application.MainLoop.RemoveTimeout(timer); }
+            if (chat != null) StartPositionMarkerChat(chat);
+            else _nodeMap.SetFocus();
+        }
+
+        private static void ShowMapPointSharingSettings()
+        {
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            var writableFiles = MapOverlayFiles.Where(file => file.Data != null && !file.Data.WriteProtected).ToList();
+            var channelIndexes = Enumerable.Range(0, _mesh.ChannelSlotCount).ToList();
+            var channelLabels = channelIndexes.Select(index =>
+            {
+                var configured = _mesh.Channels.FirstOrDefault(channel => channel.Index == index);
+                return "Channel " + index.ToString(CultureInfo.InvariantCulture) + (configured == null || String.IsNullOrWhiteSpace(configured.Name) ? "" : " - " + configured.Name);
+            }).ToList();
+            var dialog = new Dialog("Map point sharing", 98, 24);
+            var enabled = new CheckBox("Enable sending and receiving shared map points") { X = 1, Y = 1, Checked = _settings.Map.MapPointSharingEnabled };
+            var receiveDeletions = new CheckBox("Apply received ///MAP- deletion messages") { X = 1, Y = 16, Checked = _settings.Map.ReceiveSharedMapPointDeletions };
+            var centerReceived = new CheckBox("Center map view on newly received points") { X = 1, Y = 17, Checked = _settings.Map.CenterMapOnReceivedSharedPoint };
+            var overlayList = new ListView(writableFiles.Select(file => file.DisplayName + " (" + Path.GetFileName(file.FileName) + ")").ToList()) { X = 1, Y = 4, Width = 48, Height = 7 };
+            var channelList = new ListView(channelLabels) { X = 52, Y = 4, Width = 42, Height = 7 };
+            var overlayIndex = writableFiles.FindIndex(file => String.Equals(Path.GetFileName(file.FileName), _settings.Map.MapPointSharingOverlayFile, StringComparison.OrdinalIgnoreCase));
+            if (overlayIndex >= 0) overlayList.SelectedItem = overlayIndex;
+            else if (writableFiles.Count > 0) overlayList.SelectedItem = 0;
+            var channelIndex = channelIndexes.IndexOf(_settings.Map.MapPointSharingChannelIndex);
+            if (channelIndex >= 0) channelList.SelectedItem = channelIndex;
+            else channelList.SelectedItem = 0;
+            dialog.Add(enabled,
+                new Label("Destination overlay XML:") { X = 1, Y = 3 }, overlayList,
+                new Label("Mesh channel:") { X = 52, Y = 3 }, channelList,
+                new Label("Received ///MAP+ messages on this channel are added to the selected XML.") { X = 1, Y = 13, Width = Dim.Fill(2) },
+                new Label("The destination XML must remain writable. UUIDs prevent duplicate imports.") { X = 1, Y = 14, Width = Dim.Fill(2) },
+                receiveDeletions,
+                centerReceived);
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                if (enabled.Checked && (overlayList.SelectedItem < 0 || overlayList.SelectedItem >= writableFiles.Count)) { MessageBox.ErrorQuery("Map point sharing", "Select a writable overlay XML file.", "OK"); return; }
+                if (enabled.Checked && (channelList.SelectedItem < 0 || channelList.SelectedItem >= channelIndexes.Count)) { MessageBox.ErrorQuery("Map point sharing", "Select a mesh channel.", "OK"); return; }
+                _settings.Map.MapPointSharingEnabled = enabled.Checked;
+                _settings.Map.ReceiveSharedMapPointDeletions = receiveDeletions.Checked;
+                _settings.Map.CenterMapOnReceivedSharedPoint = centerReceived.Checked;
+                if (overlayList.SelectedItem >= 0 && overlayList.SelectedItem < writableFiles.Count)
+                {
+                    var selectedOverlay = writableFiles[overlayList.SelectedItem];
+                    _settings.Map.MapPointSharingOverlayFile = Path.GetFileName(selectedOverlay.FileName);
+                    if (enabled.Checked) selectedOverlay.Enabled = true;
+                }
+                if (channelList.SelectedItem >= 0 && channelList.SelectedItem < channelIndexes.Count) _settings.Map.MapPointSharingChannelIndex = channelIndexes[channelList.SelectedItem];
+                SaveMapOverlayState();
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                RefreshMapOverlays();
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+            if (_nodeMap != null && _mapPage != null && _mapPage.Visible) _nodeMap.SetFocus();
+        }
+
+        private static void ShowMapHopLimitSettings()
+        {
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            var dialog = new Dialog("Map node filters", 72, 17);
+            var enabled = new CheckBox("Enable hop limit filter") { X = 1, Y = 1, Checked = _settings.Map.HopLimitEnabled };
+            var value = new TextField(_settings.Map.HopLimit.ToString(CultureInfo.InvariantCulture)) { X = 31, Y = 3, Width = 8 };
+            dialog.Add(enabled, new Label("Maximum hops (0 = direct):") { X = 1, Y = 3 }, value);
+            dialog.Add(new Label("Nodes without a known hop count are hidden while enabled.") { X = 1, Y = 5, Width = Dim.Fill(2) });
+            var ageEnabled = new CheckBox("Enable last-heard age filter") { X = 1, Y = 7, Checked = _settings.Map.NodeAgeLimitEnabled };
+            var hours = new TextField(_settings.Map.NodeAgeLimitHours.ToString(CultureInfo.InvariantCulture)) { X = 31, Y = 9, Width = 10 };
+            dialog.Add(ageEnabled, new Label("Maximum age (hours):") { X = 1, Y = 9 }, hours, new Label("Unknown last-heard times are hidden while age filtering is enabled.") { X = 1, Y = 11 });
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                double maximumHours;
+                if (!Double.TryParse(hours.Text.ToString().Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out maximumHours) || Double.IsNaN(maximumHours) || Double.IsInfinity(maximumHours) || maximumHours <= 0 || maximumHours > 876000) { MessageBox.ErrorQuery("Age filter", "Enter positive hours (up to 876000).", "OK"); return; }
+                int limit;
+                if (!Int32.TryParse(value.Text.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out limit) || limit < 0 || limit > 255)
+                {
+                    MessageBox.ErrorQuery("Hop Limit", "Enter a value from 0 to 255.", "OK");
+                    return;
+                }
+                _settings.Map.NodeAgeLimitEnabled = ageEnabled.Checked; _settings.Map.NodeAgeLimitHours = maximumHours;
+                _settings.Map.HopLimitEnabled = enabled.Checked;
+                _settings.Map.HopLimit = limit;
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel);
+            value.SetFocus();
+            Application.Run(dialog, HandleTerminalGuiException);
+            if (_mapPage != null && _mapPage.Visible)
+            {
+                _nodeMap.HopLimitEnabled = _settings.Map.HopLimitEnabled;
+                _nodeMap.HopLimit = _settings.Map.HopLimit;
+            _nodeMap.NodeAgeLimitEnabled = _settings.Map.NodeAgeLimitEnabled;
+            _nodeMap.NodeAgeLimitHours = _settings.Map.NodeAgeLimitHours;
+                _nodeMap.SetData(_store.GetNodes(StoredNodeSort.Name), _mesh.Device.Latitude, _mesh.Device.Longitude);
+                _nodeMap.SetFocus();
+            }
+            if (_mapMenu != null) _mapMenu.Children = BuildMapMenuItems();
+        }
+
+        private static void ToggleBackgroundMapFromMap()
+        {
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            if (_nodeMap == null || !_nodeMap.HasBackgroundMap)
+            {
+                ShowBriefMapPopup("No offline map found in the osm directory.");
+                return;
+            }
+            _settings.Map.ShowBackgroundMap = !_settings.Map.ShowBackgroundMap;
+            _nodeMap.ShowBackgroundMap = _settings.Map.ShowBackgroundMap;
+            _nodeMap.SetNeedsDisplay();
+            MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+            if (_mapMenu != null) _mapMenu.Children = BuildMapMenuItems();
+            ShowBriefMapPopup("Offline background map " + (_settings.Map.ShowBackgroundMap ? "enabled" : "disabled"));
+        }
+
+        private static void ToggleMapOverlayByNumber(int index)
+        {
+            if (index == 6) { _temporaryMeshCorePathsVisible = !_temporaryMeshCorePathsVisible; RefreshMapOverlays(); ShowBriefMapPopup("MeshCore path layer " + (_temporaryMeshCorePathsVisible ? "enabled" : "disabled")); return; }
+            if (index < 0 || index >= 8) return;
+            if (index >= MapOverlayFiles.Count)
+            {
+                ShowBriefMapPopup("Overlay " + (index + 1).ToString(CultureInfo.InvariantCulture) + " is not configured.");
+                return;
+            }
+            var overlay = MapOverlayFiles[index];
+            overlay.Enabled = !overlay.Enabled;
+            SaveMapOverlayState();
+            MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+            RefreshMapOverlays();
+            ShowBriefMapPopup("Overlay " + (index + 1).ToString(CultureInfo.InvariantCulture) + " - " + overlay.DisplayName + " " + (overlay.Enabled ? "enabled" : "disabled"));
+        }
+        private static void TogglePositionHistoryFromMap()
+        {
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            if (!_settings.Map.PositionTrackNodeNumber.HasValue)
+            {
+                ShowBriefMapPopup("Position history is not configured.");
+                return;
+            }
+            _settings.Map.PositionTrackVisible = !_settings.Map.PositionTrackVisible;
+            if (_settings.Map.PositionTrackVisible) SetPositionTrackToLatest24Hours(_settings.Map.PositionTrackNodeNumber.Value);
+            MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+            RefreshMapOverlays();
+            ShowBriefMapPopup("Position history " + (_settings.Map.PositionTrackVisible
+                ? "enabled | latest available 24h: -" + _settings.Map.PositionTrackFromHoursAgo.ToString(CultureInfo.InvariantCulture) + "h to -" + _settings.Map.PositionTrackToHoursAgo.ToString(CultureInfo.InvariantCulture) + "h"
+                : "disabled"));
+        }
+        private static void ToggleKnownNodesFromMap(bool showNotification)
+        {
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            _settings.Map.ShowKnownNodes = !_settings.Map.ShowKnownNodes;
+            if (_nodeMap != null) { _nodeMap.ShowKnownNodes = _settings.Map.ShowKnownNodes; _nodeMap.SetNeedsDisplay(); }
+            MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+            if (_mapMenu != null) _mapMenu.Children = BuildMapMenuItems();
+            if (showNotification) ShowBriefMapPopup("Known nodes " + (_settings.Map.ShowKnownNodes ? "enabled" : "disabled"));
+        }
+        private static void ShowBriefMapPopup(string message)
+        {
+            var width = Math.Max(36, Math.Min(78, (message ?? "").Length + 6));
+            var dialog = new Dialog("Map", width, 7);
+            object timeoutToken = null;
+            dialog.KeyPress += e =>
+            {
+                e.Handled = true;
+                if (timeoutToken != null) Application.MainLoop.RemoveTimeout(timeoutToken);
+                Application.RequestStop();
+            };
+            dialog.Add(new Label(message ?? "") { X = 1, Y = 1, Width = Dim.Fill(1) });
+            timeoutToken = Application.MainLoop.AddTimeout(TimeSpan.FromSeconds(4), delegate(MainLoop loop) { Application.RequestStop(); return false; });
+            Application.Run(dialog, HandleTerminalGuiException);
+            if (_nodeMap != null) _nodeMap.SetFocus();
+        }
+        private static void ShowPositionTrackSettings()
+        {
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            var nodeNumbers = _store.GetPositionNodeNumbers().ToList();
+            var storedNodes = _store.GetNodes(StoredNodeSort.Name).ToDictionary(node => node.NodeNumber);
+            var nodeLabels = nodeNumbers.Select(number =>
+            {
+                StoredMeshNode node;
+                var label = storedNodes.TryGetValue(number, out node)
+                    ? (String.IsNullOrWhiteSpace(node.LongName) ? node.NodeId ?? "!" + number.ToString("x8") : node.LongName) + " (!" + number.ToString("x8") + ")"
+                    : "!" + number.ToString("x8");
+                return ReplaceGraphicalSymbols(label);
+            }).ToList();
+            var dialog = new Dialog("Node position history", 88, 27);
+            var enabled = new CheckBox("Show stored positions for the selected node") { X = 1, Y = 1, Checked = _settings.Map.PositionTrackVisible && _settings.Map.PositionTrackNodeNumber.HasValue };
+            var nodeFrame = new FrameView("Nodes") { X = 1, Y = 3, Width = 44, Height = 17 };
+            var mapBackground = ParseColor(_settings.Appearance.BackgroundColor, Color.Black);
+            var mapText = ParseColor(_settings.Appearance.TextColor, Color.Gray);
+            var mapSelected = ParseColor(_settings.Appearance.SelectedItemColor, Color.BrightYellow);
+            var nodeNormal = Application.Driver.MakeAttribute(mapText, mapBackground);
+            var nodeFocus = Application.Driver.MakeAttribute(mapBackground, mapText);
+            var nodeSelected = Application.Driver.MakeAttribute(mapSelected, mapBackground);
+            var nodes = new ListView(nodeLabels) { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), ColorScheme = new ColorScheme { Normal = nodeNormal, Focus = nodeFocus, HotNormal = nodeSelected, HotFocus = nodeFocus, Disabled = nodeNormal } };
+            nodeFrame.Add(nodes);
+            var updateNodeFrameTitle = new Action(delegate { nodeFrame.Title = nodeNumbers.Count == 0 ? "Nodes - no stored positions" : "Nodes " + Math.Min(nodeNumbers.Count, nodes.SelectedItem + 1) + "/" + nodeNumbers.Count; nodeFrame.SetNeedsDisplay(); });
+            nodes.SelectedItemChanged += delegate { updateNodeFrameTitle(); };
+            var selectedNodeIndex = _settings.Map.PositionTrackNodeNumber.HasValue ? nodeNumbers.IndexOf(_settings.Map.PositionTrackNodeNumber.Value) : -1;
+            if (selectedNodeIndex >= 0) nodes.SelectedItem = selectedNodeIndex;
+            updateNodeFrameTitle();
+            var colorNames = new[] { "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Brown", "Gray", "DarkGray", "BrightBlue", "BrightGreen", "BrightCyan", "BrightRed", "BrightMagenta", "BrightYellow", "White" };
+            var colors = new RadioGroup(new Rect(51, 3, 25, colorNames.Length), colorNames.Select(value => (ustring)value).ToArray());
+            var selectedColorIndex = Array.FindIndex(colorNames, value => String.Equals(value, _settings.Map.PositionTrackColor, StringComparison.OrdinalIgnoreCase));
+            colors.SelectedItem = selectedColorIndex >= 0 ? selectedColorIndex : Array.IndexOf(colorNames, "BrightYellow");
+            var symbol = new TextField(String.IsNullOrWhiteSpace(_settings.Map.PositionTrackSymbol) ? "O" : _settings.Map.PositionTrackSymbol) { X = 12, Y = 2, Width = 8 };
+            var fromHours = new TextField(_settings.Map.PositionTrackFromHoursAgo.ToString(CultureInfo.InvariantCulture)) { X = 24, Y = 20, Width = 6 };
+            var toHours = new TextField(_settings.Map.PositionTrackToHoursAgo.ToString(CultureInfo.InvariantCulture)) { X = 47, Y = 20, Width = 6 };
+            dialog.Add(enabled, new Label("Symbol:") { X = 1, Y = 2 }, symbol, nodeFrame, new Label("Color:") { X = 51, Y = 2 }, colors,
+                new Label("Period: from -") { X = 1, Y = 20 }, fromHours, new Label("hours to -") { X = 33, Y = 20 }, toHours, new Label("hours") { X = 56, Y = 20 },
+                new Label("Map keys: F = next/newer position, R = previous/older position") { X = 1, Y = 21 });
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                var enteredSymbol = symbol.Text.ToString().Trim();
+                int parsedFromHours, parsedToHours;
+                if (enabled.Checked && (nodes.SelectedItem < 0 || nodes.SelectedItem >= nodeNumbers.Count)) { MessageBox.ErrorQuery("Node position history", "Select a node with stored position data.", "OK"); return; }
+                if (String.IsNullOrWhiteSpace(enteredSymbol) || enteredSymbol.Length > 3) { MessageBox.ErrorQuery("Node position history", "Enter a symbol containing one to three characters.", "OK"); return; }
+                if (!Int32.TryParse(fromHours.Text.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out parsedFromHours) || !Int32.TryParse(toHours.Text.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out parsedToHours) || parsedFromHours < 0 || parsedToHours <= parsedFromHours || parsedToHours > 87600) { MessageBox.ErrorQuery("Node position history", "Enter a valid period. The second hour value must be greater than the first.", "OK"); return; }
+                if (nodes.SelectedItem >= 0 && nodes.SelectedItem < nodeNumbers.Count) _settings.Map.PositionTrackNodeNumber = nodeNumbers[nodes.SelectedItem];
+                _settings.Map.PositionTrackVisible = enabled.Checked;
+                _settings.Map.PositionTrackFromHoursAgo = parsedFromHours;
+                _settings.Map.PositionTrackToHoursAgo = parsedToHours;
+                _settings.Map.PositionTrackColor = colors.SelectedItem >= 0 && colors.SelectedItem < colorNames.Length ? colorNames[colors.SelectedItem] : "BrightYellow";
+                _settings.Map.PositionTrackSymbol = enteredSymbol;
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                RefreshMapOverlays();
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException);
+            if (_mapPage != null && _mapPage.Visible) _nodeMap.SetFocus();
+        }
+
+        private static void RefreshMapMenuFiles()
+        {
+            LoadMapOverlayFiles();
+            if (_mapMenu != null) _mapMenu.Children = BuildMapMenuItems();
+            RefreshMapOverlays();
+        }
+
+        private static void CreateMapOverlayFile()
+        {
+            var dialog = new Dialog("Create map XML", 62, 12);
+            var fileName = new TextField("") { X = 16, Y = 1, Width = 38 };
+            var displayName = new TextField("") { X = 16, Y = 2, Width = 38 };
+            var writeProtected = new CheckBox("Write protected") { X = 16, Y = 4 };
+            var selectable = new CheckBox("Items selectable") { X = 16, Y = 5, Checked = true };
+            dialog.Add(new Label("File name:") { X = 1, Y = 1 }, fileName, new Label("Display name:") { X = 1, Y = 2 }, displayName, writeProtected, selectable,
+                new Label("An empty MapData XML file will be created.") { X = 1, Y = 6 });
+            var create = new Button("Create", true);
+            create.Clicked += delegate
+            {
+                var entered = fileName.Text.ToString().Trim();
+                if (!entered.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) entered += ".xml";
+                if (String.IsNullOrWhiteSpace(entered) || entered != Path.GetFileName(entered) || entered.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                {
+                    MessageBox.ErrorQuery("Create map XML", "Enter a valid file name without a directory.", "OK"); return;
+                }
+                var directory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "map");
+                var target = Path.Combine(directory, entered);
+                if (File.Exists(target)) { MessageBox.ErrorQuery("Create map XML", "This file already exists.", "OK"); return; }
+                try
+                {
+                    Directory.CreateDirectory(directory);
+                    var data = new MapOverlayData { Name = String.IsNullOrWhiteSpace(displayName.Text.ToString()) ? Path.GetFileNameWithoutExtension(entered) : displayName.Text.ToString().Trim(), WriteProtected = writeProtected.Checked, Selectable = selectable.Checked };
+                    var serializer = new XmlSerializer(typeof(MapOverlayData));
+                    var xmlSettings = new System.Xml.XmlWriterSettings { Indent = true, Encoding = new UTF8Encoding(false) };
+                    using (var writer = System.Xml.XmlWriter.Create(target, xmlSettings)) serializer.Serialize(writer, data);
+                    SaveMapOverlayState(); RefreshMapMenuFiles(); Application.RequestStop();
+                }
+                catch (Exception ex) { MessageBox.ErrorQuery("Create map XML", ex.Message, "OK"); }
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(create); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static string EncodeSharedMapText(string value)
+        {
+            return Convert.ToBase64String(Encoding.UTF8.GetBytes(value ?? "")).TrimEnd('=');
+        }
+
+        private static string DecodeSharedMapText(string value)
+        {
+            value = value ?? "";
+            var remainder = value.Length % 4;
+            if (remainder != 0) value = value.PadRight(value.Length + 4 - remainder, '=');
+            return Encoding.UTF8.GetString(Convert.FromBase64String(value));
+        }
+
+        private static string FormatSharedMapCoordinate(double value)
+        {
+            var formatted = value.ToString("F6", CultureInfo.InvariantCulture).TrimEnd('0').TrimEnd('.');
+            return formatted == "-0" ? "0" : formatted;
+        }
+
+        private static string BuildSharedMapPointMessage(MapOverlayPoint point)
+        {
+            var colors = new[] { "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Brown", "Gray", "DarkGray", "BrightBlue", "BrightGreen", "BrightCyan", "BrightRed", "BrightMagenta", "BrightYellow", "White" };
+            var shapes = new[] { "Point", "Line", "Rectangle", "Circle" };
+            var colorCode = Math.Max(0, Array.FindIndex(colors, value => String.Equals(value, point.Color, StringComparison.OrdinalIgnoreCase)));
+            var shapeCode = Math.Max(0, Array.FindIndex(shapes, value => String.Equals(value, point.Shape, StringComparison.OrdinalIgnoreCase)));
+            return SharedMapPointPrefix + "1|" + point.Uuid.Replace("-", "") + "|" +
+                FormatSharedMapCoordinate(point.Latitude) + "|" +
+                FormatSharedMapCoordinate(point.Longitude) + "|" +
+                colorCode.ToString("x", CultureInfo.InvariantCulture) + "|" + shapeCode.ToString(CultureInfo.InvariantCulture) + "|" + point.EffectiveFillDensity.ToString(CultureInfo.InvariantCulture) + "|" +
+                EncodeSharedMapText(point.ShortName) + "|" + EncodeSharedMapText(point.Description) + "|" + EncodeSharedMapText(point.FillSymbol) + "|" +
+                (point.ReferenceLatitude.HasValue ? FormatSharedMapCoordinate(point.ReferenceLatitude.Value) : "") + "|" +
+                (point.ReferenceLongitude.HasValue ? FormatSharedMapCoordinate(point.ReferenceLongitude.Value) : "");
+        }
+
+        private static bool TryParseSharedMapPoint(string text, out MapOverlayPoint point)
+        {
+            point = null;
+            if (String.IsNullOrWhiteSpace(text) || !text.StartsWith(SharedMapPointPrefix, StringComparison.Ordinal)) return false;
+            var parts = text.Substring(SharedMapPointPrefix.Length).Split('|');
+            Guid uuid;
+            double latitude, longitude;
+            if (parts.Length != 12 || parts[0] != "1") return false;
+            if (!Guid.TryParse(parts[1], out uuid) ||
+                !Double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out latitude) ||
+                !Double.TryParse(parts[3], NumberStyles.Float, CultureInfo.InvariantCulture, out longitude) ||
+                latitude < -90d || latitude > 90d || longitude < -180d || longitude > 180d) return false;
+            try
+            {
+                int colorCode, shapeCode, fillDensity;
+                if (!Int32.TryParse(parts[4], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out colorCode) || colorCode < 0 || colorCode > 15 || !Int32.TryParse(parts[5], out shapeCode) || shapeCode < 0 || shapeCode > 3 || !Int32.TryParse(parts[6], out fillDensity) || fillDensity < 0 || fillDensity > 9) return false;
+                var colors = new[] { "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Brown", "Gray", "DarkGray", "BrightBlue", "BrightGreen", "BrightCyan", "BrightRed", "BrightMagenta", "BrightYellow", "White" };
+                var shapes = new[] { "Point", "Line", "Rectangle", "Circle" };
+                var name = DecodeSharedMapText(parts[7]).Trim();
+                if (String.IsNullOrWhiteSpace(name)) return false;
+                point = new MapOverlayPoint
+                {
+                    Uuid = uuid.ToString("D"), Latitude = latitude, Longitude = longitude,
+                    Color = colors[colorCode], Shape = shapes[shapeCode], Filled = fillDensity > 0, FillDensity = fillDensity,
+                    ShortName = name, Description = DecodeSharedMapText(parts[8]).Trim(), FillSymbol = DecodeSharedMapText(parts[9])
+                };
+                if (point.Shape != "Point")
+                {
+                    double referenceLatitude, referenceLongitude;
+                    if (Double.TryParse(parts[10], NumberStyles.Float, CultureInfo.InvariantCulture, out referenceLatitude) && Double.TryParse(parts[11], NumberStyles.Float, CultureInfo.InvariantCulture, out referenceLongitude) && referenceLatitude >= -90d && referenceLatitude <= 90d && referenceLongitude >= -180d && referenceLongitude <= 180d)
+                    { point.ReferenceLatitude = referenceLatitude; point.ReferenceLongitude = referenceLongitude; }
+                    else return false;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static string FormatMapPointCreator(uint nodeNumber)
+        {
+            var nodeId = "!" + nodeNumber.ToString("x8");
+            var display = DisplayNodeName(nodeNumber);
+            return String.IsNullOrWhiteSpace(display) || String.Equals(display, nodeId, StringComparison.OrdinalIgnoreCase) ? nodeId : display + " (" + nodeId + ")";
+        }
+
+        private static void SendSharedMapMessage(string message)
+        {
+            var channelIndex = _settings.Map.MapPointSharingChannelIndex;
+            // Native BLE operations must start without the terminal UI synchronization context.
+            // Otherwise a GATT write can reach the radio while its continuation waits on this UI thread.
+            var packetId = Task.Run(() => _mesh.SendTextToChannelWithIdAsync(channelIndex, message)).GetAwaiter().GetResult();
+            var channel = _mesh.Channels.FirstOrDefault(item => item.Index == channelIndex);
+            _store.AddOutgoing(packetId, _mesh.Device.MyNode == null ? 0u : _mesh.Device.MyNode.MyNodeNum, UInt32.MaxValue, message, channelIndex, channel == null ? null : channel.Name);
+            RefreshChatsUi();
+        }
+
+        private static void TryReceiveSharedMapPoint(MeshMessage message)
+        {
+            if (_settings == null || _settings.Map == null || !_settings.Map.MapPointSharingEnabled || message == null ||
+                !message.IsChannelMessage || !message.ChannelIndex.HasValue || (int)message.ChannelIndex.Value != _settings.Map.MapPointSharingChannelIndex) return;
+            MapPositionMarker position;
+            if (MapPositionMarkerProtocol.TryParse(message.Text, message.From, out position, _mesh.Protocol == MeshProtocol.MeshCore ? (Func<string, uint>)_store.GetOrCreateMeshCoreIdentity : null))
+            {
+                if (!_settings.Map.ReceivePositionMarkers) return;
+                var receivedUtc = DateTime.UtcNow;
+                Save(delegate
+                {
+                    if (_settings.StorePositionData && (!_settings.StorePositionFavoritesOnly || IsFavoriteNode(position.NodeNumber)))
+                    {
+                        _store.AddPosition(position.NodeNumber, new Meshtastic.Protobufs.Position
+                        {
+                            LatitudeI = (int)Math.Round(position.Latitude * 10000000d),
+                            LongitudeI = (int)Math.Round(position.Longitude * 10000000d)
+                        }, receivedUtc);
+                        RefreshTelemetryViews(position.NodeNumber, true);
+                    }
+                });
+                Ui(delegate { if (_nodeMap != null) _nodeMap.SetPositionMarker(position); });
+                return;
+            }
+            if (message.Text != null && message.Text.StartsWith(SharedMapPointDeletionPrefix, StringComparison.Ordinal))
+            {
+                if (!_settings.Map.ReceiveSharedMapPointDeletions) return;
+                Guid deletionUuid;
+                if (!Guid.TryParse(message.Text.Substring(SharedMapPointDeletionPrefix.Length).Trim(), out deletionUuid)) return;
+                var normalizedUuid = deletionUuid.ToString("D");
+                Ui(delegate
+                {
+                    var target = MapOverlayFiles.FirstOrDefault(file => file.Data != null && !file.Data.WriteProtected && file.Data.Places != null && String.Equals(Path.GetFileName(file.FileName), _settings.Map.MapPointSharingOverlayFile, StringComparison.OrdinalIgnoreCase));
+                    if (target == null) return;
+                    var deletionPoint = target.Data.Places.FirstOrDefault(item => !String.IsNullOrWhiteSpace(item.Uuid) && String.Equals(item.Uuid, normalizedUuid, StringComparison.OrdinalIgnoreCase));
+                    if (deletionPoint == null) return;
+                    target.Data.Places.Remove(deletionPoint);
+                    try { SaveMapOverlayFile(target); RefreshMapOverlays(); }
+                    catch { target.Data.Places.Add(deletionPoint); }
+                });
+                return;
+            }
+            MapOverlayPoint point;
+            if (!TryParseSharedMapPoint(message.Text, out point)) return;
+            point.Creator = FormatMapPointCreator(message.From);
+            Ui(delegate
+            {
+                var target = MapOverlayFiles.FirstOrDefault(file => file.Data != null && !file.Data.WriteProtected && String.Equals(Path.GetFileName(file.FileName), _settings.Map.MapPointSharingOverlayFile, StringComparison.OrdinalIgnoreCase));
+                if (target == null) return;
+                if (MapOverlayFiles.Any(file => file.Data != null && file.Data.Places != null && file.Data.Places.Any(existing => !String.IsNullOrWhiteSpace(existing.Uuid) && String.Equals(existing.Uuid, point.Uuid, StringComparison.OrdinalIgnoreCase)))) return;
+                point.SourceFile = target.FileName;
+                point.OverlayName = target.DisplayName;
+                point.Selectable = target.Data.Selectable;
+                try
+                {
+                    target.Data.Places.Add(point);
+                    SaveMapOverlayFile(target);
+                    target.Enabled = true;
+                    SaveMapOverlayState();
+                    RefreshMapOverlays();
+                    if (_settings.Map.CenterMapOnReceivedSharedPoint && _nodeMap != null) _nodeMap.CenterOn(point.Latitude, point.Longitude);
+                }
+                catch { }
+            });
+        }
+
+        private static void ShowMapPointSymbolPicker(TextField shortName)
+        {
+            var symbols = new[]
+            {
+                "␀", "☺", "☻", "♥", "♦", "♣", "♠", "•", "◘", "○", "◙", "♂", "♀", "♪", "♫", "☼",
+                "►", "◄", "↕", "‼", "¶", "§", "▬", "↨", "↑", "↓", "→", "←", "∟", "↔", "▲", "▼"
+            };
+            symbols = symbols.Concat(new[] { "\u2302" })
+                .Concat(Enumerable.Range(0x2295, 0x22A1 - 0x2295 + 1).Select(code => Char.ConvertFromUtf32(code)))
+                .Concat(Enumerable.Range(0x29E8, 0x29F3 - 0x29E8 + 1).Select(code => Char.ConvertFromUtf32(code))).ToArray();
+            var labels = symbols.Select((symbol, index) => index.ToString("00", CultureInfo.InvariantCulture) + "   " + symbol +
+                "   U+" + Char.ConvertToUtf32(symbol, 0).ToString("X4", CultureInfo.InvariantCulture)).ToList();
+            var dialog = new Dialog("Map point symbol", 54, 19);
+            var list = new ListView(labels) { X = 2, Y = 3, Width = 30, Height = 10 };
+            dialog.Add(
+                new Label("CP437 symbols and additional Unicode symbols") { X = 2, Y = 1, Width = Dim.Fill(2) },
+                list);
+            var select = new Button("Select", true);
+            select.Clicked += delegate
+            {
+                if (list.SelectedItem < 0 || list.SelectedItem >= symbols.Length) return;
+                shortName.Text = symbols[list.SelectedItem];
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(select); dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+            shortName.SetFocus();
+        }
+
+        private static void CreateMapOverlayPoint(double latitudeValue, double longitudeValue)
+        {
+            var writableFiles = MapOverlayFiles.Where(file => file.Data != null && !file.Data.WriteProtected).ToList();
+            if (writableFiles.Count == 0) { MessageBox.Query("New map point", "Create or unlock a map XML file first.", "OK"); return; }
+            var dialog = new Dialog("New map item", 92, 29);
+            var pendingUuid = Guid.NewGuid().ToString("D");
+            var latitude = new TextField(latitudeValue.ToString("F6", CultureInfo.InvariantCulture)) { X = 16, Y = 1, Width = 22 };
+            var longitude = new TextField(longitudeValue.ToString("F6", CultureInfo.InvariantCulture)) { X = 16, Y = 2, Width = 22 };
+            var files = new ListView(writableFiles.Select(file => file.DisplayName + " (" + Path.GetFileName(file.FileName) + ")").ToList()) { X = 16, Y = 4, Width = 38, Height = 5 };
+            var previousFile = writableFiles.FindIndex(file => String.Equals(Path.GetFileName(file.FileName), _lastMapPointFile, StringComparison.OrdinalIgnoreCase));
+            files.SelectedItem = previousFile >= 0 ? previousFile : 0;
+            var colorNames = new[] { "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Brown", "Gray", "DarkGray", "BrightBlue", "BrightGreen", "BrightCyan", "BrightRed", "BrightMagenta", "BrightYellow", "White" };
+            var color = new RadioGroup(new Rect(60, 1, 27, colorNames.Length), colorNames.Select(name => (ustring)name).ToArray());
+            var previousColor = Array.FindIndex(colorNames, name => String.Equals(name, _lastMapPointColor, StringComparison.OrdinalIgnoreCase));
+            color.SelectedItem = previousColor >= 0 ? previousColor : Array.IndexOf(colorNames, "Green");
+            var shapeNames = new[] { "Point", "Line", "Rectangle", "Circle" };
+            var shape = new RadioGroup(new Rect(16, 10, 24, shapeNames.Length), shapeNames.Select(name => (ustring)name).ToArray());
+            shape.SelectedItem = Array.IndexOf(shapeNames, _nodeMap.MeasurementShape);
+            var fillDensity = new TextField("0") { X = 16, Y = 14, Width = 3 };
+            var fillSymbol = new TextField("*") { X = 16, Y = 15, Width = 4 };
+            var selectFillSymbol = new Button("Symbol") { X = 23, Y = 15 };
+            selectFillSymbol.Clicked += delegate { ShowMapPointSymbolPicker(fillSymbol); };
+            var shortName = new TextField(_lastMapPointShortName) { X = 16, Y = 16, Width = 27 };
+            var selectSymbol = new Button("Symbol") { X = 45, Y = 16 };
+            selectSymbol.Clicked += delegate { ShowMapPointSymbolPicker(shortName); };
+            var description = new MessageInputView { X = 16, Y = 18, Width = 38, Height = 5, WordWrap = true, Text = _lastMapPointDescription };
+            var sendPoint = new CheckBox("Send item through configured channel") { X = 16, Y = 24, Checked = _settings.Map != null && _settings.Map.MapPointSharingEnabled };
+            var remaining = new Label("") { X = 16, Y = 23, Width = 52 };
+            Func<MapOverlayPoint> buildPoint = delegate
+            {
+                var selectedShape = shape.SelectedItem >= 0 && shape.SelectedItem < shapeNames.Length ? shapeNames[shape.SelectedItem] : "Point";
+                var selectedColor = color.SelectedItem >= 0 && color.SelectedItem < colorNames.Length ? colorNames[color.SelectedItem] : "Green";
+                double currentLatitude, currentLongitude; if (!TryParseCoordinate(latitude.Text.ToString(), out currentLatitude)) currentLatitude = latitudeValue; if (!TryParseCoordinate(longitude.Text.ToString(), out currentLongitude)) currentLongitude = longitudeValue;
+                int density; if (!Int32.TryParse(fillDensity.Text.ToString(), out density)) density = 0;
+                var previewPoint = new MapOverlayPoint { Uuid = pendingUuid, Shape = selectedShape, Filled = density > 0, FillDensity = density, Latitude = currentLatitude, Longitude = currentLongitude, ReferenceLatitude = selectedShape != "Point" && _nodeMap.HasMeasurementPoint ? (double?)_nodeMap.MeasurementLatitude : null, ReferenceLongitude = selectedShape != "Point" && _nodeMap.HasMeasurementPoint ? (double?)_nodeMap.MeasurementLongitude : null, Color = selectedColor, ShortName = shortName.Text.ToString().Trim(), Description = description.Text.ToString().Trim(), FillSymbol = fillSymbol.Text.ToString() };
+                if (selectedShape == "Circle" && _nodeMap.HasMeasurementPoint)
+                {
+                    previewPoint.ReferenceLatitude = currentLatitude; previewPoint.ReferenceLongitude = currentLongitude;
+                    previewPoint.Latitude = _nodeMap.MeasurementLatitude; previewPoint.Longitude = _nodeMap.MeasurementLongitude;
+                }
+                return previewPoint;
+            };
+                        Action updateRemaining = delegate
+            {
+                var used = Encoding.UTF8.GetByteCount(BuildSharedMapPointMessage(buildPoint()));
+                var available = _mesh.GetMaximumTextPayloadBytes(true) - used;
+                remaining.Text = _mesh.Protocol + " message: " + Math.Abs(available).ToString(CultureInfo.InvariantCulture) + (available >= 0 ? " bytes remaining" : " bytes over limit");
+                remaining.SetNeedsDisplay();
+            };
+            latitude.TextChanged += delegate { updateRemaining(); }; longitude.TextChanged += delegate { updateRemaining(); }; shortName.TextChanged += delegate { updateRemaining(); }; description.TextChanged += delegate { updateRemaining(); }; description.ContentsChanged += delegate { updateRemaining(); }; fillDensity.TextChanged += delegate { updateRemaining(); }; fillSymbol.TextChanged += delegate { updateRemaining(); }; shape.SelectedItemChanged += delegate { updateRemaining(); }; color.SelectedItemChanged += delegate { updateRemaining(); };
+            dialog.Add(new Label("Latitude:") { X = 1, Y = 1 }, latitude,
+                new Label("Longitude:") { X = 1, Y = 2 }, longitude,
+                new Label("XML file:") { X = 1, Y = 4 }, files,
+                new Label("Colors:") { X = 60, Y = 0 }, color,
+                new Label("Shape:") { X = 1, Y = 10 }, shape,
+                new Label(_nodeMap.HasMeasurementPoint ? "Reference M is available" : "Press M on map for shapes") { X = 16, Y = 9, Width = 38 },
+                new Label("Fill density:") { X = 1, Y = 14 }, fillDensity, new Label("(0-9)") { X = 21, Y = 14 },
+                new Label("Fill symbol:") { X = 1, Y = 15 }, fillSymbol, selectFillSymbol,
+                new Label("Short name:") { X = 1, Y = 16 }, shortName, selectSymbol,
+                new Label("Description:") { X = 1, Y = 18 }, description,
+                remaining, sendPoint);
+            updateRemaining();
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                double parsedLatitude, parsedLongitude;
+                if (!TryParseCoordinate(latitude.Text.ToString(), out parsedLatitude) || !TryParseCoordinate(longitude.Text.ToString(), out parsedLongitude) || parsedLatitude < -90d || parsedLatitude > 90d || parsedLongitude < -180d || parsedLongitude > 180d)
+                { MessageBox.ErrorQuery("New map point", "Enter valid latitude and longitude values.", "OK"); return; }
+                if (files.SelectedItem < 0 || files.SelectedItem >= writableFiles.Count) { MessageBox.ErrorQuery("New map point", "Select an XML file.", "OK"); return; }
+                if (String.IsNullOrWhiteSpace(shortName.Text.ToString())) { MessageBox.ErrorQuery("New map point", "Enter a short name.", "OK"); return; }
+                if (color.SelectedItem < 0 || color.SelectedItem >= colorNames.Length) { MessageBox.ErrorQuery("New map point", "Select a color.", "OK"); return; }
+                if (shape.SelectedItem < 0 || shape.SelectedItem >= shapeNames.Length) { MessageBox.ErrorQuery("New map item", "Select a shape.", "OK"); return; }
+                if (shape.SelectedItem > 0 && !_nodeMap.HasMeasurementPoint) { MessageBox.ErrorQuery("New map item", "Press M on the map first to set the second reference point.", "OK"); return; }
+                int parsedFillDensity;
+                if (!Int32.TryParse(fillDensity.Text.ToString(), out parsedFillDensity) || parsedFillDensity < 0 || parsedFillDensity > 9) { MessageBox.ErrorQuery("New map item", "Enter a fill density from 0 to 9.", "OK"); return; }
+                if (parsedFillDensity > 0 && (String.IsNullOrEmpty(fillSymbol.Text.ToString()) || new StringInfo(fillSymbol.Text.ToString()).LengthInTextElements != 1)) { MessageBox.ErrorQuery("New map item", "Select exactly one fill symbol.", "OK"); return; }
+                var selectedColor = colorNames[color.SelectedItem];
+                var target = writableFiles[files.SelectedItem];
+                var localNodeNumber = _mesh.Device.MyNode == null ? 0u : _mesh.Device.MyNode.MyNodeNum;
+                var point = buildPoint();
+                point.Creator = localNodeNumber == 0u ? "Local user" : FormatMapPointCreator(localNodeNumber); point.Color = selectedColor; point.SourceFile = target.FileName; point.OverlayName = target.DisplayName;
+                string sharedMessage = null;
+                if (sendPoint.Checked)
+                {
+                    if (_settings.Map == null || !_settings.Map.MapPointSharingEnabled) { MessageBox.ErrorQuery("New map point", "Enable and configure map point sharing in the Map menu first.", "OK"); return; }
+                    if (!_mesh.IsConnected) { MessageBox.ErrorQuery("New map point", "The Meshtastic device is not connected.", "OK"); return; }
+                    sharedMessage = BuildSharedMapPointMessage(point);
+                    if (Encoding.UTF8.GetByteCount(sharedMessage) > _mesh.GetMaximumTextPayloadBytes(true)) { MessageBox.ErrorQuery("New map point", "This point needs " + Encoding.UTF8.GetByteCount(sharedMessage).ToString(CultureInfo.InvariantCulture) + " bytes, but this mesh channel message can contain only " + _mesh.GetMaximumTextPayloadBytes(true).ToString(CultureInfo.InvariantCulture) + ". Shorten the name or description.", "OK"); return; }
+                }
+                target.Data.Places.Add(point);
+                try { SaveMapOverlayFile(target); }
+                catch (Exception ex) { target.Data.Places.Remove(point); MessageBox.ErrorQuery("New map point", ex.Message, "OK"); return; }
+                target.Enabled = true;
+                if (sendPoint.Checked)
+                {
+                    try { SendSharedMapMessage(sharedMessage); }
+                    catch (Exception ex) { MessageBox.ErrorQuery("Map point sharing", "The point was saved locally, but could not be sent:\n" + ex.Message, "OK"); }
+                }
+                _lastMapPointFile = Path.GetFileName(target.FileName); _lastMapPointColor = point.Color; _lastMapPointShortName = point.ShortName; _lastMapPointDescription = point.Description;
+                _nodeMap.ResetMeasurement(); SaveMapOverlayState(); RefreshMapOverlays(); if (_mapMenu != null) _mapMenu.Children = BuildMapMenuItems(); Application.RequestStop();
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException); _nodeMap.SetFocus();
+        }
+        private static void ChangeMapOverlayProtection()
+        {
+            if (MapOverlayFiles.Count == 0) { MessageBox.Query("Map XML protection", "No map XML files are available.", "OK"); return; }
+            var dialog = new Dialog("Map XML protection", 70, 16);
+            var list = new ListView(MapOverlayFiles.Select(file => (file.Data != null && file.Data.WriteProtected ? "[protected] " : "[writable] ") + file.DisplayName + " (" + Path.GetFileName(file.FileName) + ")").ToList()) { X = 1, Y = 1, Width = Dim.Fill(2), Height = Dim.Fill(4) };
+            if (_mapOverlayOrderList != null && _mapOverlayOrderList.SelectedItem >= 0 && _mapOverlayOrderList.SelectedItem < MapOverlayFiles.Count) list.SelectedItem = _mapOverlayOrderList.SelectedItem;
+            dialog.Add(list);
+            var change = new Button("Change", true);
+            change.Clicked += delegate
+            {
+                if (list.SelectedItem < 0 || list.SelectedItem >= MapOverlayFiles.Count) return;
+                var file = MapOverlayFiles[list.SelectedItem];
+                try { file.Data.WriteProtected = !file.Data.WriteProtected; SaveMapOverlayFile(file); RefreshMapMenuFiles(); Application.RequestStop(); }
+                catch (Exception ex) { MessageBox.ErrorQuery("Map XML protection", ex.Message, "OK"); }
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(change); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException);
+        }
+        private static void DeleteMapOverlayFile()
+        {
+            if (MapOverlayFiles.Count == 0) { MessageBox.Query("Delete map XML", "No map XML files are available.", "OK"); return; }
+            var dialog = new Dialog("Delete map XML", 70, 16);
+            var list = new ListView(MapOverlayFiles.Select(file => (file.Data != null && file.Data.WriteProtected ? "[protected] " : "") + file.DisplayName + " (" + Path.GetFileName(file.FileName) + ")").ToList()) { X = 1, Y = 1, Width = Dim.Fill(2), Height = Dim.Fill(4) };
+            if (_mapOverlayOrderList != null && _mapOverlayOrderList.SelectedItem >= 0 && _mapOverlayOrderList.SelectedItem < MapOverlayFiles.Count) list.SelectedItem = _mapOverlayOrderList.SelectedItem;
+            dialog.Add(list);
+            var delete = new Button("Delete", true);
+            delete.Clicked += delegate
+            {
+                if (list.SelectedItem < 0 || list.SelectedItem >= MapOverlayFiles.Count) return;
+                var selectedFile = MapOverlayFiles[list.SelectedItem];
+                if (selectedFile.Data != null && selectedFile.Data.WriteProtected) { MessageBox.ErrorQuery("Delete map XML", "This XML file is write protected and cannot be deleted.", "OK"); return; }
+                if (MessageBox.Query("Delete map XML", "Delete " + Path.GetFileName(selectedFile.FileName) + "?", "Delete", "Cancel") != 0) return;
+                try { File.Delete(selectedFile.FileName); MapOverlayFiles.Remove(selectedFile); SaveMapOverlayState(); RefreshMapMenuFiles(); Application.RequestStop(); }
+                catch (Exception ex) { MessageBox.ErrorQuery("Delete map XML", ex.Message, "OK"); }
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(delete); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException);
+        }
+        private static void LoadMapOverlayFiles()
+        {
+            MapOverlayFiles.Clear();
+            var directory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "map");
+            if (!Directory.Exists(directory)) return;
+            var serializer = new XmlSerializer(typeof(MapOverlayData));
+            foreach (var fileName in Directory.GetFiles(directory, "*.xml").OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    using (var stream = File.OpenRead(fileName))
+                    {
+                        var data = serializer.Deserialize(stream) as MapOverlayData;
+                        if (data == null) continue;
+                        foreach (var point in data.Places ?? new List<MapOverlayPoint>()) { point.SourceFile = fileName; point.OverlayName = String.IsNullOrWhiteSpace(data.Name) ? Path.GetFileNameWithoutExtension(fileName) : data.Name; point.Selectable = data.Selectable; }
+                        var enabled = _settings.Map != null && _settings.Map.ActiveOverlayFiles != null ? _settings.Map.ActiveOverlayFiles.Any(saved => String.Equals(saved, Path.GetFileName(fileName), StringComparison.OrdinalIgnoreCase)) : false;
+                        MapOverlayFiles.Add(new MapOverlayFile { FileName = fileName, DisplayName = String.IsNullOrWhiteSpace(data.Name) ? Path.GetFileNameWithoutExtension(fileName) : data.Name, Enabled = enabled, Data = data });
+                    }
+                }
+                catch { }
+            }
+            var savedOrder = _settings.Map != null && _settings.Map.ActiveOverlayFiles != null ? _settings.Map.ActiveOverlayFiles : new List<string>();
+            MapOverlayFiles.Sort(delegate(MapOverlayFile left, MapOverlayFile right)
+            {
+                var leftIndex = savedOrder.FindIndex(name => String.Equals(name, Path.GetFileName(left.FileName), StringComparison.OrdinalIgnoreCase));
+                var rightIndex = savedOrder.FindIndex(name => String.Equals(name, Path.GetFileName(right.FileName), StringComparison.OrdinalIgnoreCase));
+                if (leftIndex >= 0 && rightIndex >= 0) return leftIndex.CompareTo(rightIndex);
+                if (leftIndex >= 0) return -1;
+                if (rightIndex >= 0) return 1;
+                return StringComparer.OrdinalIgnoreCase.Compare(left.DisplayName, right.DisplayName);
+            });
+        }
+
+        private static void SaveMapOverlayFile(MapOverlayFile file)
+        {
+            if (file == null || file.Data == null || String.IsNullOrWhiteSpace(file.FileName)) throw new InvalidOperationException("The map XML file is unavailable.");
+            var temporary = file.FileName + ".tmp";
+            var serializer = new XmlSerializer(typeof(MapOverlayData));
+            var xmlSettings = new System.Xml.XmlWriterSettings { Indent = true, Encoding = new UTF8Encoding(false) };
+            try
+            {
+                using (var writer = System.Xml.XmlWriter.Create(temporary, xmlSettings)) serializer.Serialize(writer, file.Data);
+                File.Copy(temporary, file.FileName, true);
+            }
+            finally { try { if (File.Exists(temporary)) File.Delete(temporary); } catch { } }
+        }
+        private static void ShowMapOverlayOrderPopup()
+        {
+            var dialog = new Dialog("Overlays", 96, 22);
+            _mapOverlayOrderList = new ListView { X = 1, Y = 1, Width = Dim.Fill(2), Height = Dim.Fill(1) };
+            _mapOverlayOrderList.KeyPress += e =>
+            {
+                if (e.KeyEvent.Key == (Key.CursorUp | Key.AltMask)) { MoveActiveMapOverlay(-1); e.Handled = true; }
+                else if (e.KeyEvent.Key == (Key.CursorDown | Key.AltMask)) { MoveActiveMapOverlay(1); e.Handled = true; }
+                else if (e.KeyEvent.Key == (Key)' ') { ToggleSelectedMapOverlay(); e.Handled = true; }
+            };
+            _mapOverlayOrderList.OpenSelectedItem += delegate { ToggleSelectedMapOverlay(); };
+            dialog.Add(_mapOverlayOrderList);
+            var toggle = new Button("Enable/Disable"); toggle.Clicked += ToggleSelectedMapOverlay;
+            var up = new Button("Up"); up.Clicked += delegate { MoveActiveMapOverlay(-1); };
+            var down = new Button("Down"); down.Clicked += delegate { MoveActiveMapOverlay(1); };
+            var create = new Button("New XML"); create.Clicked += CreateMapOverlayFile;
+            var protection = new Button("Protection"); protection.Clicked += ChangeMapOverlayProtection;
+            var delete = new Button("Delete"); delete.Clicked += DeleteMapOverlayFile;
+            var close = new Button("Close", true); close.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(toggle); dialog.AddButton(up); dialog.AddButton(down); dialog.AddButton(create); dialog.AddButton(protection); dialog.AddButton(delete); dialog.AddButton(close);
+            RefreshMapOverlayOrderBox();
+            _mapOverlayOrderList.SetFocus();
+            Application.Run(dialog, HandleTerminalGuiException);
+            _mapOverlayOrderList = null;
+            if (_mapPage != null && _mapPage.Visible && _nodeMap != null) _nodeMap.SetFocus();
+        }
+
+        private static void RefreshMapOverlayOrderBox()
+        {
+            if (_mapOverlayOrderList == null) return;
+            var selectedFile = _mapOverlayOrderList.SelectedItem >= 0 && _mapOverlayOrderList.SelectedItem < MapOverlayFiles.Count ? MapOverlayFiles[_mapOverlayOrderList.SelectedItem].FileName : null;
+            var active = MapOverlayFiles.Where(file => file.Enabled).ToList();
+            _mapOverlayOrderList.SetSource(MapOverlayFiles.Select(file =>
+                (file.Enabled ? "[x] " + (active.IndexOf(file) + 1).ToString().PadLeft(2) : "[ ]  -") + "  " + file.DisplayName + " (" + Path.GetFileName(file.FileName) + ")" +
+                (file.Data != null && file.Data.WriteProtected ? " [protected]" : "") + (file.Data != null && !file.Data.Selectable ? " [display only]" : "")).ToList());
+            var selectedIndex = MapOverlayFiles.FindIndex(file => String.Equals(file.FileName, selectedFile, StringComparison.OrdinalIgnoreCase));
+            if (MapOverlayFiles.Count > 0) _mapOverlayOrderList.SelectedItem = selectedIndex >= 0 ? selectedIndex : Math.Min(Math.Max(0, _mapOverlayOrderList.SelectedItem), MapOverlayFiles.Count - 1);
+        }
+
+        private static void ToggleSelectedMapOverlay()
+        {
+            if (_mapOverlayOrderList == null || _mapOverlayOrderList.SelectedItem < 0 || _mapOverlayOrderList.SelectedItem >= MapOverlayFiles.Count) return;
+            var selected = MapOverlayFiles[_mapOverlayOrderList.SelectedItem];
+            selected.Enabled = !selected.Enabled;
+            RefreshMapOverlays();
+            _mapOverlayOrderList.SelectedItem = MapOverlayFiles.IndexOf(selected);
+            SaveMapOverlayState();
+        }
+
+        private static void MoveActiveMapOverlay(int direction)
+        {
+            if (_mapOverlayOrderList == null || _mapOverlayOrderList.SelectedItem < 0 || _mapOverlayOrderList.SelectedItem >= MapOverlayFiles.Count) return;
+            var selectedFile = MapOverlayFiles[_mapOverlayOrderList.SelectedItem];
+            if (!selectedFile.Enabled) return;
+            var active = MapOverlayFiles.Where(file => file.Enabled).ToList();
+            var selected = active.IndexOf(selectedFile);
+            var target = selected + direction;
+            if (target < 0 || target >= active.Count) return;
+            var firstIndex = MapOverlayFiles.IndexOf(selectedFile);
+            var secondIndex = MapOverlayFiles.IndexOf(active[target]);
+            MapOverlayFiles[firstIndex] = MapOverlayFiles[secondIndex];
+            MapOverlayFiles[secondIndex] = selectedFile;
+            RefreshMapOverlays();
+            _mapOverlayOrderList.SelectedItem = MapOverlayFiles.IndexOf(selectedFile);
+            SaveMapOverlayState();
+        }
+
+        private static void RefreshMapOverlays()
+        {
+            if (_nodeMap != null)
+            {
+                var points = MapOverlayFiles.Where(file => file.Enabled && file.Data != null && file.Data.Places != null).SelectMany(file => file.Data.Places).ToList();
+                points.AddRange(BuildPositionTrackPoints());
+                if (_temporaryMeshCorePathsVisible) points.AddRange(TemporaryMeshCorePaths);
+                _nodeMap.SetOverlayPoints(points);
+            }
+            RefreshMapOverlayOrderBox();
+            if (_mapMenu != null) _mapMenu.Children = BuildMapMenuItems();
+        }
+        private static IEnumerable<MapOverlayPoint> BuildPositionTrackPoints()
+        {
+            if (_settings.Map == null || !_settings.Map.PositionTrackVisible || !_settings.Map.PositionTrackNodeNumber.HasValue) return Enumerable.Empty<MapOverlayPoint>();
+            var nodeNumber = _settings.Map.PositionTrackNodeNumber.Value;
+            var symbol = String.IsNullOrWhiteSpace(_settings.Map.PositionTrackSymbol) ? "O" : _settings.Map.PositionTrackSymbol.Trim();
+            var color = String.IsNullOrWhiteSpace(_settings.Map.PositionTrackColor) ? "BrightYellow" : _settings.Map.PositionTrackColor;
+            var nowUtc = DateTime.UtcNow;
+            var newestUtc = nowUtc.AddHours(-_settings.Map.PositionTrackFromHoursAgo);
+            var oldestUtc = nowUtc.AddHours(-_settings.Map.PositionTrackToHoursAgo);
+            return _store.GetPositions(nodeNumber, oldestUtc, newestUtc, 5000).Select(position => new MapOverlayPoint
+            {
+                Latitude = position.Latitude.Value,
+                Longitude = position.Longitude.Value,
+                ShortName = symbol,
+                Color = color,
+                Selectable = true,
+                IsTelemetryPosition = true,
+                TelemetryNodeNumber = nodeNumber,
+                TelemetryReceivedAtUtc = position.ReceivedAtUtc,
+                TelemetryAltitude = position.Altitude,
+                OverlayName = "Node position history"
+            }).ToList();
+        }
+        private static void SaveMapOverlayState()
+        {
+            if (_settings == null) return;
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            _settings.Map.ActiveOverlayFiles = MapOverlayFiles.Where(file => file.Enabled).Select(file => Path.GetFileName(file.FileName)).ToList();
+        }
+        private static void SaveMapViewState()
+        {
+            if (_settings == null || _nodeMap == null) return;
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            _settings.Map.CenterLatitude = _nodeMap.CenterLatitude;
+            _settings.Map.CenterLongitude = _nodeMap.CenterLongitude;
+            _settings.Map.MetersPerRow = _nodeMap.MetersPerRow;
+            SaveMapOverlayState();
+        }
+        private static void UpdateMapInfo(StoredMeshNode node)
+        {
+            if (_mapInfo == null) return;
+            if (node == null) { _mapInfo.Text = "Multiple nodes selected - Enter: node list | Space: center"; return; }
+            var distance = MeshtasticClient.GetDistanceMeters(_mesh.Device.Latitude, _mesh.Device.Longitude, node.Latitude, node.Longitude);
+            var bearing = MeshtasticClient.GetInitialBearingDegrees(_mesh.Device.Latitude, _mesh.Device.Longitude, node.Latitude, node.Longitude);
+            var distanceText = !distance.HasValue ? "-" : distance.Value < 1000d ? Math.Round(distance.Value) + " m" : (distance.Value / 1000d).ToString("F1", CultureInfo.InvariantCulture) + " km";
+            var directionText = bearing.HasValue ? Math.Round(bearing.Value) + "° " + MeshtasticClient.GetCompassDirection(bearing.Value) : "-";
+            _mapInfo.Text = "Node | " + (String.IsNullOrWhiteSpace(node.LongName) ? node.NodeId ?? "!" + node.NodeNumber.ToString("x8") : node.LongName) + " | Direction " + directionText + " | Distance " + distanceText + " | Hops " + (node.HopsAway.HasValue ? node.HopsAway.Value.ToString(CultureInfo.InvariantCulture) : "-");
+        }
+        private static void UpdateMapOverlayInfo(MapOverlayPoint point)
+        {
+            if (_mapInfo == null || point == null) return;
+            if (point.IsTelemetryPosition)
+            {
+                _mapInfo.Text = "Position history | " + DisplayNodeName(point.TelemetryNodeNumber) + " | " + (point.TelemetryReceivedAtUtc.HasValue ? point.TelemetryReceivedAtUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "-") + " | " + FormatPositionAge(point.TelemetryReceivedAtUtc) + " | " + point.Latitude.ToString("F6", CultureInfo.InvariantCulture) + ", " + point.Longitude.ToString("F6", CultureInfo.InvariantCulture) + (point.TelemetryAltitude.HasValue ? " | " + point.TelemetryAltitude.Value.ToString(CultureInfo.InvariantCulture) + " m" : "");
+                return;
+            }
+            var distance = MeshtasticClient.GetDistanceMeters(_mesh.Device.Latitude, _mesh.Device.Longitude, point.Latitude, point.Longitude);
+            var bearing = MeshtasticClient.GetInitialBearingDegrees(_mesh.Device.Latitude, _mesh.Device.Longitude, point.Latitude, point.Longitude);
+            var distanceText = !distance.HasValue ? "-" : distance.Value < 1000d ? Math.Round(distance.Value) + " m" : (distance.Value / 1000d).ToString("F1", CultureInfo.InvariantCulture) + " km";
+            var directionText = bearing.HasValue ? Math.Round(bearing.Value) + "° " + MeshtasticClient.GetCompassDirection(bearing.Value) : "-";
+            _mapInfo.Text = "Map overlay | " + Path.GetFileName(point.SourceFile ?? "-") + " | Direction " + directionText + " | Distance " + distanceText + " | Description " + (String.IsNullOrWhiteSpace(point.Description) ? point.ShortName ?? "?" : point.Description);
+        }
+        private static string FormatPositionAge(DateTime? receivedAtUtc)
+        {
+            if (!receivedAtUtc.HasValue) return "age unavailable";
+            var age = DateTime.UtcNow - receivedAtUtc.Value.ToUniversalTime();
+            if (age < TimeSpan.Zero) age = TimeSpan.Zero;
+            if (age.TotalDays >= 1d) return ((int)age.TotalDays).ToString(CultureInfo.InvariantCulture) + "d " + age.Hours.ToString(CultureInfo.InvariantCulture) + "h ago";
+            if (age.TotalHours >= 1d) return ((int)age.TotalHours).ToString(CultureInfo.InvariantCulture) + "h " + age.Minutes.ToString(CultureInfo.InvariantCulture) + "m ago";
+            if (age.TotalMinutes >= 1d) return ((int)age.TotalMinutes).ToString(CultureInfo.InvariantCulture) + "m " + age.Seconds.ToString(CultureInfo.InvariantCulture) + "s ago";
+            return Math.Max(0, (int)age.TotalSeconds).ToString(CultureInfo.InvariantCulture) + "s ago";
+        }
+        private static void CopyPositionHistoryPoint(MapOverlayPoint point)
+        {
+            var header = "ReceivedUtc\tLatitude\tLongitude\tAltitudeMeters";
+            var row = (point.TelemetryReceivedAtUtc.HasValue ? point.TelemetryReceivedAtUtc.Value.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) : "") + "\t" +
+                point.Latitude.ToString("F7", CultureInfo.InvariantCulture) + "\t" + point.Longitude.ToString("F7", CultureInfo.InvariantCulture) + "\t" +
+                (point.TelemetryAltitude.HasValue ? point.TelemetryAltitude.Value.ToString(CultureInfo.InvariantCulture) : "");
+            CopyTextWithFallback(header + Environment.NewLine + row, "Position and timestamp copied.", "Node position");
+        }
+        private static void CopyAllPositionHistory(uint nodeNumber)
+        {
+            var positions = _store.GetPositions(nodeNumber, Int32.MaxValue);
+            var rows = new List<string> { "ReceivedUtc\tLatitude\tLongitude\tAltitudeMeters" };
+            rows.AddRange(positions.Select(position => position.ReceivedAtUtc.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) + "\t" +
+                position.Latitude.Value.ToString("F7", CultureInfo.InvariantCulture) + "\t" + position.Longitude.Value.ToString("F7", CultureInfo.InvariantCulture) + "\t" +
+                (position.Altitude.HasValue ? position.Altitude.Value.ToString(CultureInfo.InvariantCulture) : "")));
+            CopyTextWithFallback(String.Join(Environment.NewLine, rows), positions.Count + " stored positions copied with timestamps.", "Node position history");
+        }
+
+        private static bool ConfirmMapOverlayPointDeletion(MapOverlayPoint point, MapOverlayFile source, out bool sendDeletion)
+        {
+            var canShare = _settings != null && _settings.Map != null && _settings.Map.MapPointSharingEnabled && !String.IsNullOrWhiteSpace(point.Uuid);
+            var confirmed = false;
+            var dialog = new Dialog("Delete map item", 72, 12);
+            var send = new CheckBox("Send deletion through configured channel") { X = 2, Y = 4, Checked = canShare, Enabled = !String.IsNullOrWhiteSpace(point.Uuid) };
+            dialog.Add(
+                new Label("Delete this item from " + Path.GetFileName(source.FileName) + "?") { X = 2, Y = 1, Width = Dim.Fill(2) },
+                new Label(String.IsNullOrWhiteSpace(point.Uuid) ? "This older point has no UUID and cannot be deleted remotely." : "UUID: " + point.Uuid) { X = 2, Y = 2, Width = Dim.Fill(2) },
+                send);
+            var delete = new Button("Delete", true);
+            delete.Clicked += delegate { confirmed = true; Application.RequestStop(); };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(delete); dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+            sendDeletion = confirmed && send.Checked;
+            return confirmed;
+        }
+
+        private static void ShowMapOverlayDetails(MapOverlayPoint point)
+        {
+            if (point == null) return;
+            if (point.IsTelemetryPosition)
+            {
+                var distance = MeshtasticClient.GetDistanceMeters(_mesh.Device.Latitude, _mesh.Device.Longitude, point.Latitude, point.Longitude);
+                var bearing = MeshtasticClient.GetInitialBearingDegrees(_mesh.Device.Latitude, _mesh.Device.Longitude, point.Latitude, point.Longitude);
+                var distanceText = !distance.HasValue ? "-" : distance.Value < 1000d ? Math.Round(distance.Value) + " m" : (distance.Value / 1000d).ToString("F1", CultureInfo.InvariantCulture) + " km";
+                var directionText = bearing.HasValue ? Math.Round(bearing.Value) + "° " + MeshtasticClient.GetCompassDirection(bearing.Value) : "-";
+                var positionText = "Type: Stored node position" +
+                    "\nNode: " + DisplayNodeName(point.TelemetryNodeNumber) +
+                    "\nReceived: " + (point.TelemetryReceivedAtUtc.HasValue ? point.TelemetryReceivedAtUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "-") +
+                    "\nAge: " + FormatPositionAge(point.TelemetryReceivedAtUtc) +
+                    "\nPosition: " + point.Latitude.ToString("F6", CultureInfo.InvariantCulture) + ", " + point.Longitude.ToString("F6", CultureInfo.InvariantCulture) +
+                    "\nAltitude: " + (point.TelemetryAltitude.HasValue ? point.TelemetryAltitude.Value.ToString(CultureInfo.InvariantCulture) + " m" : "-") +
+                    "\nDirection: " + directionText +
+                    "\nDistance: " + distanceText;
+                var positionChoice = MessageBox.Query("Node position", positionText, "Center", "Copy position", "Copy all", "Close");
+                if (positionChoice == 0) _nodeMap.CenterOn(point.Latitude, point.Longitude);
+                else if (positionChoice == 1) CopyPositionHistoryPoint(point);
+                else if (positionChoice == 2) CopyAllPositionHistory(point.TelemetryNodeNumber);
+                return;
+            }
+            var source = MapOverlayFiles.FirstOrDefault(file => String.Equals(file.FileName, point.SourceFile, StringComparison.OrdinalIgnoreCase));
+            var text = "Type: Map overlay" +
+                "\nOverlay: " + (point.OverlayName ?? "-") +
+                "\nFile: " + Path.GetFileName(point.SourceFile ?? "-") +
+                "\nDescription: " + (String.IsNullOrWhiteSpace(point.Description) ? "-" : point.Description) +
+                "\nShort name: " + (String.IsNullOrWhiteSpace(point.ShortName) ? "-" : point.ShortName) +
+                "\nUUID: " + (String.IsNullOrWhiteSpace(point.Uuid) ? "-" : point.Uuid) +
+                "\nCreator: " + (String.IsNullOrWhiteSpace(point.Creator) ? "-" : point.Creator) +
+                "\nShape: " + (String.IsNullOrWhiteSpace(point.Shape) ? "Point" : point.Shape) + (point.Shape != null && !String.Equals(point.Shape, "Point", StringComparison.OrdinalIgnoreCase) ? " (fill density " + point.EffectiveFillDensity.ToString(CultureInfo.InvariantCulture) + ")" : "") +
+                "\nFill symbol: " + (String.IsNullOrWhiteSpace(point.FillSymbol) ? "-" : point.FillSymbol) +
+                "\nReference: " + (point.ReferenceLatitude.HasValue && point.ReferenceLongitude.HasValue ? point.ReferenceLatitude.Value.ToString("F6", CultureInfo.InvariantCulture) + ", " + point.ReferenceLongitude.Value.ToString("F6", CultureInfo.InvariantCulture) : "-") +
+                "\nPosition: " + point.Latitude.ToString("F6", CultureInfo.InvariantCulture) + ", " + point.Longitude.ToString("F6", CultureInfo.InvariantCulture) +
+                "\nColor: " + (point.Color ?? "-") +
+                "\nWrite protected: " + (source != null && source.Data != null && source.Data.WriteProtected ? "yes" : "no");
+            var choice = MessageBox.Query("Map item details", text, "Center", "Delete item", "Send again", "Close");
+            if (choice == 0) _nodeMap.CenterOn(point.Latitude, point.Longitude);
+            else if (choice == 2)
+            {
+                if (_settings.Map == null || !_settings.Map.MapPointSharingEnabled)
+                { MessageBox.ErrorQuery("Send map item", "Enable map point sharing and select a channel first.", "OK"); return; }
+                if (!_mesh.IsConnected)
+                { MessageBox.ErrorQuery("Send map item", "The Meshtastic device is not connected.", "OK"); return; }
+                Guid uuid;
+                if (!Guid.TryParse(point.Uuid, out uuid) || String.IsNullOrWhiteSpace(point.ShortName))
+                { MessageBox.ErrorQuery("Send map item", "The item needs a valid UUID and a short name before it can be shared.", "OK"); return; }
+                var message = BuildSharedMapPointMessage(point);
+                var bytes = Encoding.UTF8.GetByteCount(message);
+                if (bytes > _mesh.GetMaximumTextPayloadBytes(true))
+                { MessageBox.ErrorQuery("Send map item", "This item needs " + bytes.ToString(CultureInfo.InvariantCulture) + " bytes, but this mesh channel message can contain only " + _mesh.GetMaximumTextPayloadBytes(true).ToString(CultureInfo.InvariantCulture) + ". Shorten the name or description.", "OK"); return; }
+                try
+                {
+                    SendSharedMapMessage(message);
+                    MessageBox.Query("Send map item", "The item was sent to the configured sharing channel.", "OK");
+                }
+                catch (Exception ex) { MessageBox.ErrorQuery("Send map item", "The item could not be sent:\n" + ex.Message, "OK"); }
+            }
+            else if (choice == 1)
+            {
+                if (source == null || source.Data == null) { MessageBox.ErrorQuery("Delete map item", "The source XML file is unavailable.", "OK"); return; }
+                if (source.Data.WriteProtected) { MessageBox.ErrorQuery("Delete map item", "The source XML file is write protected.", "OK"); return; }
+                bool sendDeletion;
+                if (!ConfirmMapOverlayPointDeletion(point, source, out sendDeletion)) return;
+                try
+                {
+                    source.Data.Places.Remove(point);
+                    SaveMapOverlayFile(source);
+                    RefreshMapOverlays();
+                    _mapInfo.Text = "No item selected";
+                }
+                catch (Exception ex) { source.Data.Places.Add(point); MessageBox.ErrorQuery("Delete map item", ex.Message, "OK"); return; }
+                if (sendDeletion)
+                {
+                    if (_settings.Map == null || !_settings.Map.MapPointSharingEnabled) MessageBox.ErrorQuery("Map point sharing", "The point was deleted locally, but map point sharing is disabled.", "OK");
+                    else if (!_mesh.IsConnected) MessageBox.ErrorQuery("Map point sharing", "The point was deleted locally, but the Meshtastic device is not connected.", "OK");
+                    else
+                    {
+                        Guid uuid;
+                        if (!Guid.TryParse(point.Uuid, out uuid)) MessageBox.ErrorQuery("Map point sharing", "The point was deleted locally, but its UUID is invalid.", "OK");
+                        else
+                        {
+                            try { SendSharedMapMessage(SharedMapPointDeletionPrefix + uuid.ToString("N")); }
+                            catch (Exception ex) { MessageBox.ErrorQuery("Map point sharing", "The point was deleted locally, but the deletion message could not be sent:\n" + ex.Message, "OK"); }
+                        }
+                    }
+                }
+            }
+        }
+        private static void ShowAllTelemetry()
+        {
+            ShowTelemetryPage(null);
+        }
+
+        private static int _meshCoreServiceActive;
+        private static void ShowRoomLogin() { ShowRoomLogin(null); }
+        private static void ShowRoomLogin(uint? targetNode)
+        {
+            if (_mesh.Protocol != MeshProtocol.MeshCore || !_mesh.IsConnected) { MessageBox.Query("Room Server", "Connect to MeshCore first.", "OK"); return; }
+            var rooms = _mesh.Nodes.Where(node => node.MeshCoreContactType == 3 && (!targetNode.HasValue || node.Number == targetNode.Value)).OrderBy(node => node.LongName).ToList();
+            if (rooms.Count == 0) { MessageBox.Query("Room Server", "No Room Server contact is available. Add a discovered Room Server to the Companion's contacts, then refresh the device list.", "OK"); return; }
+            var dialog = new Dialog("Room Server login", 70, 15);
+            var list = new ListView(rooms.Select(node => node.LongName + " (" + node.Id.Substring(0, 8) + ")").ToList()) { X = 1, Y = 1, Width = Dim.Fill(2), Height = 4 };
+            if (targetNode.HasValue) list.SelectedItem = Math.Max(0, rooms.FindIndex(node => node.Number == targetNode.Value));
+            else if (_selected != null) list.SelectedItem = Math.Max(0, rooms.FindIndex(node => node.Number == _selected.Id));
+            var password = new TextField("") { X = 12, Y = 6, Width = 45, Secret = true };
+            dialog.Add(new Label("Room Server:") { X = 1, Y = 0 }, list, new Label("Password:") { X = 1, Y = 6 }, password,
+                new Label("The password is used for this login and is not saved.\nAfter a reconnect, log in again.") { X = 1, Y = 8, Width = Dim.Fill(2), Height = 2 });
+            uint? target = null; string roomPassword = null;
+            var login = new Button("Log in", true);
+            login.Clicked += delegate { if (list.SelectedItem < 0 || list.SelectedItem >= rooms.Count) return; target = rooms[list.SelectedItem].Number; roomPassword = password.Text.ToString(); password.Text = ""; Application.RequestStop(); };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(login); dialog.AddButton(cancel); Application.Run(dialog);
+            if (!target.HasValue) return;
+            var number = target.Value;
+            RunMeshCoreService(async delegate
+            {
+                var room = await _mesh.LoginMeshCoreRoomAsync(number, roomPassword);
+                roomPassword = null;
+                Ui(delegate
+                {
+                    _selected = new ChatItem { Kind = ChatKind.Direct, Id = number, Name = "[Room] " + rooms.First(node => node.Number == number).LongName };
+                    RefreshChats(); ShowChatPage(); ShowSelectedChat();
+                    MessageBox.Query("Room Server", room.CanPost ? "Logged in with read/write access." : "Logged in with read-only access.", "OK");
+                });
+            });
+        }
+
+        private static void RequestMeshCoreTelemetry()
+        {
+            if (_mesh.Protocol != MeshProtocol.MeshCore || !_mesh.IsConnected) { MessageBox.Query("Telemetry", "Connect to MeshCore first.", "OK"); return; }
+            var nodes = _mesh.Nodes.Where(node => node.MeshCoreContactType.HasValue).OrderBy(node => node.Number == _mesh.Device.MyNode.MyNodeNum ? 0 : 1).ThenBy(node => node.LongName).ToList();
+            if (nodes.Count == 0) return;
+            var dialog = new Dialog("Request MeshCore telemetry", 70, 15);
+            var list = new ListView(nodes.Select(node => node.LongName + (node.Number == _mesh.Device.MyNode.MyNodeNum ? " [this device]" : "") + " (" + node.Id.Substring(0, 8) + ")").ToList()) { X = 1, Y = 1, Width = Dim.Fill(2), Height = 7 };
+            var preferred = _telemetryPage.Visible && _telemetryNodeFilter.HasValue ? _telemetryNodeFilter : (_selected != null && _selected.Kind == ChatKind.Direct ? (uint?)_selected.Id : null);
+            if (preferred.HasValue) list.SelectedItem = Math.Max(0, nodes.FindIndex(node => node.Number == preferred.Value));
+            dialog.Add(new Label("Device:") { X = 1, Y = 0 }, list, new Label("Remote devices must allow telemetry access.") { X = 1, Y = 9 });
+            uint? target = null;
+            var request = new Button("Request", true); request.Clicked += delegate { if (list.SelectedItem < 0 || list.SelectedItem >= nodes.Count) return; target = nodes[list.SelectedItem].Number; Application.RequestStop(); };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(request); dialog.AddButton(cancel); Application.Run(dialog);
+            if (!target.HasValue) return;
+            var number = target.Value;
+            RunMeshCoreService(async delegate
+            {
+                var telemetry = await _mesh.RequestMeshCoreTelemetryAsync(number);
+                Ui(delegate
+                {
+                    if (_settings.StoreTelemetryData) ShowTelemetryPage(number);
+                    else MessageBox.Query("MeshCore telemetry", telemetry.MeshCoreRawTelemetry + "\n\nTelemetry storage is disabled in Settings.", "OK");
+                });
+            });
+        }
+
+        private static void RunMeshCoreService(Func<Task> operation)
+        {
+            if (Interlocked.CompareExchange(ref _meshCoreServiceActive, 1, 0) != 0) { MessageBox.Query("MeshCore", "A MeshCore request is already pending.", "OK"); return; }
+            Task.Run(async delegate
+            {
+                try { await operation(); }
+                catch (Exception ex) { Ui(delegate { MessageBox.ErrorQuery("MeshCore request failed", ex.Message, "OK"); }); }
+                finally { Interlocked.Exchange(ref _meshCoreServiceActive, 0); }
+            });
+        }
+        private static void DeleteCurrentNodeTelemetry()
+        {
+            if (!_telemetryNodeFilter.HasValue)
+            {
+                MessageBox.Query("Delete telemetry", "Open telemetry for a specific node first.", "OK");
+                return;
+            }
+            var nodeNumber = _telemetryNodeFilter.Value;
+            if (MessageBox.Query("Delete telemetry", "Delete all telemetry records for " + DisplayNodeName(nodeNumber) + "?", "Delete", "Cancel") != 0) return;
+            _store.DeleteTelemetry(nodeNumber);
+            RefreshTelemetryPage();
+        }
+        private static void DeleteAllTelemetry()
+        {
+            if (MessageBox.Query("Delete all telemetry", "Delete all telemetry records from the database?", "Delete", "Cancel") != 0) return;
+            _store.DeleteAllTelemetry();
+            RefreshTelemetryPage();
+        }
+        private static void ShowTelemetryForCurrentChatNode()
+        {
+            if (_selected == null || _selected.Kind != ChatKind.Direct)
+            {
+                MessageBox.Query("Telemetry", "Telemetry can only be shown for a direct chat.", "OK");
+                return;
+            }
+            ShowTelemetryPage(_selected.Id);
+        }
+        private static void ShowTelemetryPage(uint? nodeNumber)
+        {
+            _telemetryNodeFilter = nodeNumber;
+            RefreshTelemetryPage();
+            _chatPage.Visible = false;
+            _mapPage.Visible = false;
+            _nodesPage.Visible = false;
+            _mapPage.Visible = false;
+            _telemetryPage.Visible = true;
+            _telemetryPage.SetFocus();
+            _telemetryList.SetFocus();
+        }
+        private static void RefreshTelemetryPage()
+        {
+            if (_telemetryPage == null) return;
+            IList<StoredTelemetry> entries = _telemetryNodeFilter.HasValue ? _store.GetTelemetry(_telemetryNodeFilter.Value, Int32.MaxValue) : _store.GetTelemetry(Int32.MaxValue);
+            _telemetryHeader.Text = _telemetryNodeFilter.HasValue ? "Node: " + DisplayNodeName(_telemetryNodeFilter.Value) : "All nodes";
+            TelemetryItems.Clear();
+            TelemetryItems.AddRange(entries);
+            _telemetryList.SetSource(TelemetryItems.Select(t => FormatTelemetrySummary(t, !_telemetryNodeFilter.HasValue)).ToList());
+            if (TelemetryItems.Count > 0) _telemetryList.SelectedItem = 0;
+            UpdateTelemetryScrollInfo();
+        }
+        private static void UpdateTelemetryScrollInfo()
+        {
+            if (_telemetryScrollInfo == null) return;
+            _telemetryScrollInfo.Text = TelemetryItems.Count == 0 ? "No telemetry" : "Position " + Math.Min(TelemetryItems.Count, _telemetryList.SelectedItem + 1) + "/" + TelemetryItems.Count;
+        }
+        private static string FormatTelemetrySummary(StoredTelemetry telemetry, bool includeNode)
+        {
+            var values = new List<string>();
+            if (telemetry.BatteryLevel.HasValue) values.Add("Battery: " + telemetry.BatteryLevel.Value + "%");
+            if (telemetry.Voltage.HasValue) values.Add("Voltage: " + telemetry.Voltage.Value.ToString("F2", CultureInfo.InvariantCulture) + " V");
+            if (telemetry.ChannelUtilization.HasValue) values.Add("Channel utilization: " + telemetry.ChannelUtilization.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
+            if (telemetry.AirUtilTx.HasValue) values.Add("Air utilization TX: " + telemetry.AirUtilTx.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
+            if (telemetry.UptimeSeconds.HasValue) values.Add("Uptime: " + TimeSpan.FromSeconds(telemetry.UptimeSeconds.Value).ToString());
+            if (telemetry.Temperature.HasValue) values.Add("Temperature: " + telemetry.Temperature.Value.ToString("F1", CultureInfo.InvariantCulture) + " °C");
+            if (telemetry.RelativeHumidity.HasValue) values.Add("Humidity: " + telemetry.RelativeHumidity.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
+            if (telemetry.BarometricPressure.HasValue) values.Add("Pressure: " + telemetry.BarometricPressure.Value.ToString("F1", CultureInfo.InvariantCulture) + " hPa");
+            if (telemetry.Latitude.HasValue) values.Add("Latitude: " + telemetry.Latitude.Value.ToString("F6", CultureInfo.InvariantCulture));
+            if (telemetry.Longitude.HasValue) values.Add("Longitude: " + telemetry.Longitude.Value.ToString("F6", CultureInfo.InvariantCulture));
+            if (telemetry.Altitude.HasValue) values.Add("Altitude: " + telemetry.Altitude.Value.ToString(CultureInfo.InvariantCulture) + " m");
+            return telemetry.ReceivedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") +
+                (includeNode ? " | " + DisplayNodeName(telemetry.NodeNumber) : "") +
+                " | " + (values.Count == 0 ? telemetry.Type : String.Join(" | ", values));
+        }
+        private static void ShowSelectedTelemetryDetails()
+        {
+            var index = _telemetryList.SelectedItem;
+            if (index < 0 || index >= TelemetryItems.Count) return;
+            var telemetry = TelemetryItems[index];
+            var values = new List<string>();
+            if (telemetry.BatteryLevel.HasValue) values.Add("Battery: " + telemetry.BatteryLevel.Value + "%");
+            if (telemetry.Voltage.HasValue) values.Add("Voltage: " + telemetry.Voltage.Value.ToString("F2", CultureInfo.InvariantCulture) + " V");
+            if (telemetry.ChannelUtilization.HasValue) values.Add("Channel utilization: " + telemetry.ChannelUtilization.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
+            if (telemetry.AirUtilTx.HasValue) values.Add("Air utilization TX: " + telemetry.AirUtilTx.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
+            if (telemetry.UptimeSeconds.HasValue) values.Add("Uptime: " + TimeSpan.FromSeconds(telemetry.UptimeSeconds.Value));
+            if (telemetry.Temperature.HasValue) values.Add("Temperature: " + telemetry.Temperature.Value.ToString("F1", CultureInfo.InvariantCulture) + " °C");
+            if (telemetry.RelativeHumidity.HasValue) values.Add("Humidity: " + telemetry.RelativeHumidity.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
+            if (telemetry.BarometricPressure.HasValue) values.Add("Pressure: " + telemetry.BarometricPressure.Value.ToString("F1", CultureInfo.InvariantCulture) + " hPa");
+            if (telemetry.Latitude.HasValue) values.Add("Latitude: " + telemetry.Latitude.Value.ToString("F6", CultureInfo.InvariantCulture));
+            if (telemetry.Longitude.HasValue) values.Add("Longitude: " + telemetry.Longitude.Value.ToString("F6", CultureInfo.InvariantCulture));
+            if (telemetry.Altitude.HasValue) values.Add("Altitude: " + telemetry.Altitude.Value.ToString(CultureInfo.InvariantCulture) + " m");
+            var text = "Node: " + DisplayNodeName(telemetry.NodeNumber) +
+                "\nReceived: " + telemetry.ReceivedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") +
+                "\nMeasurement time: " + (telemetry.TelemetryTimeUtc.HasValue ? telemetry.TelemetryTimeUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "-") +
+                "\nType: " + telemetry.Type +
+                "\n" + (values.Count == 0 ? "No decoded values." : String.Join("\n", values)) +
+                (String.IsNullOrEmpty(telemetry.RawTelemetry) ? "" : "\nRaw: " + telemetry.RawTelemetry);
+            MessageBox.Query("Telemetry details", text, "OK");
+        }
+        private static void CopyTelemetryToClipboard(bool excelFormat)
+        {
+            var separator = excelFormat ? "\t" : ",";
+            var rows = new List<string>();
+            foreach (var telemetry in TelemetryItems)
+            {
+                var fields = new[]
+                {
+                    telemetry.ReceivedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                    NullableText(telemetry.BatteryLevel), NullableText(telemetry.Voltage, excelFormat), NullableText(telemetry.ChannelUtilization, excelFormat), NullableText(telemetry.AirUtilTx, excelFormat), NullableText(telemetry.UptimeSeconds), NullableText(telemetry.Temperature, excelFormat), NullableText(telemetry.RelativeHumidity, excelFormat), NullableText(telemetry.BarometricPressure, excelFormat), NullableText(telemetry.Latitude, excelFormat), NullableText(telemetry.Longitude, excelFormat), NullableText(telemetry.Altitude)
+                };
+                rows.Add(String.Join(separator, fields.Select(value => ClipboardField(value, excelFormat))));
+            }
+            CopyTextWithFallback(String.Join(Environment.NewLine, rows), excelFormat ? "Telemetry was copied in spreadsheet format." : "Telemetry was copied as CSV.");
+        }
+        private static string NullableText(uint? value) { return value.HasValue ? value.Value.ToString(CultureInfo.InvariantCulture) : ""; }
+        private static string NullableText(int? value) { return value.HasValue ? value.Value.ToString(CultureInfo.InvariantCulture) : ""; }
+        private static string NullableText(double? value, bool useLocalDecimalSeparator) { return value.HasValue ? value.Value.ToString(useLocalDecimalSeparator ? CultureInfo.CurrentCulture : CultureInfo.InvariantCulture) : ""; }
+        private static string ClipboardField(string value, bool excelFormat)
+        {
+            value = value ?? "";
+            if (excelFormat) return value.Replace("\t", " ").Replace("\r", " ").Replace("\n", " ");
+            return "\"" + value.Replace("\"", "\"\"") + "\"";
+        }
+        private static void CopyNodeList()
+        {
+            RefreshNodePage();
+            CopyTextWithFallback(String.Join(Environment.NewLine, NodeItems.Select(FormatNode)), NodeItems.Count == 0 ? "The empty node list was copied." : "Node list copied.");
+        }
+
+        private static void RestoreNodeListState()
+        {
+            if (_settings.Nodes == null) _settings.Nodes = new MeshtasticNodeListSettings();
+            _settings.Nodes.SearchText = "";
+            _favoritesOnly = _settings.Nodes.FavoritesOnly;
+            _nodeSortAscending = _settings.Nodes.SortAscending;
+            NodeSortMode parsed;
+            _nodeSort = Enum.TryParse(_settings.Nodes.SortMode ?? "Name", true, out parsed) ? parsed : NodeSortMode.Name;
+        }
+
+        private static void SaveNodeListState()
+        {
+            if (_settings == null) return;
+            if (_settings.Nodes == null) _settings.Nodes = new MeshtasticNodeListSettings();
+            _settings.Nodes.FavoritesOnly = _favoritesOnly;
+            _settings.Nodes.SortAscending = _nodeSortAscending;
+            _settings.Nodes.SortMode = _nodeSort.ToString();
+            _settings.Nodes.SearchText = "";
+        }
+
+        private static string NodeSortLabel()
+        {
+            return _nodeSort == NodeSortMode.Name ? "name" : _nodeSort == NodeSortMode.NodeId ? "ID" : _nodeSort == NodeSortMode.LastReceived ? "last" : _nodeSort == NodeSortMode.Distance ? "distance" : _nodeSort == NodeSortMode.Hops ? "hops" : "signal";
+        }
+        private static Button _nodeContactFilterButton;
+        private static void RefreshNodePage(bool preserveScroll = false)
+        {
+            if (_nodeList == null) return;
+            var selectedIndex = _nodeList.SelectedItem;
+            var topIndex = _nodeList.TopItem;
+            var leftIndex = _nodeList.LeftItem;
+            var selectedNode = selectedIndex >= 0 && selectedIndex < NodeItems.Count ? (uint?)NodeItems[selectedIndex].NodeNumber : null;
+            var topNode = topIndex >= 0 && topIndex < NodeItems.Count ? (uint?)NodeItems[topIndex].NodeNumber : null;
+            var search = _nodeSearch == null ? "" : _nodeSearch.Text.ToString().Trim();
+            IEnumerable<StoredMeshNode> nodes = _store.GetNodes(GetDatabaseNodeSort(_nodeSort)).Where(n => !_favoritesOnly || n.IsFavorite);
+            if (!String.IsNullOrEmpty(search)) nodes = nodes.Where(n => NodeMatchesSearch(n, search));
+            nodes = SortNodes(nodes.Where(MatchesMeshCoreContactFilter));
+            NodeItems.Clear();
+            NodeItems.AddRange(nodes);
+            if (_nodeContactFilterButton != null) { _nodeContactFilterButton.Text = MeshCoreContactFilterLabel; _nodeContactFilterButton.Enabled = _mesh.Protocol == MeshProtocol.MeshCore; }
+            _nodeList.SetSource(NodeItems.Select(FormatNode).ToList());
+                        if (NodeItems.Count > 0)
+            {
+                var selected = selectedNode.HasValue ? NodeItems.FindIndex(node => node.NodeNumber == selectedNode.Value) : -1;
+                _nodeList.SelectedItem = selected >= 0 ? selected : Math.Min(Math.Max(0, selectedIndex), NodeItems.Count - 1);
+                if (preserveScroll)
+                {
+                    var top = topNode.HasValue ? NodeItems.FindIndex(node => node.NodeNumber == topNode.Value) : -1;
+                    _nodeList.TopItem = top >= 0 ? top : Math.Min(Math.Max(0, topIndex), NodeItems.Count - 1);
+                    _nodeList.LeftItem = leftIndex;
+                }
+            }
+            UpdateNodeScrollInfo();
+        }
+
+        private static StoredNodeSort GetDatabaseNodeSort(NodeSortMode sort)
+        {
+            return sort == NodeSortMode.NodeId ? StoredNodeSort.NodeId : sort == NodeSortMode.LastReceived ? StoredNodeSort.LastReceived : StoredNodeSort.Name;
+        }
+
+        private static bool NodeMatchesSearch(StoredMeshNode node, string search)
+        {
+            return (!String.IsNullOrEmpty(node.LongName) && node.LongName.IndexOf(search, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                   (!String.IsNullOrEmpty(node.ShortName) && node.ShortName.IndexOf(search, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                   (!String.IsNullOrEmpty(node.NodeId) && node.NodeId.IndexOf(search, StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private static IEnumerable<StoredMeshNode> SortNodes(IEnumerable<StoredMeshNode> nodes)
+        {
+            switch (_nodeSort)
+            {
+                case NodeSortMode.Name: return _nodeSortAscending ? nodes.OrderBy(node => node.LongName ?? node.NodeId ?? "") : nodes.OrderByDescending(node => node.LongName ?? node.NodeId ?? "");
+                case NodeSortMode.NodeId: return _nodeSortAscending ? nodes.OrderBy(node => node.NodeId ?? "") : nodes.OrderByDescending(node => node.NodeId ?? "");
+                case NodeSortMode.LastReceived: return _nodeSortAscending ? nodes.OrderBy(node => node.LastReceivedUtc) : nodes.OrderByDescending(node => node.LastReceivedUtc);
+                case NodeSortMode.Distance: return SortNodesWithMissingValues(nodes, node => MeshtasticClient.GetDistanceMeters(_mesh.Device.Latitude, _mesh.Device.Longitude, node.Latitude, node.Longitude));
+                case NodeSortMode.Hops: return SortNodesWithMissingValues(nodes, node => node.HopsAway.HasValue ? (double?)node.HopsAway.Value : null);
+                case NodeSortMode.Signal: return SortNodesWithMissingValues(nodes, node => { var live = _mesh.Nodes.FirstOrDefault(item => item.Number == node.NodeNumber); return (live?.LastRssi ?? node.LastRssi).HasValue ? (double?)(live?.LastRssi ?? node.LastRssi).Value : null; });
+                default: return nodes;
+            }
+        }
+
+        private static IEnumerable<StoredMeshNode> SortNodesWithMissingValues(IEnumerable<StoredMeshNode> nodes, Func<StoredMeshNode, double?> selector)
+        {
+            var known = nodes.Where(node => selector(node).HasValue);
+            var unknown = nodes.Where(node => !selector(node).HasValue);
+            return _nodeSortAscending ? known.OrderBy(node => selector(node).Value).Concat(unknown) : known.OrderByDescending(node => selector(node).Value).Concat(unknown);
+        }
+        private static void CreateNode()
+        {
+            if (_mesh.Protocol == MeshProtocol.MeshCore) { EditMeshCoreContact(null); return; }
+            var dialog = new Dialog("Create node", 60, 10);
+            var id = new TextField("") { X = 18, Y = 1, Width = 20 };
+            var name = new TextField("") { X = 18, Y = 2, Width = 32 };
+            dialog.Add(new Label("Meshtastic ID:") { X = 1, Y = 1 }, id, new Label("Name:") { X = 1, Y = 2 }, name);
+            var save = new Button("Create", true);
+            save.Clicked += delegate
+            {
+                var enteredId = id.Text.ToString().Trim();
+                var hexId = enteredId.TrimStart('!');
+                uint nodeNumber;
+                if (!UInt32.TryParse(hexId, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out nodeNumber) || String.IsNullOrWhiteSpace(name.Text.ToString()))
+                {
+                    MessageBox.ErrorQuery("Create node", "Enter a Meshtastic ID (for example !a1b2c3d4) and a name.", "OK");
+                    return;
+                }
+                _store.AddOrUpdateManualNode(nodeNumber, "!" + hexId.ToLowerInvariant(), name.Text.ToString().Trim());
+                RefreshNodePage();
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel");
+            cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+        private static void RefreshNodesFromDevice()
+        {
+            if (_mesh.State != ConnectionState.Connected) { MessageBox.ErrorQuery("Nodes", "Connect to a Meshtastic device first.", "OK"); return; }
+            if (!TryStartNodeRefresh()) MessageBox.Query("Nodes", "A device refresh is already active.", "OK");
+        }
+        private static CancellationTokenSource _manualNodeRefreshCancellation;
+        private static bool TryStartNodeRefresh()
+        {
+            if (Interlocked.CompareExchange(ref _deviceRefreshActive, 1, 0) != 0) return false;
+            var cancellation = new CancellationTokenSource();
+            _manualNodeRefreshCancellation = cancellation; ShowPleaseWait("Loading nodes and channels from device...");
+            Task.Run(async delegate
+            {
+                try { await ReceiveDeviceStateAsync(cancellation.Token); Ui(() => RefreshNodePage(true)); }
+                catch (OperationCanceledException) { try { await _mesh.DisconnectAsync(); } catch { } }
+                catch (Exception ex)
+                {
+                    Ui(delegate { HidePleaseWait(); MessageBox.ErrorQuery("Nodes", ex.Message, "OK"); });
+                }
+                finally
+                {
+                    Ui(() => { if (_manualNodeRefreshCancellation == cancellation) { _manualNodeRefreshCancellation = null; HidePleaseWait(); } });
+                    cancellation.Dispose();
+                    Interlocked.Exchange(ref _deviceRefreshActive, 0);
+                }
+            });
+            return true;
+        }
+        private static void DeleteAllNodes()
+        {
+            if (MessageBox.Query("Delete all nodes", "Delete all nodes from the database?", "Delete", "Cancel") != 0) return;
+            _store.DeleteAllNodes();
+            RefreshNodePage();
+        }
+        private static void StartChatForSelectedNode()
+        {
+            var index = _nodeList.SelectedItem;
+            if (index < 0 || index >= NodeItems.Count) return;
+            StartChatForNode(NodeItems[index]);
+        }
+        private static void StartChatForNode(StoredMeshNode node)
+        {
+            ShowChatPage();
+            _nodeStartedChat = true;
+            _selected = new ChatItem { Kind = ChatKind.Direct, Id = node.NodeNumber, Name = String.IsNullOrEmpty(node.LongName) ? node.NodeId : node.LongName };
+            ShowSelectedChat();
+            _input.SetFocus();
+        }
+        private static void ShowSelectedNodeDetails()
+        {
+            var index = _nodeList.SelectedItem;
+            if (index < 0 || index >= NodeItems.Count) return;
+            ShowNodeDetails(NodeItems[index]);
+        }
+        private static void ShowCurrentChatNodeDetails()
+        {
+            if (_selected == null || _selected.Kind != ChatKind.Direct)
+            {
+                MessageBox.Query("Node details", "Select a direct chat first.", "OK");
+                return;
+            }
+            var node = _store.GetNodes(StoredNodeSort.Name).FirstOrDefault(item => item.NodeNumber == _selected.Id);
+            if (node == null)
+            {
+                MessageBox.Query("Node details", "No stored details are available for this node yet.", "OK");
+                return;
+            }
+            ShowNodeDetails(node);
+        }
+        private static void ShowMapClusterNodes(IReadOnlyList<StoredMeshNode> cluster)
+        {
+            if (cluster == null || cluster.Count == 0) return;
+            var nodes = cluster.OrderBy(node => node.ShortName ?? "", StringComparer.CurrentCultureIgnoreCase)
+                .ThenBy(node => node.LongName ?? "", StringComparer.CurrentCultureIgnoreCase).ToList();
+            Func<string, int, string> column = (value, length) =>
+            {
+                value = ReplaceGraphicalSymbols(value ?? "").Replace('\r', ' ').Replace('\n', ' ');
+                return (value.Length > length ? value.Substring(0, length) : value).PadRight(length);
+            };
+            var labels = nodes.Select(node => column(node.ShortName, 8) + " | " +
+                column(node.HopsAway.HasValue ? node.HopsAway.Value.ToString(CultureInfo.InvariantCulture) : "-", 4) + " | " +
+                column(String.IsNullOrWhiteSpace(node.LongName) ? node.NodeId ?? "!" + node.NodeNumber.ToString("x8") : node.LongName, 32) + " | " +
+                (node.LastReceivedUtc == DateTime.MinValue ? "-" : FormatNodeReceived(node.LastReceivedUtc))).ToList();
+            var width = Math.Max(30, Math.Min(116, Application.Top.Frame.Width - 2));
+            var height = Math.Max(8, Math.Min(nodes.Count + 7, Application.Top.Frame.Height - 2));
+            var dialog = new Dialog("Nodes in cluster (" + nodes.Count.ToString(CultureInfo.InvariantCulture) + ")", width, height);
+            var list = new ListView(labels) { X = 1, Y = 2, Width = Dim.Fill(1), Height = Dim.Fill(2) };
+            dialog.Add(new Label(column("Short", 8) + " | " + column("Hops", 4) + " | " + column("Long name", 32) + " | Last heard") { X = 1, Y = 1, Width = Dim.Fill(1) }, list);
+            Action details = delegate
+            {
+                if (list.SelectedItem >= 0 && list.SelectedItem < nodes.Count) ShowNodeDetails(nodes[list.SelectedItem]);
+            };
+            list.OpenSelectedItem += delegate { details(); };
+            var open = new Button("Details", true);
+            open.Clicked += delegate { details(); };
+            var close = new Button("Close");
+            close.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(open); dialog.AddButton(close);
+            Application.Run(dialog, HandleTerminalGuiException);
+            if (_nodeMap != null) _nodeMap.SetFocus();
+        }
+
+        private static string FormatNodeReceived(DateTime time) { return time == DateTime.MinValue ? "-" : time.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") + " (" + FormatDetailedAge(time) + ")"; }
+        private static void ShowNodeDetails(StoredMeshNode node)
+        {
+            var distance = MeshtasticClient.GetDistanceMeters(_mesh.Device.Latitude, _mesh.Device.Longitude, node.Latitude, node.Longitude);
+            var bearing = MeshtasticClient.GetInitialBearingDegrees(_mesh.Device.Latitude, _mesh.Device.Longitude, node.Latitude, node.Longitude);
+            var distanceText = distance.HasValue ? (distance.Value < 1000 ? Math.Round(distance.Value) + " m" : (distance.Value / 1000d).ToString("F1", CultureInfo.InvariantCulture) + " km") : "not available";
+            var direction = bearing.HasValue ? Math.Round(bearing.Value) + "° " + MeshtasticClient.GetCompassDirection(bearing.Value) : "not available";
+            var text = "ID: " + (node.NodeId ?? "!" + node.NodeNumber.ToString("x8")) +
+                "\nNode number: " + node.NodeNumber +
+                "\nName: " + (node.LongName ?? "-") +
+                "\nShort name: " + (node.ShortName ?? "-") +
+                "\nFavorite: " + (node.IsFavorite ? "yes" : "no") +
+                "\nLast received: " + FormatNodeReceived(node.LastReceivedUtc) +
+                "\nPosition: " + (node.Latitude.HasValue && node.Longitude.HasValue ? node.Latitude.Value.ToString("F6", CultureInfo.InvariantCulture) + ", " + node.Longitude.Value.ToString("F6", CultureInfo.InvariantCulture) : "not available") +
+                "\nDistance: " + distanceText +
+                "\nDirection: " + direction +
+                "\nBattery: " + (node.BatteryLevel.HasValue ? node.BatteryLevel.Value + "%" : "not available") +
+                "\nHops: " + (node.HopsAway.HasValue ? node.HopsAway.Value.ToString() : "not available");
+            var buttons = new List<string> { "Start chat", "Telemetry", "Position history", node.IsFavorite ? "Remove favorite" : "Add favorite", "Copy GPS", "Delete" };
+            if (_mesh.Protocol == MeshProtocol.MeshCore) { text += "\nDevice contact: " + MeshCoreContactStatus(node) + "\nType: " + MeshCoreNodeType(node); buttons.Add("Paths"); buttons.Add("Save to device"); buttons.Add("Remove from device"); }
+            int serviceButton = -1;
+            var serviceType = _mesh.Protocol == MeshProtocol.MeshCore ? MeshCoreNodeType(node) : "";
+            if (serviceType == "Repeater" || serviceType == "Roomserver") { serviceButton = buttons.Count; buttons.Add(serviceType == "Repeater" ? "Repeater admin" : "Room login"); }
+            buttons.Add("Close" );
+            var selectedButton = ShowNodeDetailsDialog(text, buttons);
+            if (selectedButton == serviceButton && serviceButton >= 0) { if (serviceType == "Repeater") ShowMeshCoreRepeaterAdmin(node.NodeNumber); else ShowRoomLogin(node.NodeNumber); }
+            else if (selectedButton == 0) StartChatForNode(node);
+            else if (selectedButton == 1) ShowTelemetryPage(node.NodeNumber);
+            else if (selectedButton == 2) ShowNodePositionHistory(node);
+            else if (selectedButton == 3) { _store.SetNodeFavorite(node.NodeNumber, !node.IsFavorite); RefreshNodePage(); }
+            else if (selectedButton == 4) CopyNodePositionToClipboard(node);
+            else if (selectedButton == 6 && _mesh.Protocol == MeshProtocol.MeshCore) ShowMeshCoreNodePaths(node);
+            else if (selectedButton == 7 && _mesh.Protocol == MeshProtocol.MeshCore) EditMeshCoreContact(node);
+            else if (selectedButton == 8 && _mesh.Protocol == MeshProtocol.MeshCore) RemoveMeshCoreDeviceContact(node);
+            else if (selectedButton == 5 && MessageBox.Query("Delete node", "Delete this node from the database?", "Delete", "Cancel") == 0) { _store.DeleteNode(node.NodeNumber); RefreshNodePage(); }
+        }
+        private static string FormatDetailedAge(DateTime timestampUtc)
+        {
+            var age = DateTime.UtcNow - timestampUtc.ToUniversalTime();
+            if (age < TimeSpan.Zero) age = TimeSpan.Zero;
+            if (age.TotalDays >= 1d)
+            {
+                var days = (int)age.TotalDays;
+                return days.ToString(CultureInfo.InvariantCulture) + (days == 1 ? " day " : " days ") +
+                    age.Hours.ToString(CultureInfo.InvariantCulture) + (age.Hours == 1 ? " hour ago" : " hours ago");
+            }
+            if (age.TotalHours >= 1d)
+            {
+                var hours = (int)age.TotalHours;
+                return hours.ToString(CultureInfo.InvariantCulture) + (hours == 1 ? " hour " : " hours ") +
+                    age.Minutes.ToString(CultureInfo.InvariantCulture) + (age.Minutes == 1 ? " minute ago" : " minutes ago");
+            }
+            if (age.TotalMinutes >= 1d)
+            {
+                var minutes = (int)age.TotalMinutes;
+                return minutes.ToString(CultureInfo.InvariantCulture) + (minutes == 1 ? " minute " : " minutes ") +
+                    age.Seconds.ToString(CultureInfo.InvariantCulture) + (age.Seconds == 1 ? " second ago" : " seconds ago");
+            }
+            var seconds = Math.Max(0, (int)age.TotalSeconds);
+            return seconds.ToString(CultureInfo.InvariantCulture) + (seconds == 1 ? " second ago" : " seconds ago");
+        }
+        private static void ShowNodePositionHistory(StoredMeshNode node)
+        {
+            var latestPosition = _store.GetPositions(node.NodeNumber, 1).FirstOrDefault();
+            if (latestPosition == null)
+            {
+                MessageBox.Query("Position history", "No stored position history is available for this node.", "OK");
+                return;
+            }
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            _settings.Map.PositionTrackNodeNumber = node.NodeNumber;
+            _settings.Map.PositionTrackVisible = true;
+            SetPositionTrackToLatest24Hours(node.NodeNumber);
+            if (String.IsNullOrWhiteSpace(_settings.Map.PositionTrackColor)) _settings.Map.PositionTrackColor = "BrightYellow";
+            if (String.IsNullOrWhiteSpace(_settings.Map.PositionTrackSymbol)) _settings.Map.PositionTrackSymbol = "O";
+            MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+            ShowMapPage();
+            if (latestPosition.Latitude.HasValue && latestPosition.Longitude.HasValue) _nodeMap.CenterOn(latestPosition.Latitude.Value, latestPosition.Longitude.Value);
+            ShowBriefMapPopup("Position history enabled | latest available 24h: -" + _settings.Map.PositionTrackFromHoursAgo.ToString(CultureInfo.InvariantCulture) + "h to -" + _settings.Map.PositionTrackToHoursAgo.ToString(CultureInfo.InvariantCulture) + "h");
+        }
+
+        private static void SetPositionTrackToLatest24Hours(uint nodeNumber)
+        {
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            var latest = _store.GetPositions(nodeNumber, 1).FirstOrDefault();
+            if (latest == null) { _settings.Map.PositionTrackFromHoursAgo = 0; _settings.Map.PositionTrackToHoursAgo = 24; return; }
+            var ageHours = Math.Max(0d, (DateTime.UtcNow - latest.ReceivedAtUtc.ToUniversalTime()).TotalHours);
+            var fromHours = Math.Max(0, (int)Math.Floor(ageHours));
+            var toHours = Math.Max(fromHours + 1, (int)Math.Ceiling(ageHours + 24d));
+            _settings.Map.PositionTrackFromHoursAgo = fromHours;
+            _settings.Map.PositionTrackToHoursAgo = Math.Min(87600, toHours);
+        }
+        private static void CopyNodePositionToClipboard(StoredMeshNode node)
+        {
+            if (!node.Latitude.HasValue || !node.Longitude.HasValue)
+            {
+                MessageBox.Query("Copy GPS", "No GPS position is available for this node.", "OK");
+                return;
+            }
+            var position = node.Latitude.Value.ToString("F6", CultureInfo.InvariantCulture) + "," + node.Longitude.Value.ToString("F6", CultureInfo.InvariantCulture);
+            CopyTextWithFallback(position, "GPS position copied: " + position, "Copy GPS");
+        }
+        private static string FormatNode(StoredMeshNode node)
+        {
+            var distance = MeshtasticClient.GetDistanceMeters(_mesh.Device.Latitude, _mesh.Device.Longitude, node.Latitude, node.Longitude);
+            var bearing = MeshtasticClient.GetInitialBearingDegrees(_mesh.Device.Latitude, _mesh.Device.Longitude, node.Latitude, node.Longitude);
+            var direction = bearing.HasValue ? MeshtasticClient.GetCompassDirection(bearing.Value) : "-";
+            var distanceText = distance.HasValue ? (distance.Value < 1000 ? Math.Round(distance.Value) + "m" : (distance.Value / 1000d).ToString("F1", CultureInfo.InvariantCulture) + "km") : "-";
+            var id = (node.NodeId ?? "!" + node.NodeNumber.ToString("x8")).PadRight(12).Substring(0, 12);
+            var shortName = ReplaceGraphicalSymbols(String.IsNullOrWhiteSpace(node.ShortName) ? "-" : node.ShortName).PadRight(5).Substring(0, 5);
+            var name = ReplaceGraphicalSymbols(node.LongName ?? "unknown").PadRight(22).Substring(0, 22);
+            var liveNode = _mesh.Nodes.FirstOrDefault(item => item.Number == node.NodeNumber);
+            var rssi = (liveNode?.LastRssi ?? node.LastRssi).HasValue ? (liveNode?.LastRssi ?? node.LastRssi).Value.ToString(CultureInfo.InvariantCulture) : "-";
+            var snr = (liveNode?.LastSnr ?? node.LastSnr).HasValue ? (liveNode?.LastSnr ?? node.LastSnr).Value.ToString("F1", CultureInfo.InvariantCulture) : "-";
+            return (node.IsFavorite ? "* " : "  ") + (_mesh.Protocol == MeshProtocol.MeshCore ? MeshCoreContactTag(node).PadRight(6) : "") + id + " " + shortName + " | " + FormatNodeAge(node.LastReceivedUtc).PadLeft(6) + " | " + distanceText.PadLeft(8) + " " + direction.PadRight(5) + " | hops " + (node.HopsAway.HasValue ? node.HopsAway.Value.ToString() : "-") + " | RSSI " + rssi.PadLeft(4) + " SNR " + snr.PadLeft(5) + " | " + (_mesh.Protocol == MeshProtocol.MeshCore ? MeshCoreNodeType(node).PadRight(10) + " | " : "") + name;
+        }
+        private static void CycleNodeSort()
+        {
+            _nodeSort = _nodeSort == NodeSortMode.Name ? NodeSortMode.NodeId :
+                _nodeSort == NodeSortMode.NodeId ? NodeSortMode.LastReceived :
+                _nodeSort == NodeSortMode.LastReceived ? NodeSortMode.Distance :
+                _nodeSort == NodeSortMode.Distance ? NodeSortMode.Hops :
+                _nodeSort == NodeSortMode.Hops ? NodeSortMode.Signal : NodeSortMode.Name;
+            _sortButton.Text = "Sort: " + NodeSortLabel();
+            SaveNodeListState();
+            RefreshNodePage();
+        }
+        private static void ToggleNodeSortDirection()
+        {
+            _nodeSortAscending = !_nodeSortAscending;
+            _nodeSortDirectionButton.Text = _nodeSortAscending ? "Order: asc" : "Order: desc";
+            SaveNodeListState();
+            RefreshNodePage();
+        }
+        private static void UpdateNodeScrollInfo()
+        {
+            if (_nodeScrollInfo == null) return;
+            _nodeScrollInfo.Text = NodeItems.Count == 0 ? "No nodes" : "Position " + Math.Min(NodeItems.Count, _nodeList.SelectedItem + 1) + "/" + NodeItems.Count;
+        }
+
+        private static void ShowLogoSettings()
+        {
+            var logo = _settings.Logo ?? (_settings.Logo = new MeshtasticLogoSettings());
+            var dialog = new Dialog("Logo settings", 70, 22);
+            var enabled = new CheckBox("Show logo on the chat page") { X = 1, Y = 1, Checked = logo.ShowLogo };
+            var showFrame = new CheckBox("Show logo frame") { X = 1, Y = 2, Checked = logo.ShowFrame };
+            var automatic = new CheckBox("Automatically change logos") { X = 1, Y = 3, Checked = logo.AutomaticRotation };
+            var showEmoji = new CheckBox("Show selected message emoji in logo frame") { X = 1, Y = 4, Checked = logo.ShowSelectedEmoji };
+            var animateTall = new CheckBox("Animate logo files larger than the logo frame") { X = 1, Y = 5, Checked = logo.AnimateTallLogos };
+            var pingPong = new CheckBox("Ping-pong animation (reverse at the end)") { X = 1, Y = 6, Checked = logo.AnimationPingPong };
+            var animationInterval = new TextField(logo.TallLogoFrameIntervalMilliseconds.ToString(CultureInfo.InvariantCulture)) { X = 42, Y = 7, Width = 8 };
+            var verticalStep = new TextField(logo.AnimationVerticalStepLines.ToString(CultureInfo.InvariantCulture)) { X = 42, Y = 8, Width = 8 };
+            var horizontalStep = new TextField(logo.AnimationHorizontalStepCharacters.ToString(CultureInfo.InvariantCulture)) { X = 42, Y = 9, Width = 8 };
+            var interval = new TextField(logo.RotationIntervalSeconds.ToString(CultureInfo.InvariantCulture)) { X = 34, Y = 10, Width = 8 };
+            var width = new TextField(logo.InnerWidth.ToString(CultureInfo.InvariantCulture)) { X = 34, Y = 11, Width = 8 };
+            var height = new TextField(logo.InnerHeight.ToString(CultureInfo.InvariantCulture)) { X = 34, Y = 12, Width = 8 };
+            dialog.Add(enabled, showFrame, automatic, showEmoji, animateTall, pingPong,
+                new Label("Animation frame interval (milliseconds):") { X = 1, Y = 7 }, animationInterval,
+                new Label("Vertical step (lines):") { X = 1, Y = 8 }, verticalStep,
+                new Label("Horizontal step (characters):") { X = 1, Y = 9 }, horizontalStep,
+                new Label("Change logo every (seconds):") { X = 1, Y = 10 }, interval,
+                new Label("Logo and chat width:") { X = 1, Y = 11 }, width,
+                new Label("Logo height:") { X = 1, Y = 12 }, height,
+                new Label("F7: Previous logo | F8: Next logo") { X = 1, Y = 14 });
+            dialog.KeyPress += e =>
+            {
+                if (e.KeyEvent.Key == Key.F7) { ShowPreviousLogo(); e.Handled = true; }
+                else if (e.KeyEvent.Key == Key.F8) { ShowNextLogo(); e.Handled = true; }
+            };
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                int seconds, animationMilliseconds, verticalStepLines, horizontalStepCharacters, innerWidth, innerHeight;
+                if (!Int32.TryParse(interval.Text.ToString(), out seconds) || seconds < 1)
+                {
+                    MessageBox.ErrorQuery("Logo settings", "The interval must be at least one second.", "OK");
+                    return;
+                }
+                if (!Int32.TryParse(animationInterval.Text.ToString(), out animationMilliseconds) || animationMilliseconds < 50 || animationMilliseconds > 60000)
+                {
+                    MessageBox.ErrorQuery("Logo settings", "The animation interval must be between 50 and 60000 milliseconds.", "OK");
+                    return;
+                }
+                if (!Int32.TryParse(verticalStep.Text.ToString(), out verticalStepLines) || verticalStepLines < 1 || verticalStepLines > 10000)
+                {
+                    MessageBox.ErrorQuery("Logo settings", "The vertical step must be between 1 and 10000 lines.", "OK");
+                    return;
+                }
+                if (!Int32.TryParse(horizontalStep.Text.ToString(), out horizontalStepCharacters) || horizontalStepCharacters < 1 || horizontalStepCharacters > 10000)
+                {
+                    MessageBox.ErrorQuery("Logo settings", "The horizontal step must be between 1 and 10000 characters.", "OK");
+                    return;
+                }
+                if (!Int32.TryParse(width.Text.ToString(), out innerWidth) || innerWidth < 20)
+                {
+                    MessageBox.ErrorQuery("Logo settings", "The logo and chat width must be at least 20 characters.", "OK");
+                    return;
+                }
+                if (!Int32.TryParse(height.Text.ToString(), out innerHeight) || innerHeight < 1)
+                {
+                    MessageBox.ErrorQuery("Logo settings", "The logo height must be at least one character.", "OK");
+                    return;
+                }
+                logo.ShowLogo = enabled.Checked;
+                logo.ShowFrame = showFrame.Checked;
+                logo.AutomaticRotation = automatic.Checked;
+                logo.ShowSelectedEmoji = showEmoji.Checked;
+                logo.AnimateTallLogos = animateTall.Checked;
+                logo.AnimationPingPong = pingPong.Checked;
+                logo.RotationIntervalSeconds = seconds;
+                logo.TallLogoFrameIntervalMilliseconds = animationMilliseconds;
+                logo.AnimationVerticalStepLines = verticalStepLines;
+                logo.AnimationHorizontalStepCharacters = horizontalStepCharacters;
+                logo.InnerWidth = innerWidth;
+                logo.InnerHeight = innerHeight;
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                ApplyLogoSettings();
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel");
+            cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static void ApplyLogoSettings()
+        {
+            if (_logoFrame == null || _channelsFrame == null || _directChatsFrame == null) return;
+            if (_settings.Logo == null) _settings.Logo = new MeshtasticLogoSettings();
+            var visible = _settings.Logo.ShowLogo;
+            var sidebarOuterWidth = GetSidebarOuterWidth();
+            _logoFrame.Width = sidebarOuterWidth;
+            _logoFrame.Height = GetLogoOuterHeight();
+            _channelsFrame.Width = sidebarOuterWidth;
+            _directChatsFrame.Width = sidebarOuterWidth;
+            if (_nodeInfoFrame != null) _nodeInfoFrame.X = sidebarOuterWidth + 1;
+            if (_messagesFrame != null) _messagesFrame.X = sidebarOuterWidth + 1;
+            if (_inputFrame != null) _inputFrame.X = sidebarOuterWidth + 1;
+            _logoFrame.Border.BorderStyle = _settings.Logo.ShowFrame ? BorderStyle.Single : BorderStyle.None;
+            _logoFrame.Visible = visible;
+            _channelsFrame.Y = visible ? GetLogoOuterHeight() : 0;
+            _directChatsFrame.Y = Pos.Bottom(_channelsFrame);
+            if (visible)
+            {
+                LoadLogoFiles();
+                ShowCurrentLogo();
+            }
+            _chatPage.LayoutSubviews();
+            _chatPage.SetNeedsDisplay();
+        }
+
+        private static int GetSidebarOuterWidth()
+        {
+            var innerWidth = _settings == null || _settings.Logo == null ? 32 : Math.Max(20, _settings.Logo.InnerWidth);
+            return innerWidth + 2;
+        }
+
+        private static int GetLogoOuterHeight()
+        {
+            var innerHeight = _settings == null || _settings.Logo == null ? 8 : Math.Max(1, _settings.Logo.InnerHeight);
+            return innerHeight + 2;
+        }
+
+        private static void LoadLogoFiles()
+        {
+            LogoFiles.Clear();
+            var applicationFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo");
+            var workingFolder = Path.Combine(Environment.CurrentDirectory, "logo");
+            var folder = Directory.Exists(applicationFolder) ? applicationFolder : workingFolder;
+            if (Directory.Exists(folder)) LogoFiles.AddRange(Directory.GetFiles(folder, "*.txt").OrderBy(file => Path.GetFileName(file), StringComparer.OrdinalIgnoreCase));
+            _logoIndex = LogoFiles.FindIndex(file => String.Equals(Path.GetFileName(file), _settings.Logo.LastLogoFileName, StringComparison.OrdinalIgnoreCase));
+            if (_logoIndex < 0) _logoIndex = 0;
+            _nextLogoChangeUtc = DateTime.MinValue;
+        }
+
+        private static void RotateLogoIfDue()
+        {
+            if (_settings == null || _settings.Logo == null || !_settings.Logo.ShowLogo || !_settings.Logo.AutomaticRotation || _logoFrame == null || !_logoFrame.Visible || DateTime.UtcNow < _nextLogoChangeUtc) return;
+            if (LogoFiles.Count > 1) _logoIndex = (_logoIndex + 1) % LogoFiles.Count;
+            ShowCurrentLogo();
+        }
+
+        private static void ShowNextLogo()
+        {
+            if (_settings == null || _settings.Logo == null || !_settings.Logo.ShowLogo || _logoFrame == null || !_logoFrame.Visible) return;
+            if (LogoFiles.Count == 0) LoadLogoFiles();
+            if (LogoFiles.Count > 1) _logoIndex = (_logoIndex + 1) % LogoFiles.Count;
+            ShowCurrentLogo();
+        }
+
+        private static void ShowPreviousLogo()
+        {
+            if (_settings == null || _settings.Logo == null || !_settings.Logo.ShowLogo || _logoFrame == null || !_logoFrame.Visible) return;
+            if (LogoFiles.Count == 0) LoadLogoFiles();
+            if (LogoFiles.Count > 1) _logoIndex = (_logoIndex - 1 + LogoFiles.Count) % LogoFiles.Count;
+            ShowCurrentLogo();
+        }
+
+        private static void DeleteCurrentLogo()
+        {
+            if (LogoFiles.Count == 0) LoadLogoFiles();
+            if (LogoFiles.Count == 0)
+            {
+                MessageBox.ErrorQuery("Delete logo", "No logo file is currently available.", "OK");
+                return;
+            }
+
+            _logoIndex = Math.Max(0, Math.Min(_logoIndex, LogoFiles.Count - 1));
+            var logoFile = Path.GetFullPath(LogoFiles[_logoIndex]);
+            var logoFolder = Path.GetFullPath(Path.GetDirectoryName(logoFile) ?? "");
+            var applicationLogoFolder = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo"));
+            var workingLogoFolder = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, "logo"));
+            var isLogoFolder = String.Equals(logoFolder, applicationLogoFolder, StringComparison.OrdinalIgnoreCase) ||
+                               String.Equals(logoFolder, workingLogoFolder, StringComparison.OrdinalIgnoreCase);
+            if (!isLogoFolder || !String.Equals(Path.GetExtension(logoFile), ".txt", StringComparison.OrdinalIgnoreCase) || !File.Exists(logoFile))
+            {
+                MessageBox.ErrorQuery("Delete logo", "The current logo file is not a valid file in the logo folder.", "OK");
+                return;
+            }
+
+            var fileName = Path.GetFileName(logoFile);
+            if (MessageBox.Query("Delete logo", "Permanently delete the current logo?\n\n" + fileName, "Delete", "Cancel") != 0) return;
+
+            try
+            {
+                File.Delete(logoFile);
+                LogoFiles.RemoveAt(_logoIndex);
+                if (_logoIndex >= LogoFiles.Count) _logoIndex = 0;
+                _settings.Logo.LastLogoFileName = LogoFiles.Count == 0 ? "" : Path.GetFileName(LogoFiles[_logoIndex]);
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                ShowCurrentLogo();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.ErrorQuery("Delete logo", "Could not delete the logo file.\n\n" + ex.Message, "OK");
+            }
+        }
+
+        private static void ShowCurrentLogo()
+        {
+            if (_logoText == null) return;
+            ClearAnimatedLogo();
+            if (TryShowSelectedEmojiInLogo()) return;
+            if (LogoFiles.Count == 0) _logoText.Text = "No logo files found.\nPlace *.txt files in .\\logo.";
+            else
+            {
+                try
+                {
+                    var logoLines = File.ReadAllLines(LogoFiles[_logoIndex]);
+                    _settings.Logo.LastLogoFileName = Path.GetFileName(LogoFiles[_logoIndex]);
+                    var frameHeight = Math.Max(1, _settings.Logo.InnerHeight);
+                    var frameWidth = Math.Max(1, _settings.Logo.InnerWidth);
+                    var logoWidth = logoLines.Length == 0 ? 0 : logoLines.Max(line => line == null ? 0 : line.Length);
+                    if (_settings.Logo.AnimateTallLogos && (logoLines.Length > frameHeight || logoWidth > frameWidth))
+                    {
+                        _animatedLogoLines = logoLines;
+                        _animatedLogoVerticalOffset = 0;
+                        _animatedLogoHorizontalOffset = 0;
+                        _animatedLogoVerticalDirection = 1;
+                        _animatedLogoHorizontalDirection = 1;
+                        ShowAnimatedLogoFrame();
+                    }
+                    else _logoText.Text = String.Join(Environment.NewLine, logoLines);
+                }
+                catch { _logoText.Text = "Could not read logo file."; }
+            }
+            _nextLogoChangeUtc = DateTime.UtcNow.AddSeconds(Math.Max(1, _settings.Logo.RotationIntervalSeconds));
+            _logoText.SetNeedsDisplay();
+        }
+
+        private static void ClearAnimatedLogo()
+        {
+            _animatedLogoScheduleGeneration++;
+            _animatedLogoLines = null;
+            _animatedLogoVerticalOffset = 0;
+            _animatedLogoHorizontalOffset = 0;
+            _animatedLogoVerticalDirection = 1;
+            _animatedLogoHorizontalDirection = 1;
+        }
+
+        private static void ScheduleAnimatedLogoFrame()
+        {
+            if (_animatedLogoLines == null || _animatedLogoLines.Length == 0 || _settings == null || _settings.Logo == null || !_settings.Logo.AnimateTallLogos) return;
+            var generation = _animatedLogoScheduleGeneration;
+            var interval = Math.Max(50, _settings.Logo.TallLogoFrameIntervalMilliseconds);
+            Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(interval), delegate(MainLoop loop)
+            {
+                if (generation != _animatedLogoScheduleGeneration || _animatedLogoLines == null || Volatile.Read(ref _shutdownStarted) != 0) return false;
+                ShowAnimatedLogoFrame();
+                return false;
+            });
+        }
+
+        private static void ShowAnimatedLogoFrame()
+        {
+            if (_animatedLogoLines == null || _animatedLogoLines.Length == 0 || _logoText == null) return;
+            var frameHeight = Math.Max(1, _settings.Logo.InnerHeight);
+            var frameWidth = Math.Max(1, _settings.Logo.InnerWidth);
+            var logoWidth = _animatedLogoLines.Max(line => line == null ? 0 : line.Length);
+            var maximumVerticalOffset = Math.Max(0, _animatedLogoLines.Length - frameHeight);
+            var maximumHorizontalOffset = Math.Max(0, logoWidth - frameWidth);
+            var visibleLines = new List<string>();
+            for (var row = 0; row < frameHeight; row++)
+            {
+                var sourceRow = _animatedLogoVerticalOffset + row;
+                var sourceLine = sourceRow < _animatedLogoLines.Length ? (_animatedLogoLines[sourceRow] ?? "") : "";
+                var paddedLine = sourceLine.PadRight(logoWidth);
+                var available = Math.Max(0, paddedLine.Length - _animatedLogoHorizontalOffset);
+                var length = Math.Min(frameWidth, available);
+                var visibleLine = length > 0 ? paddedLine.Substring(_animatedLogoHorizontalOffset, length) : "";
+                visibleLines.Add(visibleLine.PadRight(frameWidth));
+            }
+            _logoText.Text = String.Join(Environment.NewLine, visibleLines);
+            _logoText.SetNeedsDisplay();
+            _animatedLogoVerticalOffset = AdvanceAnimatedLogoOffset(_animatedLogoVerticalOffset, maximumVerticalOffset, _settings.Logo.AnimationVerticalStepLines, ref _animatedLogoVerticalDirection);
+            _animatedLogoHorizontalOffset = AdvanceAnimatedLogoOffset(_animatedLogoHorizontalOffset, maximumHorizontalOffset, _settings.Logo.AnimationHorizontalStepCharacters, ref _animatedLogoHorizontalDirection);
+            ScheduleAnimatedLogoFrame();
+        }
+
+        private static int AdvanceAnimatedLogoOffset(int current, int maximum, int step, ref int direction)
+        {
+            if (maximum <= 0) { direction = 1; return 0; }
+            step = Math.Max(1, step);
+            if (!_settings.Logo.AnimationPingPong)
+            {
+                direction = 1;
+                return current >= maximum ? 0 : Math.Min(maximum, current + step);
+            }
+            if (direction >= 0)
+            {
+                var next = current + step;
+                if (next >= maximum) { direction = -1; return maximum; }
+                return next;
+            }
+            else
+            {
+                var next = current - step;
+                if (next <= 0) { direction = 1; return 0; }
+                return next;
+            }
+        }
+
+        private static bool TryShowSelectedEmojiInLogo()
+        {
+            if (_settings == null || _settings.Logo == null || !_settings.Logo.ShowSelectedEmoji || _messages == null) return false;
+            var token = _messages.SelectedEmojiToken;
+            if (String.IsNullOrEmpty(token)) return false;
+            var emoji = ResolveEmojiReplacement(token);
+            if (String.IsNullOrEmpty(emoji)) return false;
+
+            var innerWidth = _settings == null || _settings.Logo == null ? 32 : Math.Max(1, _settings.Logo.InnerWidth);
+            var innerHeight = _settings == null || _settings.Logo == null ? 8 : Math.Max(1, _settings.Logo.InnerHeight);
+            var useFull = innerWidth >= 48 && innerHeight >= 24 && EmojiBlocksFull.ContainsKey(emoji);
+            EmojiBlockEntry block;
+            if (!(useFull ? EmojiBlocksFull : EmojiBlocksHalf).TryGetValue(emoji, out block)
+                && !EmojiBlocksHalf.TryGetValue(emoji, out block)
+                && !EmojiBlocksFull.TryGetValue(emoji, out block)) return false;
+            _logoText.Text = block.Text ?? "";
+            _logoText.SetNeedsDisplay();
+            return true;
+        }
+        private static void SelectBluetoothDevice(TextField target, MeshProtocol protocol, Action<BluetoothDeviceInfo> selected = null)
+        {
+            var dialog = new Dialog("Paired Bluetooth devices", 86, 19);
+            var status = new Label("Loading paired devices...") { X = 1, Y = 1, Width = Dim.Fill(1) };
+            var list = new ListView(new List<string>()) { X = 1, Y = 3, Width = Dim.Fill(1), Height = Dim.Fill(2) };
+            IList<BluetoothDeviceInfo> devices = new List<BluetoothDeviceInfo>();
+            var select = new Button("Select", true) { Enabled = false };
+            var closed = false;
+            using (var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
+            {
+                Action choose = () => { if (list.SelectedItem >= 0 && list.SelectedItem < devices.Count) { target.Text = devices[list.SelectedItem].Id; selected?.Invoke(devices[list.SelectedItem]); Application.RequestStop(); } };
+                select.Clicked += () => choose();
+                list.OpenSelectedItem += args => choose();
+                var back = new Button("Cancel"); back.Clicked += () => Application.RequestStop();
+                dialog.Add(status, list); dialog.AddButton(select); dialog.AddButton(back);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var found = await MeshtasticClient.GetBluetoothDevicesAsync(protocol, cancel.Token).ConfigureAwait(false);
+                        Application.MainLoop.Invoke(() => { if (closed) return; devices = found; list.SetSource(found.Select(d => d.ToString()).ToList()); select.Enabled = found.Count > 0; status.Text = found.Count == 0 ? "No paired devices. Pair in the operating system first." : "Choose your radio (Enter or double-click)."; });
+                    }
+                    catch (Exception ex) { Application.MainLoop.Invoke(() => { if (!closed) status.Text = ex is OperationCanceledException ? "Bluetooth search timed out." : ex.Message; }); }
+                });
+                try { Application.Run(dialog, HandleTerminalGuiException); }
+                finally { closed = true; cancel.Cancel(); }
+            }
+        }
+        private static void ShowSettings()
+        {
+            var c = _settings.Connection;
+            var dialog = new Dialog("Connection settings", 90, 24);
+            var transport = new RadioGroup(new Rect(1, 1, 24, 3), new ustring[] { "Serial", "TCP", "Bluetooth LE" }) { SelectedItem = (int)c.Transport };
+            var protocol = new RadioGroup(new Rect(35, 1, 24, 2), new ustring[] { "Meshtastic", "MeshCore" }) { SelectedItem = c.Protocol == MeshProtocol.MeshCore ? 1 : 0 };
+            dialog.Add(protocol);
+            var serial = new TextField(c.SerialPort) { X = 16, Y = 4, Width = 20 };
+            var baud = new TextField(c.SerialBaudRate.ToString(CultureInfo.InvariantCulture)) { X = 16, Y = 5, Width = 20 };
+            var dtr = new CheckBox("DTR enabled") { X = 1, Y = 6, Checked = c.SerialDtrEnable };
+            var rts = new CheckBox("RTS enabled") { X = 22, Y = 6, Checked = c.SerialRtsEnable };
+            var host = new TextField(c.TcpHost) { X = 16, Y = 8, Width = 35 };
+            var port = new TextField(c.TcpPort.ToString(CultureInfo.InvariantCulture)) { X = 16, Y = 9, Width = 20 };
+            var bluetoothName = c.BluetoothDeviceName; var bluetoothNameId = c.BluetoothDeviceId;
+            var bluetooth = new TextField(c.BluetoothDeviceId ?? "") { X = 16, Y = 11, Width = 35 };
+            var selectBluetooth = new Button("Select device") { X = 54, Y = 11 };
+            selectBluetooth.Clicked += delegate { SelectBluetoothDevice(bluetooth, protocol.SelectedItem == 1 ? MeshProtocol.MeshCore : MeshProtocol.Meshtastic, device => { bluetoothName = device.Name; bluetoothNameId = device.Id; }); };
+            dialog.Add(new Label("Bluetooth ID:") { X = 1, Y = 11 }, bluetooth, selectBluetooth,
+                new Label("Pair the device in Windows/Linux Bluetooth settings first.") { X = 1, Y = 13 },
+                new Label("MeshCore requires Bluetooth companion firmware.") { X = 1, Y = 14 });
+            var automaticReconnect = new CheckBox("Automatic reconnect") { X = 1, Y = 16, Checked = c.AutomaticReconnect };
+            var reconnectInterval = new TextField(c.ReconnectIntervalSeconds.ToString(CultureInfo.InvariantCulture)) { X = 30, Y = 17, Width = 8 };
+            dialog.Add(transport, new Label("Serial port:") { X = 1, Y = 4 }, serial, new Label("Baud rate:") { X = 1, Y = 5 }, baud, dtr, rts, new Label("TCP host:") { X = 1, Y = 8 }, host, new Label("TCP port:") { X = 1, Y = 9 }, port, automaticReconnect, new Label("Reconnect interval (seconds):") { X = 1, Y = 17 }, reconnectInterval);
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                int parsedBaud, parsedPort, parsedReconnectInterval;
+                if (!Int32.TryParse(baud.Text.ToString(), out parsedBaud) || !Int32.TryParse(port.Text.ToString(), out parsedPort)) { MessageBox.ErrorQuery("Settings", "Baud rate and port must be numbers.", "OK"); return; }
+                if (!Int32.TryParse(reconnectInterval.Text.ToString(), out parsedReconnectInterval) || parsedReconnectInterval < 1 || parsedReconnectInterval > 86400) { MessageBox.ErrorQuery("Settings", "The reconnect interval must be between 1 and 86400 seconds.", "OK"); return; }
+                if (transport.SelectedItem == 2 && String.IsNullOrWhiteSpace(bluetooth.Text.ToString())) { MessageBox.ErrorQuery("Bluetooth", "Select a paired device first.", "OK"); return; }
+                c.Transport = (MeshtasticTransportType)transport.SelectedItem;
+                c.BluetoothDeviceName = bluetooth.Text.ToString().Trim() == bluetoothNameId ? bluetoothName : null;
+                c.BluetoothDeviceId = bluetooth.Text.ToString().Trim();
+                c.Protocol = protocol.SelectedItem == 1 ? MeshProtocol.MeshCore : MeshProtocol.Meshtastic;
+                c.SerialPort = serial.Text.ToString(); c.SerialBaudRate = parsedBaud; c.TcpHost = host.Text.ToString(); c.TcpPort = parsedPort;
+                c.SerialDtrEnable = dtr.Checked; c.SerialRtsEnable = rts.Checked;
+                c.AutomaticReconnect = automaticReconnect.Checked; c.ReconnectIntervalSeconds = parsedReconnectInterval;
+                ApplyConnectionReconnectSettings();
+                try { MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); Application.RequestStop(); } catch (Exception ex) { MessageBox.ErrorQuery("Settings", ex.Message, "OK"); }
+            };
+            var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException);
+            if (c.Protocol != _mesh.Protocol) MessageBox.Query("Protocol changed", "Restart the program to use " + c.Protocol + " and its separate chat history.", "OK");
+        }
+
+        private static void ShowAlertSettings()
+        {
+            var dialog = new Dialog("Alert settings", 92, 24);
+            var windowsBeep = new CheckBox("Play Windows beep for new incoming messages") { X = 1, Y = 1, Checked = _settings.Alerts.EnableWindowsBeep };
+            var terminalBell = new CheckBox("Send terminal BEL for host notification") { X = 1, Y = 2, Checked = _settings.Alerts.EnableTerminalBell };
+            var interval = new TextField(_settings.Alerts.RepeatBeepIntervalSeconds.ToString(CultureInfo.InvariantCulture)) { X = 42, Y = 3, Width = 8 };
+            var desktopNotification = new CheckBox("Show desktop notification for new messages (Windows only)") { X = 1, Y = 5, Checked = _settings.Alerts.EnableDesktopNotifications };
+            var testNotification = new Button("Test desktop notification") { X = 3, Y = 6 };
+            testNotification.Clicked += delegate { ShowDesktopNotification("MeshTerminal", "Desktop notifications are working."); };
+            var blinkLogo = new CheckBox("Blink logo while unread messages exist") { X = 1, Y = 8, Checked = _settings.Alerts.BlinkLogoForUnreadMessages };
+            var httpEnabled = new CheckBox("Enable alert HTTP GET") { X = 1, Y = 10, Checked = _settings.Alerts.EnableHttpGet };
+            var httpUrl = new TextField(_settings.Alerts.HttpGetUrl ?? "") { X = 22, Y = 11, Width = 65 };
+            var executableEnabled = new CheckBox("Enable alert shell command") { X = 1, Y = 13, Checked = _settings.Alerts.EnableExecutable };
+            var executable = new TextField(_settings.Alerts.ExecutablePath ?? "") { X = 22, Y = 14, Width = 65 };
+            var suppressMap = new CheckBox("Suppress alerts for ///MAP messages") { X = 1, Y = 16, Checked = _settings.Alerts.SuppressMapMessageAlerts };
+            var cooldown = new CheckBox("Limit sound alerts to one per interval") { X = 1, Y = 18, Checked = _settings.Alerts.EnableSoundCooldown };
+            var cooldownSeconds = new TextField(_settings.Alerts.SoundCooldownSeconds.ToString(CultureInfo.InvariantCulture)) { X = 44, Y = 19, Width = 8 };
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                int parsedInterval;
+                if (!Int32.TryParse(interval.Text.ToString(), out parsedInterval) || parsedInterval < 0) { MessageBox.ErrorQuery("Alert settings", "The repeat interval must be zero or a positive number of seconds.", "OK"); return; }
+                int parsedCooldown;
+                if (!Int32.TryParse(cooldownSeconds.Text.ToString(), out parsedCooldown) || parsedCooldown < 1 || parsedCooldown > 86400) { MessageBox.ErrorQuery("Alert settings", "Sound cooldown must be between 1 and 86400 seconds.", "OK"); return; }
+                _settings.Alerts.EnableSoundCooldown = cooldown.Checked;
+                _settings.Alerts.SoundCooldownSeconds = parsedCooldown;
+                _settings.Alerts.SuppressMapMessageAlerts = suppressMap.Checked;
+                _settings.Alerts.EnableWindowsBeep = windowsBeep.Checked;
+                _settings.Alerts.EnableTerminalBell = terminalBell.Checked;
+                _settings.EnableNewMessageBeep = windowsBeep.Checked || terminalBell.Checked;
+                _settings.Alerts.RepeatBeepIntervalSeconds = parsedInterval;
+                _settings.Alerts.EnableDesktopNotifications = desktopNotification.Checked;
+                _settings.Alerts.BlinkLogoForUnreadMessages = blinkLogo.Checked;
+                _settings.Alerts.EnableHttpGet = httpEnabled.Checked;
+                _settings.Alerts.HttpGetUrl = httpUrl.Text.ToString().Trim();
+                _settings.Alerts.EnableExecutable = executableEnabled.Checked;
+                _settings.Alerts.ExecutablePath = executable.Text.ToString().Trim();
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); NotifyAlertStateChanged(null); UpdateLogoBlink(); Application.RequestStop();
+            };
+            var cancel = new Button("Cancel");
+            cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(windowsBeep, terminalBell,
+                new Label("Repeat beep interval (seconds, 0 = off):") { X = 1, Y = 3 }, interval,
+                desktopNotification, testNotification,
+                blinkLogo,
+                httpEnabled, new Label("HTTP GET URL:") { X = 1, Y = 11 }, httpUrl,
+                executableEnabled, new Label("Shell command:") { X = 1, Y = 14 }, executable, suppressMap, cooldown, new Label("Sound cooldown (seconds):") { X = 1, Y = 19 }, cooldownSeconds);
+            dialog.AddButton(save); dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static void ShowTelemetryStorageSettings()
+        {
+            var dialog = new Dialog("Telemetry storage", 72, 15);
+            var telemetryEnabled = new CheckBox("Store received telemetry data in the database") { X = 1, Y = 1, Checked = _settings.StoreTelemetryData };
+            var telemetryFavoritesOnly = new CheckBox("Store telemetry data for favorite nodes only") { X = 4, Y = 2, Checked = _settings.StoreTelemetryFavoritesOnly };
+            var positionEnabled = new CheckBox("Store received node positions in the telemetry database") { X = 1, Y = 5, Checked = _settings.StorePositionData };
+            var positionFavoritesOnly = new CheckBox("Store positions for favorite nodes only") { X = 4, Y = 6, Checked = _settings.StorePositionFavoritesOnly };
+            dialog.Add(telemetryEnabled, telemetryFavoritesOnly, positionEnabled, positionFavoritesOnly,
+                new Label("Existing telemetry and position records are not deleted when disabled.") { X = 1, Y = 9 });
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                _settings.StoreTelemetryData = telemetryEnabled.Checked;
+                _settings.StoreTelemetryFavoritesOnly = telemetryFavoritesOnly.Checked;
+                _settings.StorePositionData = positionEnabled.Checked;
+                _settings.StorePositionFavoritesOnly = positionFavoritesOnly.Checked;
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel");
+            cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static List<TelegramGatewaySettings> GetTelegramGatewaysForCurrentProtocol()
+        {
+            return _settings.TelegramGateways.Where(gateway => gateway.Protocol == _mesh.Protocol).OrderBy(gateway => gateway.ChannelIndex).ToList();
+        }
+
+        private static string TelegramGatewayChannelName(int index)
+        {
+            var channel = _mesh.Channels.FirstOrDefault(item => item.Index == index);
+            var name = channel == null ? "not configured" : (String.IsNullOrWhiteSpace(channel.Name) ? (index == 0 ? "Primary" : "Channel " + index) : channel.Name);
+            return "Ch " + index + " | " + name;
+        }
+        private static string FormatTelegramGateway(TelegramGatewaySettings gateway)
+        {
+            var directions = (gateway.ForwardMeshtasticToTelegram ? "M>T" : "") + (gateway.ForwardTelegramToMeshtastic ? (gateway.ForwardMeshtasticToTelegram ? ", T>M" : "T>M") : "");
+            return (String.IsNullOrWhiteSpace(gateway.Name) ? "" : gateway.Name + " | ") + TelegramGatewayChannelName(gateway.ChannelIndex) + "  " + (gateway.Enabled ? "[enabled] " : "[disabled]") + (gateway.ChatId == 0 ? "not configured" : "chat " + gateway.ChatId.ToString(CultureInfo.InvariantCulture)) + "  " + directions;
+        }
+
+        private static string BuildTelegramGatewayFeedback(TelegramGatewaySettings gateway, TelegramGatewayStatus status)
+        {
+            if (!gateway.Enabled) return "Gateway disabled.";
+            if (status == null) return "Gateway has not been started. Connect the mesh device or choose Apply / reconnect.";
+            return "Connection: " + status.State + "\nBot: " + (status.BotUsername ?? "-") + "\nChat ID: " + status.ChatId.ToString(CultureInfo.InvariantCulture) + "\n" + _mesh.Protocol + " -> Telegram: " + status.ForwardedToTelegramCount + "\nTelegram received: " + status.ReceivedFromTelegramCount + "\nTelegram -> " + _mesh.Protocol + ": " + status.ForwardedToMeshtasticCount + "\n\nServer feedback:\n" + (String.IsNullOrWhiteSpace(status.ServerFeedback) ? "No feedback received yet." : status.ServerFeedback);
+        }
+
+        private static void ShowTelegramGatewayStatus()
+        {
+            var dialog = new Dialog("Telegram Gateway Status", 132, 28);
+            var list = new ListView { X = 1, Y = 1, Width = Dim.Fill(2), Height = 8 };
+            var feedbackFrame = new FrameView("Telegram server feedback") { X = 1, Y = 10, Width = Dim.Fill(2), Height = Dim.Fill(4) };
+            var feedback = new TextView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), WordWrap = true, CanFocus = true, ReadOnly = true };
+            feedbackFrame.Add(feedback);
+            var statuses = new List<TelegramGatewayStatus>();
+            Action updateFeedback = delegate
+            {
+                var gateways = GetTelegramGatewaysForCurrentProtocol();
+                if (list.SelectedItem < 0 || list.SelectedItem >= gateways.Count) { feedback.Text = "Select a channel to see its Telegram connection feedback."; return; }
+                var gateway = gateways[list.SelectedItem];
+                feedback.Text = BuildTelegramGatewayFeedback(gateway, statuses.FirstOrDefault(item => item.ChannelIndex == gateway.ChannelIndex));
+            };
+            Action refresh = delegate
+            {
+                statuses = _telegramGateways == null ? new List<TelegramGatewayStatus>() : _telegramGateways.GetStatuses().ToList();
+                list.SetSource(GetTelegramGatewaysForCurrentProtocol().Select(gateway => FormatTelegramGatewayStatus(gateway, statuses.FirstOrDefault(status => status.ChannelIndex == gateway.ChannelIndex))).ToList());
+                updateFeedback();
+            };
+            list.SelectedItemChanged += delegate { updateFeedback(); };
+            var refreshButton = new Button("Refresh", true) { X = 1, Y = Pos.AnchorEnd(2) };
+            refreshButton.Clicked += delegate { refresh(); };
+            var close = new Button("Close") { X = Pos.Right(refreshButton) + 2, Y = Pos.AnchorEnd(2) };
+            close.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(list, feedbackFrame); dialog.AddButton(refreshButton); dialog.AddButton(close); refresh(); Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static string FormatTelegramGatewayStatus(TelegramGatewaySettings gateway, TelegramGatewayStatus status)
+        {
+            if (!gateway.Enabled) return TelegramGatewayChannelName(gateway.ChannelIndex) + "  disabled";
+            if (status == null) return TelegramGatewayChannelName(gateway.ChannelIndex) + "  not started";
+            var error = String.IsNullOrWhiteSpace(status.LastError) ? "" : " | " + status.LastError;
+            return (String.IsNullOrWhiteSpace(gateway.Name) ? "" : gateway.Name + " | ") + TelegramGatewayChannelName(gateway.ChannelIndex) + "  " + status.State + "  chat " + status.ChatId.ToString(CultureInfo.InvariantCulture) + "  M->T " + status.ForwardedToTelegramCount + " / Telegram RX " + status.ReceivedFromTelegramCount + " / T->M " + status.ForwardedToMeshtasticCount + error;
+        }
+
+        private static async Task RestartTelegramGatewaysAsync()
+        {
+            var previous = _telegramGateways;
+            _telegramGateways = null;
+            if (previous != null) { await previous.StopAsync(); previous.Dispose(); }
+
+            var manager = new MeshtasticTelegramGatewayManager(_mesh, _settings.TelegramGateways);
+            manager.StatusChanged += delegate { Ui(UpdateStatus); };
+            manager.TelegramMessageForwarded += delegate(object sender, TelegramGatewayMessageForwardedEventArgs e)
+            {
+                Save(delegate
+                {
+                    var channel = _mesh.Channels.FirstOrDefault(item => item.Index == e.ChannelIndex);
+                    _store.AddOutgoing(e.PacketId, _mesh.Device.MyNode == null ? 0u : _mesh.Device.MyNode.MyNodeNum, UInt32.MaxValue, e.Text, e.ChannelIndex, channel == null ? null : channel.Name);
+                    Ui(RefreshChats);
+                });
+            };
+            _telegramGateways = manager;
+            await manager.StartAsync();
+        }
+
+        private static ListView AddBotChannelSelection(Dialog dialog, MeshtasticChatBotSettings bot, int x, int y, int height)
+        {
+            var count = Math.Max(_mesh.ChannelSlotCount, bot.ReactToChannels == null || bot.ReactToChannels.Count == 0 ? 0 : bot.ReactToChannels.Max() + 1);
+            var frame = new FrameView("React to channels") { X = x, Y = y, Width = 38, Height = height };
+            var list = new ListView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(1), AllowsMarking = true, AllowsMultipleSelection = true };
+            list.SetSource(Enumerable.Range(0, count).Select(TelegramGatewayChannelName).ToList());
+            for (var index = 0; index < count; index++)
+                list.Source.SetMark(index, bot.ReactToChannels != null && bot.ReactToChannels.Contains(index));
+            frame.Add(list, new Label("Space / click: select") { X = 0, Y = Pos.AnchorEnd(1) });
+            dialog.Add(frame);
+            return list;
+        }
+
+        private static List<int> SelectedBotChannels(ListView list)
+        {
+            return Enumerable.Range(0, list.Source.Count).Where(index => list.Source.IsMarked(index)).ToList();
+        }
+        private static string LimitBotReply(string text, int maximumCharacters, MeshMessage message)
+        {
+            if (text.Length > maximumCharacters) text = text.Substring(0, maximumCharacters);
+            var maximumBytes = _mesh.GetMaximumTextPayloadBytes(message.IsChannelMessage, message.From);
+            while (Encoding.UTF8.GetByteCount(text) > maximumBytes && text.Length > 0)
+                text = text.Substring(0, text.Length - (text.Length > 1 && Char.IsLowSurrogate(text[text.Length - 1]) && Char.IsHighSurrogate(text[text.Length - 2]) ? 2 : 1));
+            if (text.Length > 0 && Char.IsHighSurrogate(text[text.Length - 1])) text = text.Substring(0, text.Length - 1);
+            return text;
+        }
+        private static void ShowChatBots()
+        {
+            var dialog = new Dialog("Chat bots", 116, 22);
+            var bots = _settings.ChatBots.Where(bot => bot.Protocol == _mesh.Protocol).ToList();
+            var list = new ListView { X = 1, Y = 1, Width = Dim.Fill(2), Height = Dim.Fill(4) };
+            Action refresh = delegate { bots = _settings.ChatBots.Where(bot => bot.Protocol == _mesh.Protocol).ToList(); list.SetSource(_settings.ChatBots.Where(bot => bot.Protocol == _mesh.Protocol).Select(FormatChatBot).ToList()); if (bots.Count > 0) list.SelectedItem = Math.Min(Math.Max(0, list.SelectedItem), bots.Count - 1); };
+            refresh();
+            var add = new Button("Add") { X = 1, Y = Pos.AnchorEnd(2) };
+            add.Clicked += delegate { EditChatBot(null); refresh(); };
+            var edit = new Button("Edit") { X = Pos.Right(add) + 2, Y = Pos.AnchorEnd(2) };
+            edit.Clicked += delegate { if (list.SelectedItem >= 0 && list.SelectedItem < bots.Count) { EditChatBot(bots[list.SelectedItem]); refresh(); } };
+            var toggle = new Button("Enable/disable") { X = Pos.Right(edit) + 2, Y = Pos.AnchorEnd(2) };
+            toggle.Clicked += delegate { if (list.SelectedItem >= 0 && list.SelectedItem < bots.Count) { bots[list.SelectedItem].Enabled = !bots[list.SelectedItem].Enabled; MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); refresh(); } };
+            var delete = new Button("Delete") { X = Pos.Right(toggle) + 2, Y = Pos.AnchorEnd(2) };
+            delete.Clicked += delegate { if (list.SelectedItem >= 0 && list.SelectedItem < bots.Count && MessageBox.Query("Delete bot", "Delete the selected chat bot?", "Delete", "Cancel") == 0) { _settings.ChatBots.Remove(bots[list.SelectedItem]); MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); refresh(); } };
+            var close = new Button("Close") { X = Pos.Right(delete) + 2, Y = Pos.AnchorEnd(2) };
+            close.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(list, add, edit, toggle, delete, close);
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static void ShowHttpBots()
+        {
+            var bots = _settings.HttpBots.Where(bot => bot.Protocol == _mesh.Protocol).ToList(); var dialog = new Dialog("HTTP bots", 116, 18); var list = new ListView { X = 1, Y = 1, Width = Dim.Fill(2), Height = Dim.Fill(4) };
+            Action refresh = delegate { bots = _settings.HttpBots.Where(bot => bot.Protocol == _mesh.Protocol).ToList(); list.SetSource(bots.Select(bot => (bot.Enabled ? "[on] " : "[off] ") + bot.Command + " | " + bot.Url).ToList()); };
+            var add = new Button("Add") { X = 1, Y = Pos.AnchorEnd(2) }; add.Clicked += delegate { var bot = new MeshtasticHttpBotSettings { Protocol = _mesh.Protocol, ReactToChannels = new List<int>() }; if (!EditHttpBot(bot)) return; _settings.HttpBots.Add(bot); MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); refresh(); };
+            var edit = new Button("Edit") { X = Pos.Right(add) + 2, Y = Pos.AnchorEnd(2) }; edit.Clicked += delegate { if (list.SelectedItem >= 0 && list.SelectedItem < bots.Count) { EditHttpBot(bots[list.SelectedItem]); MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); refresh(); } };
+            var close = new Button("Close") { X = Pos.Right(edit) + 2, Y = Pos.AnchorEnd(2) }; close.Clicked += delegate { Application.RequestStop(); }; dialog.Add(list, add, edit, close); refresh(); Application.Run(dialog, HandleTerminalGuiException);
+        }
+        private static bool EditHttpBot(MeshtasticHttpBotSettings bot)
+        {
+            var saved = false; var dialog = new Dialog("HTTP bot", 132, 30); var command = new TextField(bot.Command) { X = 20, Y = 1, Width = 25 }; var url = new TextField(bot.Url) { X = 20, Y = 2, Width = 65 }; var max = new TextField(bot.MaximumReplyLength.ToString()) { X = 20, Y = 3, Width = 8 }; var limit = new TextField(bot.MaximumParameterCount.ToString()) { X = 20, Y = 4, Width = 8 }; var enabled = new CheckBox("Enabled") { X = 1, Y = 6, Checked = bot.Enabled }; var direct = new CheckBox("React to direct messages") { X = 24, Y = 6, Checked = bot.ReactToDirectMessages }; var favorites = new CheckBox("Favorites only") { X = 24, Y = 7, Checked = bot.FavoritesOnly };
+            dialog.Add(new Label("Command:") { X = 1, Y = 1 }, command, new Label("GET URL:") { X = 1, Y = 2 }, url, new Label("Max reply:") { X = 1, Y = 3 }, max, new Label("Max params:") { X = 1, Y = 4 }, limit, enabled, direct, favorites, new Label("Custom GET parameters (variables allowed):") { X = 1, Y = 12 });
+            var channels = AddBotChannelSelection(dialog, bot, 90, 1, 22);
+            var names = new List<TextField>(); var values = new List<TextField>(); for (var i = 0; i < 5; i++) { var name = new TextField(bot.QueryParameters[i].Name) { X = 1, Y = 13 + i, Width = 20 }; var value = new TextField(bot.QueryParameters[i].Value) { X = 24, Y = 13 + i, Width = 60 }; names.Add(name); values.Add(value); dialog.Add(name, value); }
+            var save = new Button("Save", true); save.Clicked += delegate { int reply, parameters; if (!Int32.TryParse(max.Text.ToString(), out reply) || !Int32.TryParse(limit.Text.ToString(), out parameters) || reply < 1 || parameters < 0 || String.IsNullOrWhiteSpace(command.Text.ToString()) || String.IsNullOrWhiteSpace(url.Text.ToString())) { MessageBox.ErrorQuery("HTTP bot", "Command, URL and numeric limits are required.", "OK"); return; } saved = true; bot.Command = command.Text.ToString(); bot.Url = url.Text.ToString(); bot.MaximumReplyLength = reply; bot.MaximumParameterCount = parameters; bot.Enabled = enabled.Checked; bot.ReactToDirectMessages = direct.Checked; bot.FavoritesOnly = favorites.Checked; bot.ReactToChannels = SelectedBotChannels(channels); for (var i = 0; i < 5; i++) { bot.QueryParameters[i].Name = names[i].Text.ToString(); bot.QueryParameters[i].Value = values[i].Text.ToString(); } Application.RequestStop(); }; var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); }; dialog.AddButton(save); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException); return saved;
+        }
+
+        private static void WriteSerialComLog(SerialTrafficEventArgs traffic)
+        {
+            if (traffic == null || _settings == null || !_settings.EnableSerialTrafficLog) return;
+            try
+            {
+                var timestamp = new DateTimeOffset(DateTime.SpecifyKind(traffic.TimestampUtc, DateTimeKind.Utc)).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss.fff zzz", CultureInfo.InvariantCulture);
+                var comment = (traffic.Comment ?? "").Replace("\r", " ").Replace("\n", " ");
+                var hex = BitConverter.ToString(traffic.Data ?? new byte[0]).Replace("-", " ");
+                var line = timestamp + " " + (traffic.Direction ?? "??") + " [" + comment + "] " + hex + Environment.NewLine;
+                lock (ComLogGate) File.AppendAllText(ComLogFileName, line, new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        private static string ReadSerialComLog()
+        {
+            lock (ComLogGate)
+            {
+                if (!File.Exists(ComLogFileName)) return "The COM log is empty.";
+                try
+                {
+                    using (var stream = new FileStream(ComLogFileName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    {
+                        var truncated = stream.Length > MaximumDisplayedComLogBytes;
+                        if (truncated) stream.Seek(-MaximumDisplayedComLogBytes, SeekOrigin.End);
+                        using (var reader = new StreamReader(stream, Encoding.UTF8, true))
+                        {
+                            if (truncated) reader.ReadLine();
+                            return (truncated ? "[Showing the last 1 MiB of com.log]" + Environment.NewLine : "") + reader.ReadToEnd();
+                        }
+                    }
+                }
+                catch (Exception ex) { return "Unable to read com.log: " + ex.Message; }
+            }
+        }
+
+        private static void ShowSerialComLog()
+        {
+            var dialog = new Dialog("Serial COM log", 118, 34);
+            var path = new Label("File: " + Path.GetFullPath(ComLogFileName)) { X = 1, Y = 1, Width = Dim.Fill(2) };
+            var view = new TextView { X = 1, Y = 3, Width = Dim.Fill(2), Height = Dim.Fill(4), WordWrap = false, CanFocus = true, ReadOnly = true };
+            Action refresh = delegate { view.Text = ReadSerialComLog(); view.SetNeedsDisplay(); };
+            var toggle = new Button(_settings.EnableSerialTrafficLog ? "Logging: ON" : "Logging: OFF", true);
+            toggle.Clicked += delegate
+            {
+                _settings.EnableSerialTrafficLog = !_settings.EnableSerialTrafficLog;
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                toggle.Text = _settings.EnableSerialTrafficLog ? "Logging: ON" : "Logging: OFF";
+                toggle.SetNeedsDisplay();
+            };
+            var reload = new Button("Refresh"); reload.Clicked += delegate { refresh(); };
+            var copy = new Button("Copy log"); copy.Clicked += delegate { CopyTextWithFallback(view.Text == null ? "" : view.Text.ToString(), "COM log copied."); };
+            var delete = new Button("Delete log"); delete.Clicked += delegate
+            {
+                if (MessageBox.Query("Serial COM log", "Permanently delete com.log?", "Delete", "Cancel") != 0) return;
+                try { lock (ComLogGate) { if (File.Exists(ComLogFileName)) File.Delete(ComLogFileName); } refresh(); }
+                catch (Exception ex) { MessageBox.ErrorQuery("Serial COM log", "Unable to delete com.log:\n" + ex.Message, "OK"); }
+            };
+            var close = new Button("Close"); close.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(path, view); dialog.AddButton(toggle); dialog.AddButton(reload); dialog.AddButton(copy); dialog.AddButton(delete); dialog.AddButton(close);
+            refresh();
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static void ShowChatBotDebug() { ShowBotDebug("Chat bot Debug", delegate { return _lastChatBotRequest; }, delegate { return _lastChatBotOutput; }); }
+        private static void ShowHttpBotDebug() { ShowBotDebug("HTTP bot Debug", delegate { return _lastHttpBotRequest; }, delegate { return _lastHttpBotOutput; }); }
+        private static void ShowAlertHttpDebug() { ShowBotDebug("Alert HTTP Debug", delegate { return _lastAlertHttpRequest; }, delegate { return _lastAlertHttpOutput; }); }
+        private static void ShowAlertProcessDebug() { ShowBotDebug("Alert shell command Debug", delegate { return _lastAlertProcessRequest; }, delegate { return _lastAlertProcessOutput; }); }
+        private static void ShowBotDebug(string title, Func<string> requestProvider, Func<string> outputProvider)
+        {
+            var dialog = new Dialog(title, 108, 30);
+            var requestFrame = new FrameView("Last complete request") { X = 1, Y = 1, Width = Dim.Fill(2), Height = 12 };
+            var requestView = new TextView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), WordWrap = true, CanFocus = true, ReadOnly = true, Text = requestProvider() ?? "" };
+            requestFrame.Add(requestView);
+            var outputFrame = new FrameView("Last bot output") { X = 1, Y = 13, Width = Dim.Fill(2), Height = Dim.Fill(4) };
+            var outputView = new TextView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), WordWrap = true, CanFocus = true, ReadOnly = true, Text = outputProvider() ?? "" };
+            outputFrame.Add(outputView);
+            var refresh = new Button("Refresh", true); refresh.Clicked += delegate { requestView.Text = requestProvider() ?? ""; outputView.Text = outputProvider() ?? ""; requestView.SetNeedsDisplay(); outputView.SetNeedsDisplay(); };
+            var copyRequest = new Button("Copy request"); copyRequest.Clicked += delegate { CopyDebugText(requestView.Text.ToString()); };
+            var copyOutput = new Button("Copy output"); copyOutput.Clicked += delegate { CopyDebugText(outputView.Text.ToString()); };
+            var close = new Button("Close"); close.Clicked += delegate { Application.RequestStop(); };
+            dialog.Add(requestFrame, outputFrame); dialog.AddButton(refresh); dialog.AddButton(copyRequest); dialog.AddButton(copyOutput); dialog.AddButton(close); Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static void CopyDebugText(string text)
+        {
+            CopyTextWithFallback(text ?? "", "Debug text copied.");
+        }
+
+        private static void ShowInfo()
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            var version = assembly.GetName().Version;
+            var buildDate = assembly.GetCustomAttributes(typeof(AssemblyMetadataAttribute)).OfType<AssemblyMetadataAttribute>().FirstOrDefault(attribute => attribute.Key == "BuildDateUtc");
+            MessageBox.Query("Info", "MeshTerminal\n\nCreated by Tobias Krista with support from AI.\nBuild: " + (version == null ? "-" : version.ToString()) + "\nCompiled: " + (buildDate == null ? "-" : buildDate.Value + " UTC") + "\n\nSource code:\nhttps://github.com/kr-saibot/MeshTerminal\n\nThis program is published under the GNU General Public License v3.0 (GPLv3).", "OK");
+        }
+
+        private static string FormatChatBot(MeshtasticChatBotSettings bot)
+        {
+            return (bot.Enabled ? "[on]  " : "[off] ") + bot.Command + "  | " + (bot.CaseSensitive ? "case-sensitive" : "ignore case") + "  | " + bot.ExecutablePath;
+        }
+
+        private static void EditChatBot(MeshtasticChatBotSettings existing)
+        {
+            var isNew = existing == null;
+            var bot = existing ?? new MeshtasticChatBotSettings { Protocol = _mesh.Protocol, ReactToChannels = new List<int>() };
+            var dialog = new Dialog(isNew ? "Add chat bot" : "Edit chat bot", 132, 30);
+            var command = new TextField(bot.Command) { X = 30, Y = 1, Width = 30 };
+            var executable = new TextField(bot.ExecutablePath) { X = 30, Y = 2, Width = 45 };
+            var maximum = new TextField(bot.MaximumReplyLength.ToString()) { X = 30, Y = 3, Width = 10 };
+            var parameterLimit = new TextField(bot.MaximumParameterCount.ToString()) { X = 30, Y = 4, Width = 10 };
+            var prefix = new TextField(bot.ArgumentPrefix) { X = 30, Y = 5, Width = 45 };
+            var suffix = new TextField(bot.ArgumentSuffix) { X = 30, Y = 6, Width = 45 };
+            var enabled = new CheckBox("Enabled") { X = 1, Y = 8, Checked = bot.Enabled };
+            var caseSensitive = new CheckBox("Case-sensitive command") { X = 1, Y = 9, Checked = bot.CaseSensitive };
+            var directMessages = new CheckBox("React to direct messages") { X = 30, Y = 8, Checked = bot.ReactToDirectMessages };
+            var favoritesOnly = new CheckBox("Favorites only") { X = 30, Y = 9, Checked = bot.FavoritesOnly };
+            var channelChecks = AddBotChannelSelection(dialog, bot, 90, 1, 22);
+            var variables = new Button("?") { X = 77, Y = 5 };
+            variables.Clicked += ShowChatBotVariableHelp;
+            var previewFrame = new FrameView("Example command line") { X = 1, Y = 12, Width = 85, Height = Dim.Fill(4) };
+            var preview = new TextView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), WordWrap = true, CanFocus = true, ReadOnly = true };
+            previewFrame.Add(preview);
+            Action updatePreview = delegate
+            {
+                int count; if (!Int32.TryParse(parameterLimit.Text.ToString(), out count)) count = 0;
+                var commandParts = new List<string>(); var before = ExpandChatBotVariableExamples(prefix.Text.ToString()); var after = ExpandChatBotVariableExamples(suffix.Text.ToString());
+                if (!String.IsNullOrWhiteSpace(before)) commandParts.Add(before);
+                for (var parameter = 1; parameter <= Math.Min(Math.Max(0, count), 10); parameter++) commandParts.Add("P" + parameter.ToString("D2"));
+                if (!String.IsNullOrWhiteSpace(after)) commandParts.Add(after);
+                preview.Text = (String.IsNullOrWhiteSpace(executable.Text.ToString()) ? "<executable>" : executable.Text.ToString()) + " " + String.Join(" ", commandParts);
+            };
+            prefix.TextChanged += delegate { updatePreview(); }; suffix.TextChanged += delegate { updatePreview(); }; parameterLimit.TextChanged += delegate { updatePreview(); }; executable.TextChanged += delegate { updatePreview(); };
+            dialog.Add(new Label("Command (first word):") { X = 1, Y = 1 }, command, new Label("Executable path:") { X = 1, Y = 2 }, executable, new Label("Maximum reply length:") { X = 1, Y = 3 }, maximum, new Label("Maximum parameters:") { X = 1, Y = 4 }, parameterLimit, new Label("Argument before parameters:") { X = 1, Y = 5 }, prefix, new Label("Argument after parameters:") { X = 1, Y = 6 }, suffix, variables, enabled, caseSensitive, directMessages, favoritesOnly);
+            dialog.Add(previewFrame); updatePreview();
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                int replyLength, maxParameters;
+                if (String.IsNullOrWhiteSpace(command.Text.ToString()) || String.IsNullOrWhiteSpace(executable.Text.ToString()) || !Int32.TryParse(maximum.Text.ToString(), out replyLength) || replyLength < 1 || !Int32.TryParse(parameterLimit.Text.ToString(), out maxParameters) || maxParameters < 0)
+                {
+                    MessageBox.ErrorQuery("Chat bot", "Command, executable path, maximum reply length and parameter limit are required.", "OK");
+                    return;
+                }
+                bot.Command = command.Text.ToString().Trim(); bot.ExecutablePath = executable.Text.ToString().Trim(); bot.MaximumReplyLength = replyLength; bot.MaximumParameterCount = maxParameters; bot.ArgumentPrefix = prefix.Text.ToString(); bot.ArgumentSuffix = suffix.Text.ToString(); bot.Enabled = enabled.Checked; bot.CaseSensitive = caseSensitive.Checked; bot.ReactToDirectMessages = directMessages.Checked; bot.FavoritesOnly = favoritesOnly.Checked; bot.ReactToChannels = SelectedBotChannels(channelChecks);
+                if (isNew) _settings.ChatBots.Add(bot);
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel");
+            cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static void ShowChatBotVariableHelp()
+        {
+            MessageBox.Query("Bot variables", "The following variables can be used in the argument fields:\n\n{id}, {number}, {name}, {shortname}\n{latitude}, {longitude}, {battery}, {hops}\n{channel}, {channelName}, {from}, {to}\n{packetId}, {rssi}, {snr}, {hopLimit}\n{message}, {receivedUtc}, {deviceId}\n\nUnavailable node values are replaced by an empty string.", "OK");
+        }
+
+        private static string ExpandChatBotVariableExamples(string template)
+        {
+            if (String.IsNullOrEmpty(template)) return template;
+            var values = new Dictionary<string, string> { { "{id}", "!a1b2c3d4" }, { "{number}", "2712847316" }, { "{name}", "Example Node" }, { "{shortname}", "EXMP" }, { "{latitude}", "48.137154" }, { "{longitude}", "11.576124" }, { "{battery}", "87" }, { "{hops}", "2" }, { "{channel}", "0" }, { "{channelName}", "LongFast" }, { "{from}", "2712847316" }, { "{to}", "4294967295" }, { "{packetId}", "12345678" }, { "{rssi}", "-97" }, { "{snr}", "7.5" }, { "{hopLimit}", "3" }, { "{message}", "!command example" }, { "{receivedUtc}", "2026-08-10T12:00:00.0000000Z" }, { "{deviceId}", "!11223344" } };
+            foreach (var value in values) template = template.Replace(value.Key, value.Value);
+            return template;
+        }
+
+        private static async Task RunMatchingChatBotsAsync(MeshMessage message)
+        {
+            var parts = (message.Text ?? "").Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) return;
+            foreach (var bot in _settings.ChatBots.Where(x => x.Protocol == _mesh.Protocol && x.Enabled && !String.IsNullOrWhiteSpace(x.Command) && !String.IsNullOrWhiteSpace(x.ExecutablePath)).ToList())
+            {
+                if (message.IsChannelMessage)
+                {
+                    var channelIndex = (int)message.ChannelIndex.GetValueOrDefault();
+                    if (bot.ReactToChannels == null || !bot.ReactToChannels.Contains(channelIndex)) continue;
+                }
+                else if (!bot.ReactToDirectMessages) continue;
+
+                var sourceNode = _mesh.Nodes.FirstOrDefault(node => node.Number == message.From);
+                if (bot.FavoritesOnly)
+                {
+                    var storedNode = _store.GetNodes(StoredNodeSort.NodeId).FirstOrDefault(node => node.NodeNumber == message.From);
+                    if (storedNode == null || !storedNode.IsFavorite) continue;
+                }
+                var comparison = bot.CaseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+                if (!String.Equals(parts[0], bot.Command, comparison)) continue;
+                var arguments = new List<string>();
+                var prefix = ExpandChatBotVariables(bot.ArgumentPrefix, message, sourceNode);
+                var suffix = ExpandChatBotVariables(bot.ArgumentSuffix, message, sourceNode);
+                if (!String.IsNullOrWhiteSpace(prefix)) arguments.Add(prefix);
+                arguments.AddRange(parts.Skip(1).Take(Math.Max(0, bot.MaximumParameterCount)));
+                if (!String.IsNullOrWhiteSpace(suffix)) arguments.Add(suffix);
+                _lastChatBotRequest = bot.ExecutablePath + " " + String.Join(" ", arguments.Select(QuoteProcessArgument));
+                var output = await RunChatBotProcessAsync(bot, arguments);
+                _lastChatBotOutput = output ?? "";
+                if (String.IsNullOrWhiteSpace(output)) continue;
+                output = LimitBotReply(output, bot.MaximumReplyLength, message);
+                uint packetId;
+                if (message.IsChannelMessage)
+                {
+                    var channel = (int)message.ChannelIndex.GetValueOrDefault();
+                    packetId = await _mesh.SendTextToChannelWithIdAsync(channel, output);
+                    var channelName = _mesh.Channels.FirstOrDefault(x => x.Index == channel);
+                    _store.AddOutgoing(packetId, _mesh.Device.MyNode == null ? 0u : _mesh.Device.MyNode.MyNodeNum, UInt32.MaxValue, output, channel, channelName == null ? null : channelName.Name);
+                }
+                else
+                {
+                    packetId = await _mesh.SendTextWithIdAsync(message.From, output);
+                    _store.AddOutgoing(packetId, _mesh.Device.MyNode == null ? 0u : _mesh.Device.MyNode.MyNodeNum, message.From, output, null);
+                }
+                Ui(RefreshChats);
+            }
+        }
+
+        private static string ExpandChatBotVariables(string template, MeshMessage message, MeshNode node)
+        {
+            if (String.IsNullOrEmpty(template)) return template;
+            var channelIndex = message.IsChannelMessage ? (int?)message.ChannelIndex.GetValueOrDefault() : null;
+            var channel = channelIndex.HasValue ? _mesh.Channels.FirstOrDefault(item => item.Index == channelIndex.Value) : null;
+            var nodeId = node == null || String.IsNullOrWhiteSpace(node.Id) ? "!" + message.From.ToString("x8") : node.Id;
+            var values = new Dictionary<string, string>
+            {
+                { "{id}", nodeId }, { "{number}", message.From.ToString(CultureInfo.InvariantCulture) },
+                { "{name}", node == null ? "" : (node.LongName ?? "") }, { "{shortname}", node == null ? "" : (node.ShortName ?? "") },
+                { "{latitude}", node == null || !node.Latitude.HasValue ? "" : node.Latitude.Value.ToString(CultureInfo.InvariantCulture) }, { "{longitude}", node == null || !node.Longitude.HasValue ? "" : node.Longitude.Value.ToString(CultureInfo.InvariantCulture) },
+                { "{battery}", node == null || !node.BatteryLevel.HasValue ? "" : node.BatteryLevel.Value.ToString(CultureInfo.InvariantCulture) }, { "{hops}", node == null || !node.HopsAway.HasValue ? "" : node.HopsAway.Value.ToString(CultureInfo.InvariantCulture) },
+                { "{channel}", channelIndex.HasValue ? channelIndex.Value.ToString(CultureInfo.InvariantCulture) : "" }, { "{channelName}", channel == null ? "" : (channel.Name ?? "") },
+                { "{from}", message.From.ToString(CultureInfo.InvariantCulture) }, { "{to}", message.To.ToString(CultureInfo.InvariantCulture) },
+                { "{packetId}", message.Packet.Id.ToString(CultureInfo.InvariantCulture) }, { "{rssi}", message.Packet.RxRssi.ToString(CultureInfo.InvariantCulture) }, { "{snr}", message.Packet.RxSnr.ToString(CultureInfo.InvariantCulture) }, { "{hopLimit}", message.Packet.HopLimit.ToString(CultureInfo.InvariantCulture) },
+                { "{message}", message.Text ?? "" }, { "{receivedUtc}", message.ReceivedAtUtc.ToString("o", CultureInfo.InvariantCulture) }, { "{deviceId}", _mesh.Device.NodeId ?? "" }
+            };
+            foreach (var value in values) template = template.Replace(value.Key, value.Value);
+            return template;
+        }
+
+        private static async Task RunMatchingHttpBotsAsync(MeshMessage message)
+        {
+            var parts = (message.Text ?? "").Split((char[])null, StringSplitOptions.RemoveEmptyEntries); if (parts.Length == 0) return;
+            var node = _mesh.Nodes.FirstOrDefault(item => item.Number == message.From);
+            foreach (var bot in _settings.HttpBots.Where(item => item.Protocol == _mesh.Protocol && item.Enabled && !String.IsNullOrWhiteSpace(item.Command) && !String.IsNullOrWhiteSpace(item.Url)).ToList())
+            {
+                if (message.IsChannelMessage ? bot.ReactToChannels == null || !bot.ReactToChannels.Contains((int)message.ChannelIndex.GetValueOrDefault()) : !bot.ReactToDirectMessages) continue;
+                if (bot.FavoritesOnly && !_store.GetNodes().Any(item => item.NodeNumber == message.From && item.IsFavorite)) continue;
+                if (!String.Equals(parts[0], bot.Command, bot.CaseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase)) continue;
+                var query = new Dictionary<string, string> { { "id", ExpandChatBotVariables("{id}", message, node) }, { "number", ExpandChatBotVariables("{number}", message, node) }, { "name", ExpandChatBotVariables("{name}", message, node) }, { "shortname", ExpandChatBotVariables("{shortname}", message, node) }, { "latitude", ExpandChatBotVariables("{latitude}", message, node) }, { "longitude", ExpandChatBotVariables("{longitude}", message, node) }, { "battery", ExpandChatBotVariables("{battery}", message, node) }, { "hops", ExpandChatBotVariables("{hops}", message, node) }, { "channel", ExpandChatBotVariables("{channel}", message, node) }, { "channelName", ExpandChatBotVariables("{channelName}", message, node) }, { "message", message.Text ?? "" } };
+                for (var index = 0; index < Math.Min(bot.MaximumParameterCount, parts.Length - 1); index++) query["p" + (index + 1).ToString("D2")] = parts[index + 1];
+                foreach (var parameter in bot.QueryParameters.Where(parameter => !String.IsNullOrWhiteSpace(parameter.Name))) query[parameter.Name] = ExpandChatBotVariables(parameter.Value ?? "", message, node);
+                try
+                {
+                    var separator = bot.Url.Contains("?") ? "&" : "?"; var url = bot.Url + separator + String.Join("&", query.Select(pair => Uri.EscapeDataString(pair.Key) + "=" + Uri.EscapeDataString(pair.Value))); _lastHttpBotRequest = url;
+                    var output = await HttpBotHttpClient.GetStringAsync(url); _lastHttpBotOutput = output ?? ""; if (String.IsNullOrWhiteSpace(output)) continue; output = LimitBotReply(output, bot.MaximumReplyLength, message);
+                    uint packetId = message.IsChannelMessage ? await _mesh.SendTextToChannelWithIdAsync((int)message.ChannelIndex.GetValueOrDefault(), output) : await _mesh.SendTextWithIdAsync(message.From, output);
+                    _store.AddOutgoing(packetId, _mesh.Device.MyNode == null ? 0u : _mesh.Device.MyNode.MyNodeNum, message.IsChannelMessage ? UInt32.MaxValue : message.From, output, message.IsChannelMessage ? (int?)message.ChannelIndex.GetValueOrDefault() : null);
+                    Ui(RefreshChats);
+                }
+                catch (Exception ex) { _lastHttpBotOutput = ex.ToString(); }
+            }
+        }
+
+        private static async Task<string> RunChatBotProcessAsync(MeshtasticChatBotSettings bot, IEnumerable<string> arguments)
+        {
+            if (!File.Exists(bot.ExecutablePath)) return "Bot executable not found.";
+            try
+            {
+                using (var process = new Process())
+                {
+                    process.StartInfo = new ProcessStartInfo { FileName = bot.ExecutablePath, Arguments = String.Join(" ", arguments.Select(QuoteProcessArgument)), UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8, CreateNoWindow = true };
+                    process.Start();
+                    var stdout = process.StandardOutput.ReadToEndAsync();
+                    var stderr = process.StandardError.ReadToEndAsync();
+                    if (!process.WaitForExit(30000)) { try { process.Kill(); } catch { } return "Bot execution timed out."; }
+                    var output = (await stdout).Trim();
+                    var error = (await stderr).Trim();
+                    return String.IsNullOrWhiteSpace(output) ? error : output;
+                }
+            }
+            catch (Exception ex) { return "Bot error: " + ex.Message; }
+        }
+
+        private static void NotifyAlertStateChanged(MeshMessage message)
+        {
+            int unreadCount;
+            try { unreadCount = _store.CountNewMessages(_settings.Alerts.SuppressMapMessageAlerts); }
+            catch { return; }
+
+            var becameFullyRead = message == null && unreadCount == 0 && _lastKnownUnreadCount > 0;
+            _lastKnownUnreadCount = unreadCount;
+
+            if (message != null && _settings.Alerts.SuppressMapMessageAlerts &&
+                (message.Text ?? "").StartsWith("///MAP", StringComparison.Ordinal)) return;
+
+            if (message != null && (_settings.Alerts.EnableWindowsBeep || _settings.Alerts.EnableTerminalBell)) PlayAlertBeep();
+            if (message != null && _settings.Alerts.EnableDesktopNotifications) ShowDesktopNotification(message);
+            _nextRepeatedAlertCheckUtc = unreadCount > 0
+                ? DateTime.UtcNow.AddSeconds(Math.Max(1, _settings.Alerts.RepeatBeepIntervalSeconds))
+                : DateTime.MinValue;
+
+            if (message == null && !becameFullyRead) return;
+            Task.Run(async delegate { await RunAlertActionsAsync(unreadCount, message); });
+        }
+
+        private static void UpdateLogoBlink()
+        {
+            // Receive notifications and read actions run on different queues.
+            // Their cached alert count can arrive out of order; the logo must
+            // use the current store state, including reads and deletions.
+            var shouldBlink = false;
+            if (_settings != null && _settings.Alerts != null && _settings.Alerts.BlinkLogoForUnreadMessages && _store != null)
+            {
+                try { shouldBlink = _store.CountNewMessages(_settings.Alerts.SuppressMapMessageAlerts) > 0; }
+                catch { return; } // Preserve the current display on a transient database error.
+            }
+            if (shouldBlink) _logoColorsSwapped = !_logoColorsSwapped;
+            else if (_logoColorsSwapped) _logoColorsSwapped = false;
+            else return;
+            ApplyLogoTextColorScheme();
+        }
+
+        private static void ApplyLogoTextColorScheme()
+        {
+            if (_logoText == null || _settings == null || _settings.Appearance == null) return;
+            var foreground = ParseColor(_settings.Appearance.LogoTextColor, Color.BrightCyan);
+            var background = ParseColor(_settings.Appearance.BackgroundColor, Color.Black);
+            var attribute = _logoColorsSwapped
+                ? Application.Driver.MakeAttribute(background, foreground)
+                : Application.Driver.MakeAttribute(foreground, background);
+            _logoText.ColorScheme = new ColorScheme { Normal = attribute, Focus = attribute, HotNormal = attribute, HotFocus = attribute, Disabled = attribute };
+            _logoText.SetNeedsDisplay();
+        }
+
+        private static void CheckRepeatingAlertBeep()
+        {
+            if ((!_settings.Alerts.EnableWindowsBeep && !_settings.Alerts.EnableTerminalBell) || _settings.Alerts.RepeatBeepIntervalSeconds <= 0) return;
+            var now = DateTime.UtcNow;
+            if (now < _nextRepeatedAlertCheckUtc) return;
+            _nextRepeatedAlertCheckUtc = now.AddSeconds(_settings.Alerts.RepeatBeepIntervalSeconds);
+            try
+            {
+                if (_store.CountNewMessages(_settings.Alerts.SuppressMapMessageAlerts) > 0) PlayAlertBeep();
+            }
+            catch { }
+        }
+
+        private static void PlayAlertBeep()
+        {
+            if (_settings.Alerts.EnableSoundCooldown && (DateTime.UtcNow - _lastAlertBeepUtc).TotalSeconds < Math.Max(1, _settings.Alerts.SoundCooldownSeconds)) return;
+            _lastAlertBeepUtc = DateTime.UtcNow;
+            if (_settings.Alerts.EnableWindowsBeep)
+            {
+                try { Console.Beep(); }
+                catch { }
+            }
+            if (_settings.Alerts.EnableTerminalBell)
+            {
+                try { Console.Write('\a'); Console.Out.Flush(); }
+                catch { }
+            }
+        }
+
+        private static async Task RunAlertActionsAsync(int unreadCount, MeshMessage message)
+        {
+            var alerts = _settings.Alerts;
+            if (!alerts.EnableHttpGet)
+            {
+                _lastAlertHttpRequest = "Alert HTTP GET is disabled in Settings > Alerts.";
+                _lastAlertHttpOutput = "No HTTP request was sent.";
+            }
+            else if (String.IsNullOrWhiteSpace(alerts.HttpGetUrl))
+            {
+                _lastAlertHttpRequest = "Alert HTTP GET has no URL configured.";
+                _lastAlertHttpOutput = "No HTTP request was sent.";
+            }
+            else
+            {
+                try
+                {
+                    var url = BuildAlertUrl(alerts.HttpGetUrl, unreadCount, message);
+                    _lastAlertHttpRequest = url;
+                    _lastAlertHttpOutput = await AlertHttpClient.GetStringAsync(url) ?? "";
+                }
+                catch (Exception ex) { _lastAlertHttpOutput = ex.ToString(); }
+            }
+            if (!alerts.EnableExecutable)
+            {
+                _lastAlertProcessRequest = "Alert shell command is disabled in Settings > Alerts.";
+                _lastAlertProcessOutput = "No shell command was started.";
+            }
+            else if (String.IsNullOrWhiteSpace(alerts.ExecutablePath))
+            {
+                _lastAlertProcessRequest = "Alert shell command has no command configured.";
+                _lastAlertProcessOutput = "No shell command was started.";
+            }
+            else
+            {
+                var arguments = new[] { unreadCount.ToString(CultureInfo.InvariantCulture), message == null ? "" : (message.Text ?? "") };
+                _lastAlertProcessRequest = BuildAlertShellDebugCommand(alerts.ExecutablePath, arguments);
+                _lastAlertProcessOutput = await RunAlertProcessAsync(alerts.ExecutablePath, arguments);
+            }
+        }
+
+        private static string BuildAlertUrl(string baseUrl, int unreadCount, MeshMessage message)
+        {
+            var node = message == null ? null : _mesh.Nodes.FirstOrDefault(item => item.Number == message.From);
+            var query = new Dictionary<string, string>
+            {
+                { "event", message == null ? "allRead" : "newMessage" },
+                { "unreadCount", unreadCount.ToString(CultureInfo.InvariantCulture) },
+                { "message", message == null ? "" : (message.Text ?? "") },
+                { "deviceId", _mesh.Device.NodeId ?? "" }
+            };
+            if (message != null)
+            {
+                query["packetId"] = message.Packet.Id.ToString(CultureInfo.InvariantCulture);
+                query["from"] = message.From.ToString(CultureInfo.InvariantCulture);
+                query["to"] = message.To.ToString(CultureInfo.InvariantCulture);
+                query["isChannelMessage"] = message.IsChannelMessage ? "true" : "false";
+                query["isDirectMessage"] = message.IsDirectMessage ? "true" : "false";
+                query["channel"] = message.ChannelIndex.HasValue ? message.ChannelIndex.Value.ToString(CultureInfo.InvariantCulture) : "";
+                var channel = message.ChannelIndex.HasValue ? _mesh.Channels.FirstOrDefault(item => item.Index == (int)message.ChannelIndex.Value) : null;
+                query["channelName"] = channel == null ? "" : (channel.Name ?? "");
+                query["receivedUtc"] = message.ReceivedAtUtc.ToString("o", CultureInfo.InvariantCulture);
+                query["rssi"] = message.Packet.RxRssi.ToString(CultureInfo.InvariantCulture);
+                query["snr"] = message.Packet.RxSnr.ToString(CultureInfo.InvariantCulture);
+                query["hopLimit"] = message.Packet.HopLimit.ToString(CultureInfo.InvariantCulture);
+                query["nodeId"] = node == null ? "!" + message.From.ToString("x8") : (node.Id ?? "");
+                query["nodeName"] = node == null ? "" : (node.LongName ?? "");
+                query["nodeShortName"] = node == null ? "" : (node.ShortName ?? "");
+                query["latitude"] = node == null || !node.Latitude.HasValue ? "" : node.Latitude.Value.ToString(CultureInfo.InvariantCulture);
+                query["longitude"] = node == null || !node.Longitude.HasValue ? "" : node.Longitude.Value.ToString(CultureInfo.InvariantCulture);
+                query["battery"] = node == null || !node.BatteryLevel.HasValue ? "" : node.BatteryLevel.Value.ToString(CultureInfo.InvariantCulture);
+                query["hops"] = node == null || !node.HopsAway.HasValue ? "" : node.HopsAway.Value.ToString(CultureInfo.InvariantCulture);
+            }
+            var separator = baseUrl.Contains("?") ? "&" : "?";
+            return baseUrl + separator + String.Join("&", query.Select(pair => Uri.EscapeDataString(pair.Key) + "=" + Uri.EscapeDataString(pair.Value ?? "")));
+        }
+
+        private static string BuildAlertShellDebugCommand(string command, IEnumerable<string> arguments)
+        {
+            var commandArguments = arguments.ToArray();
+            if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+                return (Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe") + " /C " + command + " " + String.Join(" ", commandArguments.Select(QuoteProcessArgument));
+            return "/bin/sh -c " + QuoteShellArgument(command + " \"$@\"") + " -- " + String.Join(" ", commandArguments.Select(QuoteShellArgument));
+        }
+
+        private static async Task<string> RunAlertProcessAsync(string command, IEnumerable<string> arguments)
+        {
+            var commandArguments = arguments.ToArray();
+            try
+            {
+                using (var process = new Process())
+                {
+                    if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+                    {
+                        process.StartInfo = new ProcessStartInfo { FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe", Arguments = "/C " + command + " " + String.Join(" ", commandArguments.Select(QuoteProcessArgument)), UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8, CreateNoWindow = true };
+                    }
+                    else
+                    {
+                        process.StartInfo = new ProcessStartInfo { FileName = "/bin/sh", Arguments = "-c " + QuoteShellArgument(command + " \"$@\"") + " -- " + String.Join(" ", commandArguments.Select(QuoteShellArgument)), UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8, CreateNoWindow = true };
+                    }
+                    process.Start();
+                    var stdout = process.StandardOutput.ReadToEndAsync();
+                    var stderr = process.StandardError.ReadToEndAsync();
+                    if (!process.WaitForExit(30000)) { try { process.Kill(); } catch { } return "Alert shell command timed out."; }
+                    var output = (await stdout).Trim();
+                    var error = (await stderr).Trim();
+                    return String.IsNullOrWhiteSpace(error) ? output : (String.IsNullOrWhiteSpace(output) ? error : output + Environment.NewLine + error);
+                }
+            }
+            catch (Exception ex) { return "Alert shell command error: " + ex.Message; }
+        }
+
+        private static string QuoteShellArgument(string value)
+        {
+            return "'" + (value ?? "").Replace("'", "'\"'\"'") + "'";
+        }
+
+        private static string QuoteProcessArgument(string value)
+        {
+            if (String.IsNullOrEmpty(value)) return "\"\"";
+            if (value.IndexOfAny(new[] { ' ', '\t', '"' }) < 0) return value;
+            var result = new StringBuilder("\"");
+            var backslashes = 0;
+            foreach (var character in value)
+            {
+                if (character == '\\') { backslashes++; continue; }
+                if (character == '"') result.Append('\\', backslashes * 2 + 1);
+                else result.Append('\\', backslashes);
+                result.Append(character); backslashes = 0;
+            }
+            result.Append('\\', backslashes * 2); result.Append('"');
+            return result.ToString();
+        }
+
+        private static void ShowAppearanceSettings()
+        {
+            var appearance = _settings.Appearance;
+            var propertyNames = new[] { "Background", "Frame", "Page frame", "Normal text", "Selected Item", "Sent messages", "Received messages", "Status text", "Status background", "Input background", "Input text", "Menu background", "Menu text", "Button background", "Button text", "Logo frame", "Logo text", "Emoji text", "Map nodes", "Map clusters", "Map grid / crosshair", "Day separators" };
+            var values = new[] { appearance.BackgroundColor, appearance.FrameColor, appearance.PageFrameColor, appearance.TextColor, appearance.SelectedItemColor, appearance.SentMessageColor, appearance.ReceivedMessageColor, appearance.StatusTextColor, appearance.StatusBackgroundColor, appearance.InputBackgroundColor, appearance.InputTextColor, appearance.MenuBackgroundColor, appearance.MenuTextColor, appearance.ButtonBackgroundColor, appearance.ButtonTextColor, appearance.LogoFrameColor, appearance.LogoTextColor, appearance.EmojiTextColor, appearance.MapNodeColor, appearance.MapClusterColor, appearance.MapGridColor, appearance.DaySeparatorColor };
+            var colorNames = new[] { "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Brown", "Gray", "DarkGray", "BrightBlue", "BrightGreen", "BrightCyan", "BrightRed", "BrightMagenta", "BrightYellow", "White" };
+            var dialog = new Dialog("Appearance", 82, 25);
+            var propertiesFrame = new FrameView("Properties") { X = 1, Y = 1, Width = 26, Height = 17 };
+            var propertyForeground = ParseColor(appearance.TextColor, Color.Gray);
+            var propertyBackground = ParseColor(appearance.BackgroundColor, Color.Black);
+            var propertyNormal = Application.Driver.MakeAttribute(propertyForeground, propertyBackground);
+            const int selectedItemPropertyIndex = 4;
+            var propertyInverted = Application.Driver.MakeAttribute(propertyBackground, propertyForeground);
+            var propertySelected = Application.Driver.MakeAttribute(ParseColor(values[selectedItemPropertyIndex], Color.BrightYellow), propertyBackground);
+            var properties = new ListView(propertyNames) { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), ColorScheme = new ColorScheme { Normal = propertyNormal, Focus = propertyInverted, HotNormal = propertySelected, HotFocus = propertyInverted, Disabled = propertyNormal } };
+            propertiesFrame.Add(properties);
+            var colors = new RadioGroup(new Rect(37, 2, 28, colorNames.Length), colorNames.Select(x => (ustring)x).ToArray());
+            var changingSelection = false;
+            Action selectColor = delegate
+            {
+                var propertyIndex = properties.SelectedItem;
+                if (propertyIndex < 0 || propertyIndex >= values.Length) return;
+                propertiesFrame.Title = "Properties " + (propertyIndex + 1).ToString(CultureInfo.InvariantCulture) + "/" + values.Length.ToString(CultureInfo.InvariantCulture);
+                var colorIndex = Array.IndexOf(colorNames, values[propertyIndex]);
+                changingSelection = true; colors.SelectedItem = colorIndex < 0 ? 0 : colorIndex; changingSelection = false;
+            };
+            properties.SelectedItemChanged += delegate { selectColor(); };
+            colors.SelectedItemChanged += delegate
+            {
+                if (changingSelection) return;
+                var propertyIndex = properties.SelectedItem;
+                if (propertyIndex >= 0 && propertyIndex < values.Length && colors.SelectedItem >= 0 && colors.SelectedItem < colorNames.Length)
+                {
+                    values[propertyIndex] = colorNames[colors.SelectedItem];
+                    if (propertyIndex == selectedItemPropertyIndex)
+                    {
+                        var selectedAttribute = Application.Driver.MakeAttribute(ParseColor(values[selectedItemPropertyIndex], Color.BrightYellow), propertyBackground);
+                        properties.ColorScheme.HotNormal = selectedAttribute;
+                        properties.SetNeedsDisplay();
+                    }
+                }
+            };
+            properties.SelectedItem = 0;
+            selectColor();
+            dialog.Add(propertiesFrame, new Label("Colors") { X = 37, Y = 1 }, colors);
+            for (var index = 0; index < colorNames.Length; index++)
+            {
+                var previewColor = ParseColor(colorNames[index], Color.Gray);
+                var previewAttribute = Application.Driver.MakeAttribute(previewColor, previewColor);
+                var preview = new Label("  ") { X = 57, Y = 2 + index, Width = 2, Height = 1, ColorScheme = new ColorScheme { Normal = previewAttribute, Focus = previewAttribute, HotNormal = previewAttribute, HotFocus = previewAttribute, Disabled = previewAttribute } };
+                dialog.Add(new Label("[  ]") { X = 56, Y = 2 + index }, preview);
+            }
+            var save = new Button("Save", true);
+            save.Clicked += delegate
+            {
+                appearance.BackgroundColor = values[0]; appearance.FrameColor = values[1]; appearance.PageFrameColor = values[2]; appearance.TextColor = values[3]; appearance.SelectedItemColor = values[4]; appearance.SentMessageColor = values[5]; appearance.ReceivedMessageColor = values[6]; appearance.StatusTextColor = values[7]; appearance.StatusBackgroundColor = values[8]; appearance.InputBackgroundColor = values[9]; appearance.InputTextColor = values[10]; appearance.MenuBackgroundColor = values[11]; appearance.MenuTextColor = values[12]; appearance.ButtonBackgroundColor = values[13]; appearance.ButtonTextColor = values[14]; appearance.LogoFrameColor = values[15]; appearance.LogoTextColor = values[16]; appearance.EmojiTextColor = values[17]; appearance.MapNodeColor = values[18]; appearance.MapClusterColor = values[19]; appearance.MapGridColor = values[20]; appearance.DaySeparatorColor = values[21];
+                MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
+                ApplyAppearanceSettings();
+                Application.RequestStop();
+            };
+            var cancel = new Button("Cancel");
+            cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save); dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static void ApplyChatListSelectionColors()
+        {
+            if (_channelList == null || _directList == null || _settings == null || _settings.Appearance == null || Application.Driver == null) return;
+            var background = ParseColor(_settings.Appearance.BackgroundColor, Color.Black);
+            var text = ParseColor(_settings.Appearance.TextColor, Color.Gray);
+            var selectedItem = ParseColor(_settings.Appearance.SelectedItemColor, Color.BrightYellow);
+            var normal = Application.Driver.MakeAttribute(text, background);
+            var selected = Application.Driver.MakeAttribute(selectedItem, background);
+            var inverted = Application.Driver.MakeAttribute(background, text);
+            var activeScheme = new ColorScheme { Normal = normal, Focus = inverted, HotNormal = selected, HotFocus = inverted, Disabled = normal };
+            var inactiveScheme = new ColorScheme { Normal = normal, Focus = normal, HotNormal = normal, HotFocus = normal, Disabled = normal };
+            var channelActive = !_nodeStartedChat && _selected != null && _selected.Kind == ChatKind.Channel;
+            var directActive = !_nodeStartedChat && _selected != null && _selected.Kind == ChatKind.Direct;
+            _channelList.ColorScheme = channelActive ? activeScheme : inactiveScheme;
+            _directList.ColorScheme = directActive ? activeScheme : inactiveScheme;
+            _channelList.SetNeedsDisplay();
+            _directList.SetNeedsDisplay();
+        }
+
+        private static void ApplyAppearanceSettings()
+        {
+            if (_settings.Appearance == null) _settings.Appearance = new MeshtasticAppearanceSettings();
+            var appearance = _settings.Appearance;
+            var background = ParseColor(appearance.BackgroundColor, Color.Black);
+            var frame = ParseColor(appearance.FrameColor, Color.Gray);
+            var pageFrame = ParseColor(appearance.PageFrameColor, Color.Gray);
+            var text = ParseColor(appearance.TextColor, Color.Gray);
+            var sent = ParseColor(appearance.SentMessageColor, Color.BrightYellow);
+            var received = ParseColor(appearance.ReceivedMessageColor, Color.BrightCyan);
+            var status = ParseColor(appearance.StatusTextColor, Color.White);
+            var statusBackground = ParseColor(appearance.StatusBackgroundColor, Color.Black);
+            var inputBackground = ParseColor(appearance.InputBackgroundColor, Color.Black);
+            var inputText = ParseColor(appearance.InputTextColor, Color.White);
+            var menuBackground = ParseColor(appearance.MenuBackgroundColor, Color.Blue);
+            var menuText = ParseColor(appearance.MenuTextColor, Color.White);
+            var buttonBackground = ParseColor(appearance.ButtonBackgroundColor, Color.Black);
+            var buttonText = ParseColor(appearance.ButtonTextColor, Color.BrightCyan);
+            var logoFrame = ParseColor(appearance.LogoFrameColor, Color.Gray);
+            var logoText = ParseColor(appearance.LogoTextColor, Color.BrightCyan);
+            var emojiText = ParseColor(appearance.EmojiTextColor, Color.BrightMagenta);
+            var mapNode = ParseColor(appearance.MapNodeColor, Color.BrightCyan);
+            var mapCluster = ParseColor(appearance.MapClusterColor, Color.BrightMagenta);
+            var mapGrid = ParseColor(appearance.MapGridColor, Color.DarkGray);
+            var daySeparator = ParseColor(appearance.DaySeparatorColor, Color.DarkGray);
+            var normal = Application.Driver.MakeAttribute(text, background);
+            var focus = Application.Driver.MakeAttribute(background, frame);
+            var statusNormal = Application.Driver.MakeAttribute(status, statusBackground);
+            var statusScheme = new ColorScheme { Normal = statusNormal, Focus = statusNormal, HotNormal = statusNormal, HotFocus = statusNormal, Disabled = statusNormal };
+            var inputScheme = new ColorScheme { Normal = Application.Driver.MakeAttribute(inputText, inputBackground), Focus = Application.Driver.MakeAttribute(inputText, inputBackground), HotNormal = normal, HotFocus = normal, Disabled = normal };
+            var buttonScheme = new ColorScheme { Normal = Application.Driver.MakeAttribute(buttonText, buttonBackground), Focus = Application.Driver.MakeAttribute(buttonBackground, buttonText), HotNormal = Application.Driver.MakeAttribute(buttonText, buttonBackground), HotFocus = Application.Driver.MakeAttribute(buttonBackground, buttonText), Disabled = normal };
+            Colors.Base.Normal = normal; Colors.Base.Focus = focus; Colors.Base.HotNormal = normal; Colors.Base.HotFocus = focus; Colors.Base.Disabled = normal;
+            Colors.TopLevel.Normal = normal; Colors.TopLevel.Focus = focus; Colors.TopLevel.HotNormal = normal; Colors.TopLevel.HotFocus = focus; Colors.TopLevel.Disabled = normal;
+            Colors.Menu.Normal = Application.Driver.MakeAttribute(menuText, menuBackground); Colors.Menu.Focus = Application.Driver.MakeAttribute(menuBackground, menuText); Colors.Menu.HotNormal = Application.Driver.MakeAttribute(menuText, menuBackground); Colors.Menu.HotFocus = Application.Driver.MakeAttribute(menuBackground, menuText); Colors.Menu.Disabled = normal;
+            foreach (var view in Frames) { view.Border.BorderBrush = frame; view.Border.Background = background; view.SetNeedsDisplay(); }
+            if (_messageCharacterCounter != null) _messageCharacterCounter.ColorScheme = new ColorScheme { Normal = Application.Driver.MakeAttribute(frame, background), Focus = normal, HotNormal = normal, HotFocus = focus, Disabled = normal };
+            foreach (var page in PageFrames) { page.Border.BorderBrush = pageFrame; page.Border.Background = background; page.SetNeedsDisplay(); }
+            foreach (var button in MainButtons) button.ColorScheme = buttonScheme;
+            ApplyChatListSelectionColors();
+            if (_logoFrame != null) { _logoFrame.Border.BorderBrush = logoFrame; _logoFrame.Border.Background = background; _logoFrame.SetNeedsDisplay(); }
+            ApplyLogoTextColorScheme();
+            _messages.BackgroundColor = background; _messages.NormalTextColor = text; _messages.OutgoingColor = sent; _messages.IncomingColor = received; _messages.EmojiTextColor = emojiText; _messages.DaySeparatorColor = daySeparator;
+            if (_nodeMap != null) { _nodeMap.NodeColor = mapNode; _nodeMap.ClusterColor = mapCluster; _nodeMap.GridColor = mapGrid; _nodeMap.SetNeedsDisplay(); }
+            _input.ColorScheme = inputScheme;
+            _status.ColorScheme = statusScheme;
+            Application.Top.SetNeedsDisplay();
+        }
+
+        private static Color ParseColor(string value, Color fallback)
+        {
+            Color result;
+            return Enum.TryParse(value, true, out result) ? result : fallback;
+        }
+
+        private static void ShowPositionSettings()
+        {
+
+            var dialog = new Dialog("Set GPS position", 60, 12);
+            var latitude = new TextField(_mesh.Device.Latitude.HasValue ? _mesh.Device.Latitude.Value.ToString("F6", CultureInfo.InvariantCulture) : "") { X = 16, Y = 1, Width = 25 };
+            var longitude = new TextField(_mesh.Device.Longitude.HasValue ? _mesh.Device.Longitude.Value.ToString("F6", CultureInfo.InvariantCulture) : "") { X = 16, Y = 2, Width = 25 };
+            var altitude = new TextField("") { X = 16, Y = 3, Width = 12, Enabled = _mesh.Protocol != MeshProtocol.MeshCore };
+            dialog.Add(new Label("Latitude:") { X = 1, Y = 1 }, latitude,
+                new Label("Longitude:") { X = 1, Y = 2 }, longitude,
+                new Label("Altitude (m):") { X = 1, Y = 3 }, altitude,
+                new Label(_mesh.Protocol == MeshProtocol.MeshCore ? "Sets advert position; altitude unsupported." : "Sets the device's fixed GPS position.") { X = 1, Y = 5 });
+            var save = new Button("Set position", true);
+            save.Clicked += delegate
+            {
+                double parsedLatitude, parsedLongitude;
+                int parsedAltitude;
+                if (!TryParseCoordinate(latitude.Text.ToString(), out parsedLatitude) || !TryParseCoordinate(longitude.Text.ToString(), out parsedLongitude) || parsedLatitude < -90 || parsedLatitude > 90 || parsedLongitude < -180 || parsedLongitude > 180)
+                {
+                    MessageBox.ErrorQuery("GPS position", "Please enter valid latitude and longitude values.", "OK");
+                    return;
+                }
+                int? altitudeMeters = String.IsNullOrWhiteSpace(altitude.Text.ToString()) ? (int?)null : (Int32.TryParse(altitude.Text.ToString(), out parsedAltitude) ? (int?)parsedAltitude : null);
+                if (!String.IsNullOrWhiteSpace(altitude.Text.ToString()) && !altitudeMeters.HasValue)
+                {
+                    MessageBox.ErrorQuery("GPS position", "Altitude must be a whole number.", "OK");
+                    return;
+                }
+                Task.Run(async delegate
+                {
+                    try
+                    {
+                        await _mesh.SetFixedPositionAsync(parsedLatitude, parsedLongitude, altitudeMeters);
+                        Ui(delegate { UpdateStatus(); Application.RequestStop(); });
+                    }
+                    catch (Exception ex) { Ui(delegate { MessageBox.ErrorQuery("GPS position", ex.Message, "OK"); }); }
+                });
+            };
+            var cancel = new Button("Cancel");
+            cancel.Clicked += delegate { Application.RequestStop(); };
+            dialog.AddButton(save);
+            dialog.AddButton(cancel);
+            Application.Run(dialog, HandleTerminalGuiException);
+        }
+
+        private static bool TryParseCoordinate(string text, out double result)
+        {
+            return Double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out result) || Double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out result);
+        }
+
+        private static void UseDeviceGps()
+        {
+            if (MessageBox.Query("Use device GPS", "Remove the fixed position and use the device's internal GPS receiver again?", "Use device GPS", "Cancel") != 0) return;
+            Task.Run(async delegate
+            {
+                try
+                {
+                    await _mesh.ClearFixedPositionAsync();
+                    Ui(delegate
+                    {
+                        UpdateStatus();
+                        MessageBox.Query("Use device GPS", _mesh.Protocol == MeshProtocol.MeshCore ? "Device GPS enabled. Position updates require a satellite fix." : "The fixed position was removed. The device can use its internal GPS receiver again.", "OK");
+                    });
+                }
+                catch (Exception ex) { Ui(delegate { MessageBox.ErrorQuery("Use device GPS", ex.Message, "OK"); }); }
+            });
+        }
+
+        private static void UpdateStatus()
+        {
+            if (Volatile.Read(ref _shutdownStarted) != 0) return;
+            UpdateMessageCharacterCounter();
+            var info = _mesh.ConnectionInfo;
+            var device = _mesh.Device;
+            var position = device.Latitude.HasValue && device.Longitude.HasValue ? device.Latitude.Value.ToString("F5", CultureInfo.InvariantCulture) + ", " + device.Longitude.Value.ToString("F5", CultureInfo.InvariantCulture) : "-";
+            var connectionState = _mesh.State.ToString();
+            if (_connectionAttemptCancellation != null) connectionState = "Connecting";
+            if (_mesh.State == ConnectionState.Disconnected)
+            {
+                connectionState = _disconnectedStatusVisible ? "Disconnected" : "            ";
+                _disconnectedStatusVisible = !_disconnectedStatusVisible;
+            }
+            else _disconnectedStatusVisible = true;
+            var reconnectStatus = "";
+            var nextReconnectUtc = _mesh.NextReconnectUtc;
+            if (_settings.Connection.AutomaticReconnect && nextReconnectUtc.HasValue)
+            {
+                var remaining = Math.Max(0, (int)Math.Ceiling((nextReconnectUtc.Value - DateTime.UtcNow).TotalSeconds));
+                reconnectStatus = " | reconnect in " + remaining.ToString(CultureInfo.InvariantCulture) + "s";
+            }
+            _status.Text = " F10 Menu | " + DateTime.Now.ToString("HH:mm:ss") + " | " + _mesh.Protocol + " | Connection: " + connectionState + reconnectStatus + " | " + (info.Transport ?? "No connection") + " | Node: " + (String.IsNullOrWhiteSpace(device.NodeName) ? "-" : device.NodeName) + " | Battery: " + (_mesh.Protocol == MeshProtocol.MeshCore ? (_mesh.IsConnected && device.MeshCoreBatteryVoltage.HasValue ? device.MeshCoreBatteryVoltage.Value.ToString("0.00", CultureInfo.InvariantCulture) + " V" : "-") : (device.BatteryLevel.HasValue ? device.BatteryLevel.Value + "%" : "-")) + " | NF: " + (_mesh.IsConnected && device.NoiseFloorDbm.HasValue ? device.NoiseFloorDbm.Value + " dBm" : "-") + " | GPS: " + position;
+            _status.SetNeedsDisplay();
+        }
+        private static string DisplayNodeName(uint number)
+        {
+            var n = _mesh.Nodes.FirstOrDefault(x => x.Number == number);
+            if (n != null) return String.IsNullOrEmpty(n.LongName) ? n.Id : n.LongName;
+            var stored = _store.GetNodes(StoredNodeSort.Name).FirstOrDefault(x => x.NodeNumber == number);
+            return stored == null ? "!" + number.ToString("x8") : (String.IsNullOrEmpty(stored.LongName) ? stored.NodeId : stored.LongName);
+        }
+        private static void Save(Action action, string coalesceKey = null)
+        {
+            var writes = _databaseWrites;
+            if (writes == null || Volatile.Read(ref _shutdownStarted) != 0) return;
+            writes.Enqueue(() => { _store.FlushDeferredMeshCoreIdentities(); action(); }, coalesceKey);
+        }
+        private static void Ui(Action action)
+        {
+            if (Volatile.Read(ref _shutdownStarted) != 0) return;
+            Application.MainLoop.Invoke(delegate
+            {
+                // Also discard work queued before shutdown began.
+                if (Volatile.Read(ref _shutdownStarted) != 0) return;
+                action();
+            });
+        }
+        private static void RequestQuit()
+        {
+            if (MessageBox.Query("Exit", "Close MeshTerminal?", "Yes", "No") != 0) return;
+            if (Interlocked.CompareExchange(ref _shutdownStarted, 1, 0) != 0) return;
+            _connectionAttemptId++;
+            var cancellation = _connectionAttemptCancellation;
+            _connectionAttemptCancellation = null;
+            if (cancellation != null) cancellation.Cancel();
+            if (_status != null) { _status.Text = " Closing MeshTerminal..."; _status.SetNeedsDisplay(); }
+            // Capture the root window while still on the UI thread. Parameterless
+            // RequestStop can target a stale nested RunState after dialogs were used.
+            var shutdownTop = Application.Top;
+            var completion = new TaskCompletionSource<object>();
+            _shutdownTask = completion.Task;
+            var shutdownThread = new Thread(new ThreadStart(delegate
+            {
+                var elapsed = Stopwatch.StartNew();
+                try
+                {
+                    UpdateShutdownStatus("starting shutdown", elapsed);
+                    StopExternalServicesWithProgress(TimeSpan.FromSeconds(6), elapsed);
+                    CompleteDatabaseWritesWithProgress(TimeSpan.FromSeconds(5), elapsed);
+                    if (Environment.OSVersion.Platform != PlatformID.Win32NT)
+                    {
+                        // Terminal.Gui's Unix/Mono main loop can enter a permanent
+                        // CPU-bound spin in RequestStop/MainLoop.Stop after a long
+                        // runtime. All persistent work is already bounded and
+                        // flushed above, so finish the remaining cleanup here and
+                        // do not ask Terminal.Gui to unwind its loop.
+                        WriteShutdownLog("Linux fast shutdown after bounded cleanup");
+                        RunShutdownStep("save settings", delegate { SaveMapViewState(); SaveNodeListState(); MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); });
+                        if (_databaseWrites != null) RunShutdownStep("dispose database writer", _databaseWrites.Dispose);
+                        if (_store != null) RunShutdownStep("close database", _store.Dispose);
+                        RunShutdownStep("restore terminal state", RestoreUnixTerminalState);
+                        WriteShutdownLog("Linux cleanup finished; exiting process");
+                        completion.TrySetResult(null);
+                        Environment.Exit(0);
+                        return;
+                    }
+                    UpdateShutdownStatus("closing terminal interface", elapsed);
+                    WriteShutdownLog("requesting UI loop stop");
+                    var dispatchWatch = Stopwatch.StartNew();
+                    try
+                    {
+                        Application.MainLoop.Invoke(delegate
+                        {
+                            WriteShutdownLog("UI stop callback entered after " + dispatchWatch.Elapsed.TotalSeconds.ToString("F3", CultureInfo.InvariantCulture) + "s");
+                            WriteShutdownLog("shutdown target: " + (shutdownTop == null ? "null" : shutdownTop.GetType().FullName) + ", running=" + (shutdownTop != null && shutdownTop.Running));
+                            var stopWatch = Stopwatch.StartNew();
+                            WriteShutdownLog("START Application.RequestStop");
+                            try
+                            {
+                                if (shutdownTop != null) Application.RequestStop(shutdownTop);
+                                else Application.RequestStop();
+                            }
+                            catch (Exception error) { WriteShutdownLog("ERROR Application.RequestStop: " + error); }
+                            finally { WriteShutdownLog("END Application.RequestStop (" + stopWatch.Elapsed.TotalSeconds.ToString("F3", CultureInfo.InvariantCulture) + "s)"); }
+                        });
+                        WriteShutdownLog("UI stop Invoke returned after " + dispatchWatch.Elapsed.TotalSeconds.ToString("F3", CultureInfo.InvariantCulture) + "s");
+                    }
+                    catch (Exception error) { WriteShutdownLog("ERROR enqueueing UI stop: " + error); }
+                }
+                finally { completion.TrySetResult(null); }
+            })) { IsBackground = true, Name = "MeshTerminal shutdown" };
+            shutdownThread.Start();
+        }
+
+        private static void StopExternalServicesWithTimeout(TimeSpan timeout)
+        {
+            var stops = new List<Task>();
+            if (_telnetServers != null) stops.Add(StartStop(() => _telnetServers.StopAsync()));
+            if (_telegramGateways != null) stops.Add(StartStop(delegate { return _telegramGateways.StopAsync(); }));
+            if (_mesh != null) stops.Add(StartStop(delegate { return _mesh.DisconnectAsync(); }));
+            if (stops.Count == 0) return;
+            try { Task.WaitAll(stops.ToArray(), timeout); } catch { }
+        }
+
+        private static void StopExternalServicesWithProgress(TimeSpan timeout, Stopwatch elapsed)
+        {
+            var stops = new List<KeyValuePair<string, Task>>();
+            if (_telnetServers != null) stops.Add(new KeyValuePair<string, Task>("Telnet servers", StartStop(() => _telnetServers.StopAsync())));
+            if (_telegramGateways != null) stops.Add(new KeyValuePair<string, Task>("Telegram gateways", Task.Run(async delegate { await StartStop(delegate { return _telegramGateways.StopAsync(); }).ConfigureAwait(false); })));
+            if (_mesh != null) stops.Add(new KeyValuePair<string, Task>("mesh connection", Task.Run(async delegate { await StartStop(delegate { return _mesh.DisconnectAsync(); }).ConfigureAwait(false); })));
+            if (stops.Count == 0) { UpdateShutdownStatus("no external services to stop", elapsed); return; }
+            var deadline = DateTime.UtcNow + timeout;
+            while (stops.Any(item => !item.Value.IsCompleted) && DateTime.UtcNow < deadline)
+            {
+                var pending = String.Join(", ", stops.Where(item => !item.Value.IsCompleted).Select(item => item.Key));
+                UpdateShutdownStatus("waiting for " + pending, elapsed);
+                // Completed tasks make WaitAny return immediately and flood the UI queue.
+                var pendingTasks = stops.Where(item => !item.Value.IsCompleted).Select(item => item.Value).ToArray();
+                if (pendingTasks.Length == 0) break;
+                try { Task.WaitAny(pendingTasks, TimeSpan.FromMilliseconds(250)); } catch { }
+            }
+            var unfinished = stops.Where(item => !item.Value.IsCompleted).Select(item => item.Key).ToList();
+            UpdateShutdownStatus(unfinished.Count == 0 ? "external services stopped" : "timeout while stopping " + String.Join(", ", unfinished), elapsed);
+        }
+
+        private static void CompleteDatabaseWritesWithProgress(TimeSpan timeout, Stopwatch elapsed)
+        {
+            if (_databaseWrites == null) { UpdateShutdownStatus("no database queue", elapsed); return; }
+            var deadline = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < deadline)
+            {
+                var pending = _databaseWrites.PendingCount;
+                UpdateShutdownStatus("flushing database queue (" + pending.ToString(CultureInfo.InvariantCulture) + " pending)", elapsed);
+                if (_databaseWrites.CompleteAndWait(TimeSpan.FromMilliseconds(250)))
+                {
+                    UpdateShutdownStatus("database queue flushed", elapsed);
+                    return;
+                }
+            }
+            UpdateShutdownStatus("database flush timeout (" + _databaseWrites.PendingCount.ToString(CultureInfo.InvariantCulture) + " pending)", elapsed);
+        }
+
+        private static void UpdateShutdownStatus(string detail, Stopwatch elapsed)
+        {
+            try
+            {
+                Application.MainLoop.Invoke(delegate
+                {
+                    if (_status == null) return;
+                    _status.Text = " Closing | " + elapsed.Elapsed.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s | " + detail;
+                    _status.SetNeedsDisplay();
+                });
+            }
+            catch { }
+        }
+
+        private static Task StartStop(Func<Task> stop)
+        {
+            try { return stop() ?? Task.FromResult(0); }
+            catch { return Task.FromResult(0); }
+        }
+
+        private static void WriteShutdownLog(string detail)
+        {
+            try { File.AppendAllText("shutdown.log", DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture) + " | " + detail + Environment.NewLine); }
+            catch { }
+        }
+
+        private static void RunShutdownStep(string name, Action action)
+        {
+            WriteShutdownLog("START " + name);
+            var watch = Stopwatch.StartNew();
+            try { action(); }
+            catch (Exception error) { WriteShutdownLog("ERROR " + name + ": " + error.GetType().Name + " - " + error.Message); }
+            finally { WriteShutdownLog("END " + name + " (" + watch.Elapsed.TotalSeconds.ToString("F3", CultureInfo.InvariantCulture) + "s)"); }
+        }
+
+        private static void EnsureShutdownCompleted()
+        {
+            if (Interlocked.CompareExchange(ref _shutdownStarted, 1, 0) == 0)
+            {
+                StopExternalServicesWithTimeout(TimeSpan.FromSeconds(6));
+                if (_databaseWrites != null) _databaseWrites.CompleteAndWait(TimeSpan.FromSeconds(5));
+                return;
+            }
+            var shutdown = _shutdownTask;
+            if (shutdown != null) try { shutdown.Wait(TimeSpan.FromSeconds(1)); } catch { }
+        }
+    }
+}

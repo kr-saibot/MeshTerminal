@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 
 internal static class GatewayConfigurationTests
 {

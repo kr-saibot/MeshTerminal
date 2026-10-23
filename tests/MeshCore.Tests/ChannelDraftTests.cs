@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using Google.Protobuf;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 using Meshtastic.Protobufs;
 
 internal static class ChannelDraftTests

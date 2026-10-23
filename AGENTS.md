@@ -15,4 +15,4 @@ Build updates must overwrite program files while preserving runtime data already
 - `meshtastic-messages.db`
 - `Host\settings.ini`
 
-The Windows host and its dependencies belong in the `Windows\Host` subdirectory to prevent assembly-version collisions with ConsoleClient.
+The Windows host and its dependencies belong in the `Windows\Host` subdirectory to prevent assembly-version collisions with MeshTerminal.

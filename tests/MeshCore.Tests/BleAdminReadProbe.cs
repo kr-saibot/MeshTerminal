@@ -2,7 +2,7 @@ using System;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 using Meshtastic.Protobufs;
 public static class BleAdminReadProbe
 {

@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 internal static class MeshCoreContactTimeoutTests
 {
     internal static async Task RunAsync()

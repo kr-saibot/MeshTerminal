@@ -2,9 +2,9 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using ConsoleClient;
+using MeshTerminal;
 using Google.Protobuf;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 using Meshtastic.Protobufs;
 
 internal static class CommunicationLogTests

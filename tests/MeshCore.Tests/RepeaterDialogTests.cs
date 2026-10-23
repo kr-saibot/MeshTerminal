@@ -1,8 +1,8 @@
 using System;
 using System.Linq;
 using System.IO;
-using ConsoleClient;
-using Meshtastic.Client;
+using MeshTerminal;
+using MeshTerminal.Client;
 internal static class RepeaterDialogTests
 {
     private static void Check(bool value, string message) { if (!value) throw new Exception(message); }

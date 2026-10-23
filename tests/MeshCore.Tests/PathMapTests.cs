@@ -1,8 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using Meshtastic.Client;
-using ConsoleClient;
+using MeshTerminal.Client;
+using MeshTerminal;
 internal static class PathMapTests
 {
     internal static void Run()

@@ -3,9 +3,9 @@ using System.IO;
 using System.Linq;
 using System.Drawing;
 using Google.Protobuf;
-using Meshtastic.Client;
+using MeshTerminal.Client;
 using Meshtastic.Protobufs;
-using ConsoleClient;
+using MeshTerminal;
 using ZXing;
 
 internal static class SharingTests

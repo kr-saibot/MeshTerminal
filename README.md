@@ -1,43 +1,95 @@
-# MeshtasticConsoleClient
+# MeshTerminal
 
-MeshtasticConsoleClient is a C# 7.3 / .NET Framework 4.7.2 client library and terminal
-application for the native Meshtastic Protobuf API. It connects by USB/serial
-TCP or Bluetooth LE, stores messages, nodes and telemetry in SQLite, and supports optional
-Telegram gateways and local or HTTP chat bots.
+MeshTerminal is a terminal application for **Meshtastic and MeshCore** on
+**Windows and Linux**. Chat over LoRa mesh networks, manage nodes and channels,
+view positions on an interactive map, inspect telemetry, and connect external
+services through Telegram gateways, Telnet servers and configurable bots.
 
-It also includes an initial MeshCore Companion protocol adapter for serial and
-TCP and Bluetooth LE connections, with contacts, configured channels, direct chat and channel
-messages. Select **MeshCore** in **Settings > Connection**, enter the serial port
-(for example `COM14`) and baud rate `115200`, save, and restart the program.
-The TCP port must match the MeshCore device's configuration; the Meshtastic
-default `4403` is not automatically changed.
+Connect a compatible radio through **USB/serial, TCP or Bluetooth LE**. Bluetooth
+uses native .NET APIs on Windows and BlueZ over D-Bus on Linux; no Python helper
+is required. A Windows desktop host provides a native terminal window, tray
+integration, selectable icons and portable settings. Linux runs with Mono.
 
-MeshCore chat data is stored separately in `meshcore-messages.db`. Full public
-keys are mapped to persistent local database IDs without truncating keys.
-Group messages identify their sender by a display name, so group senders are
-kept separate from authenticated contacts with the same name. The composer
-uses the MeshCore UTF-8 text limit, including the local name prefix for groups.
-Channel messages become `Sent` after local acceptance; no recipient ACK is available.
-Direct messages initially show `QueuedAtDevice` and can subsequently
-be marked `Delivered` by a radio ACK. A missing direct ACK is marked `Failed`.
+## Meshtastic and MeshCore support
 
-Room Servers appear in the direct chat list. Use **MeshCore > Room Server login**
-to enter a password and see whether the server grants read or write access.
-Passwords are not saved; log in again after reconnecting. Room posts are limited
-to 151 UTF-8 bytes. Signed room messages remain in the room conversation and
-show the author name only when its short key identifies a unique contact.
+Choose the protocol and transport in **Settings > Connection**. Meshtastic uses
+its native Protobuf API; MeshCore connects to compatible **Companion firmware**.
+The two protocols have separate message databases, while the application shares
+its chat, map, telemetry and gateway interface. Set the serial port (for example
+`COM14`), TCP address or paired Bluetooth device to match your radio. TCP ports
+and firmware capabilities depend on the device.
 
-Use **Telemetry > Request MeshCore telemetry** to query the local device or a
-contact. Remote devices must permit the request. Received sensor values and raw
-payloads are stored when telemetry storage is enabled.
-Repeater commands and contact import are not implemented. Telegram gateways,
-local chat bots and HTTP bots support both protocols. Positions supplied by MeshCore contacts can appear on
-the existing map. Protocol switching requires a restart to select the matching
-database. Existing Meshtastic history and settings are retained.
+### MeshCore
 
-Protocol reference: https://github.com/meshcore-dev/MeshCore/blob/main/examples/companion_radio/MyMesh.cpp
+- Direct and channel chat, delivery states, Room Server login and signed room posts.
+- Contact synchronisation with progress and retry handling; buffered database
+  writes keep large contact-list transfers responsive.
+- Companion, repeater and Room Server types, favourites, contact age and PC/device
+  storage indicators; save, remove, create and import device contacts.
+- Channel editor with separate device and local libraries, slot selection,
+  hashtag-derived keys, QR codes and channel/contact link import and export.
+- Advertisements with optional position sharing, nearby-repeater discovery,
+  path discovery and FROM/TO route displays with a temporary map layer.
+- Repeater administrator login, optional encrypted per-repeater passwords,
+  documented command selection with help, six configurable command buttons,
+  scrollable replies and copy/clear actions. Device support depends on firmware.
+- Local and remote telemetry requests, battery information, device clock
+  synchronisation, routing hash length and a live noise-floor display.
 
-Source code and releases: https://github.com/kr-saibot/MeshtasticConsoleClient
+MeshCore channel messages identify senders by a display name rather than an
+explicit sender public key. Chat identities remain separate from authenticated
+contacts. Position telemetry and sender-detail actions can associate a channel
+sender with a uniquely named known contact; duplicate names require a choice
+for sender details. This is a name-based association, not key authentication.
+
+Channel messages are marked `Sent` after acceptance by the local radio; this
+is not a recipient acknowledgement. Direct messages can progress from
+`QueuedAtDevice` to `Delivered` when an acknowledgement arrives. Room Servers
+may grant read-only or read/write access; log in again after reconnecting.
+Room Server login passwords are not saved. Remote telemetry and repeater
+administration require the destination to permit the request.
+
+### Meshtastic
+
+- Native Protobuf node, channel, position, telemetry and text-message support.
+- Device/local channel libraries, editable channel options, QR codes and link imports.
+- Own contact QR display, device information and broadcast node information.
+- USB/serial, TCP and Bluetooth LE with automatic reconnect and configuration sync.
+
+## Maps, messages and integrations
+
+- Interactive terminal map with offline raster/vector MBTiles, XML overlays,
+  selectable layers, position history, hop/age filters and temporary MeshCore paths.
+- Shared map points and shapes, position markers and `[LOC]latitude,longitude`
+  messages; received positions can be retained as position telemetry.
+- Selectable links and GPS coordinates in messages, with copy/browser actions
+  and map markers. Chat ordering uses database reception order while preserving
+  the displayed message timestamp.
+- Telegram gateways, local chat bots and HTTP bots for either protocol, with
+  protocol-aware channel selection and separate configuration editors.
+- Multiple configurable Telnet servers: local/network binding, channel bridging,
+  optional password, welcome text and history, read-only mode, input echo,
+  timestamp/sender visibility, own-message display, incoming-message BEL and
+  emoji-name/ASCII handling.
+- Configurable sound-alert cooldown, desktop/shell/HTTP alerts, animated text
+  logos, emoji picker, emoji replacements and selectable appearance.
+- RAM-only device communication log with timestamps, raw and decoded frames,
+  coloured RX/TX, configurable FIFO capacity, LoRa filtering, pause, clear and copy.
+
+## Upgrade compatibility
+
+The former MeshtasticConsoleClient application is now called **MeshTerminal**.
+Start `MeshTerminal.exe` (or `mono MeshTerminal.exe` on Linux); Windows users can
+use `MeshTerminal.cmd` to open `Host/MeshTerminal.Host.exe` with the client.
+
+Existing runtime files keep their names and formats: `meshtastic-settings.xml`,
+`meshtastic-messages.db`, `meshcore-messages.db`, and `Host/settings.ini`.
+Saved channels, passwords, messages, nodes, telemetry and host preferences are
+retained. Do not publish these private files. The canonical build directories
+remain `C:\Users\Tobias\Documents\ConsoleClientBuilds\Windows` and
+`C:\Users\Tobias\Documents\ConsoleClientBuilds\Linux`.
+
+Source code and releases: https://github.com/kr-saibot/MeshTerminal
 
 ## Bluetooth LE (Windows and Linux)
 
@@ -61,14 +113,14 @@ Meshtastic requires Bluetooth to be enabled in its device configuration. Close
 any mobile app connected to the same radio before connecting this client.
 Automatic reconnect also applies to Bluetooth connections.
 
-Both platform builds and automated packet/disconnect/settings tests have been
-verified. Real-radio BLE operation, especially Linux adapter/permission behavior,
-still needs a hardware test.
+Both platform builds and automated packet/disconnect/settings tests are covered
+by the build script. Linux Bluetooth additionally depends on the local adapter,
+BlueZ permissions and pairing.
 ## Screenshots
 
 ### Chat
 
-![Chat interface of MeshtasticConsoleClient](Screenshot.png)
+![Chat interface of MeshTerminal](Screenshot.png)
 
 ### Node map
 
@@ -84,7 +136,7 @@ still needs a hardware test.
 
 ## Features
 
-- Native serial and TCP transports with automatic reconnect and connection statistics
+- Native serial, TCP and Bluetooth LE transports with automatic reconnect and connection statistics
 - Separately configurable DTR and RTS control lines for serial/COM connections
 - Node, channel, text-message, position and telemetry handling
 - SQLite message, node and telemetry storage
@@ -106,7 +158,7 @@ still needs a hardware test.
 
 ## Windows desktop host
 
-`MeshtasticConsoleHost.exe` provides a native Windows window for the otherwise
+`MeshTerminal.Host.exe` provides a native Windows window for the otherwise
 unchanged terminal application. It uses Windows ConPTY and the Windows Terminal
 renderer, so keyboard navigation, Tab, cursor keys, mouse input, Unicode symbols
 and terminal colours work as they do in a modern terminal.
@@ -128,10 +180,10 @@ The host adds the following Windows integration:
 - Selectable alarm audio with a bundled default alert sound
 
 
-Host settings are stored in `settings.ini` beside `MeshtasticConsoleHost.exe`.
-The ConsoleClient continues to store `meshtastic-settings.xml` and its SQLite
-database in the ConsoleClient working directory, which is the directory that
-contains the selected `ConsoleClient.exe`.
+Host settings are stored in `settings.ini` beside `MeshTerminal.Host.exe`.
+The MeshTerminal continues to store `meshtastic-settings.xml` and its SQLite
+database in the MeshTerminal working directory, which is the directory that
+contains the selected `MeshTerminal.exe`.
 
 The host requires 64-bit Windows 10 version 1809 or newer. ConPTY is a Windows
 API; it is not an additional separately licensed component.
@@ -236,7 +288,7 @@ a deleted marker. Markers disappear when the application exits.
   City-circle radii approximate municipality area, rather than built-up area.
   Autobahns are not included.
 
-See the [water and city overlay documentation](src/ConsoleClient/map/germany-water-cities-motorways.md)
+See the [water and city overlay documentation](src/MeshTerminal/map/germany-water-cities-motorways.md)
 for coverage, approximation details, sources and licences. Its historical filename
 is retained for compatibility with saved overlay settings.
 
@@ -291,9 +343,9 @@ The script builds both platforms, runs MeshCore protocol tests against a simulat
 Companion radio, and updates `C:\Users\Tobias\Documents\ConsoleClientBuilds\Windows`
 and `C:\Users\Tobias\Documents\ConsoleClientBuilds\Linux`. Existing runtime data
 is preserved. The Windows host and its dependencies are in `Windows\Host`.
-The `Windows\MeshtasticConsoleHost.lnk` shortcut starts the native terminal.
+The portable `Windows\MeshTerminal.cmd` launcher starts the native terminal.
 Temporary build and test files are isolated in `.build-staging`.
-The Windows host project is located in `src/ConsoleHost/` and targets x64.
+The Windows host project is located in `src/MeshTerminal.Host/` and targets x64.
 Release builds do not include `.pdb` debug-symbol files. These symbols are not
 needed at runtime; use a Debug build when source-level crash diagnostics are
 required.
@@ -344,7 +396,7 @@ The status line shows the local long name, with the short name as a fallback.
 
 ## Running
 
-Start `ConsoleClient.exe`. On its first start, enter the serial or TCP settings
+Start `MeshTerminal.exe`. On its first start, enter the connection settings
 through the Settings menu. The application writes local settings and its SQLite
 database next to the executable; these files can contain private information
 and are deliberately excluded from version control.
@@ -357,7 +409,7 @@ disabled. Changes take effect on the next connection and do not affect TCP.
 
 Some ESP32-S3 boards and USB serial circuits, including certain Heltec WiFi LoRa
 32 V3 configurations, connect DTR and RTS to reset or boot-control signals. If a
-device resets, appears to shut down, or loses its clock when ConsoleClient closes
+device resets, appears to shut down, or loses its clock when MeshTerminal closes
 the port, disable both DTR and RTS and reconnect. Other boards or drivers may need
 DTR to communicate, so keep the default unless the device exhibits this problem.
 
@@ -381,21 +433,21 @@ sudo usermod -aG dialout "$USER"
 ```
 
 Log out completely and log in again, or restart the computer, before retrying.
-Use `groups` to confirm that `dialout` is active. Do not run ConsoleClient with
+Use `groups` to confirm that `dialout` is active. Do not run MeshTerminal with
 `sudo`; correct the device-group permissions instead. Also ensure that no web
 client or other application still has the selected serial port open.
 
 ## Appearance and logos
 
 The terminal colours, frames and message colours can be changed in the
-Appearance settings. ASCII logos are loaded from `src/ConsoleClient/logo/` and
+Appearance settings. ASCII logos are loaded from `src/MeshTerminal/logo/` and
 can be replaced or extended with your own text files. The Logo settings control
 whether the logo frame is shown, its size and the automatic rotation interval.
 
 The emoji replacement list can be regenerated from official Unicode data:
 
 ```powershell
-cd src\ConsoleClient
+cd src\MeshTerminal
 powershell -ExecutionPolicy Bypass -File .\tools\GenerateEmojiReplacements.ps1
 ```
 

@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AssemblyName>MeshTerminal</AssemblyName>
+    <RootNamespace>MeshTerminal</RootNamespace>
+    <Product>MeshTerminal</Product>
+    <Title>MeshTerminal</Title>
+    <Description>Windows and Linux terminal client for Meshtastic and MeshCore with chat, maps, telemetry, repeater administration and gateways.</Description>
+    <Version>1.4.0</Version>
+    <AssemblyVersion>1.4.0.0</AssemblyVersion>
+    <FileVersion>1.4.0.0</FileVersion>
+    <Configurations>Debug;Release;Linux</Configurations>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Linux'">
+    <OutputPath>bin\Linux\</OutputPath>
+    <IntermediateOutputPath>obj\Linux\</IntermediateOutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+    <PackageReference Include="QRCoder" Version="1.6.0" />
+    <PackageReference Include="Terminal.Gui" Version="1.18.1" />
+    <PackageReference Include="mapbox-vector-tile" Version="5.3.1" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\MeshTerminal.Client\MeshTerminal.Client.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="logo\*.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="map\*.xml" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="osm\*.mbtiles" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="osm\*.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="emoji-replacements.xml" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="emoji-blocks-full.xml" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="emoji-blocks-12line-full.xml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE-Meshtastic-Protobufs.txt" Link="LICENSE-Meshtastic-Protobufs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE-BluetoothLE.txt" Link="LICENSE-BluetoothLE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE-Tmds-DBus.txt" Link="LICENSE-Tmds-DBus.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE-QRCoder.txt" Link="LICENSE-QRCoder.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\THIRD-PARTY-NOTICES.md" Link="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\README.md" Link="README.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="BuildDateUtc" Value="$([System.DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss'))" />
+  </ItemGroup>
+</Project>
