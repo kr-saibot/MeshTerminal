@@ -1,9 +1,11 @@
 # MeshTerminal
 
+Current version: **2.1.0**. See [release notes](RELEASE-NOTES-2.1.0.md) for changes since the last published release, 1.4.0.
+
 MeshTerminal is a terminal application for **Meshtastic and MeshCore** on
 **Windows and Linux**. Chat over LoRa mesh networks, manage nodes and channels,
 view positions on an interactive map, inspect telemetry, and connect external
-services through Telegram gateways, Telnet servers and configurable bots.
+services through MQTT clients, Telegram gateways, Telnet servers and configurable bots.
 
 Connect a compatible radio through **USB/serial, TCP or Bluetooth LE**. Bluetooth
 uses native .NET APIs on Windows and BlueZ over D-Bus on Linux; no Python helper
@@ -57,6 +59,14 @@ administration require the destination to permit the request.
 - USB/serial, TCP and Bluetooth LE with automatic reconnect and configuration sync.
 
 ## Maps, messages and integrations
+
+- **Chats > Chess** opens a two-player chess board in the current direct chat on
+  either protocol. Choose White or Black for a new game, select a piece and its
+  destination using the mouse or arrow keys and Enter, then send the move.
+  Games resume from the chat history; received moves update an open board and
+  changed squares are highlighted in brown. Captured pieces and move counts
+  appear beside the board. Chess messages also open from the message actions menu.
+- The **Insert** menu includes the map-marker symbol picker, including chess pieces.
 
 - Interactive terminal map with offline raster/vector MBTiles, XML overlays,
   selectable layers, position history, hop/age filters and temporary MeshCore paths.
@@ -473,3 +483,26 @@ license copy is retained in `LICENSE-Meshtastic-Protobufs.txt`.
 
 See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for third-party component
 attribution and release-packaging notes.
+
+### Repeater-Status und Nachrichtenfarben
+
+Die MeshCore-Repeater-Administration ruft nach erfolgreichem Login automatisch den Status ab. „Refresh status“ lädt ihn erneut in die Ausgabe: Spannung, Noise Floor, letztes RSSI/SNR am Repeater, Laufzeit, Warteschlange und Paketzähler. Ältere Firmware zeigt nur die von ihr gelieferten Werte. Eine fehlgeschlagene Statusabfrage hebt einen erfolgreichen Login nicht auf. Die Werte beziehen sich auf den entfernten Repeater, nicht auf den lokalen Companion.
+
+Unter Settings > Appearance sind „Failed send status“ (Standard Red) und „Sender names“ (Standard Gray) einstellbar. Nur der Status fehlgeschlagener eigener Nachrichten erhält die Fehlerfarbe; der Nachrichtentext behält seine bisherige Farbe. Die Namensfarbe gilt für eigene und empfangene Absender und funktioniert auch bei umgebrochenen Kopfzeilen.
+
+Das Repeater-Ausgabefeld ist um drei Zeilen vergrößert. Empfangene Statusantworten bekannter Repeater werden als „MeshCore status“ in der Telemetrie gespeichert, sofern die Telemetriespeicherung und gegebenenfalls der Favoritenfilter dies erlauben. Das gilt auch für Statusantworten einer Ping-Abfrage. Noise Floor, letztes RSSI/SNR, Spannung und Laufzeit sind als Datenfelder verfügbar; die vollständigen Statuswerte bleiben in den Details erhalten. Die Funkwerte gehören zum entfernten Repeater, nicht zum lokalen Empfang der Antwort. CSV-/Tabellenexporte enthalten die drei Funkfelder am Ende.
+
+Weitere Nachrichtenfarben unter Settings > Appearance: „Timestamps“ (Standard Gray) und „Successful send status“ (Standard Green). Erfolgreich sind hier die Status Sent und Delivered; wartende Nachrichten behalten ihre bisherige Statusfarbe.
+
+### Logo als Aktivitätsanzeige
+
+Unter Settings > Logo stehen zwei unabhängige Optionen bereit (beide standardmäßig aus):
+
+- **Play animation once on LoRa RX / TX:** Das ausgewählte animierbare Logo bleibt in seiner ersten Ansicht stehen. Bei funkbezogenem Empfang/Sendeauftrag läuft es einmal durch und kehrt anschließend in die erste Ansicht zurück. Ping-Pong kehrt über die Zwischenbilder zurück. Während eines laufenden Durchlaufs werden weitere Ereignisse zusammengefasst, statt ihn neu zu starten oder eine Warteschlange aufzubauen. Die Datei muss größer als der eingestellte Logo-Ausschnitt sein; die Option aktiviert dafür auch die Animation größerer Dateien.
+- **Flash logo once on LoRa RX / TX:** Die Logofarben werden pro Aktivitätsimpuls etwa 180 ms invertiert und wiederhergestellt. Die Erkennung verwendet denselben LoRa-Filter wie das Communication Log. Lokale Konfigurations-, Synchronisations- und Abfrageframes lösen weder Flash noch Animation aus. Kurze Ereignisfolgen werden zu sichtbaren Impulsen zusammengefasst. Das Blinken bei ungelesenen Nachrichten bleibt unabhängig davon erhalten.
+
+Die Aktivitätsanzeige gilt für Meshtastic und MeshCore. LoRa-Verkehr wird aus den vom Gerät gemeldeten funkbezogenen Frames bzw. ausgehenden Funkaufträgen erkannt; sie ist keine separate Messung des tatsächlichen RF-Sendezeitpunkts. Ein ausgewähltes Emoji behält bei aktivierter Emoji-Vorschau Vorrang vor der Logoanimation. Ist das Logo ausgeblendet, wird keine Aktivitätsanimation gestartet.
+
+### MQTT clients
+
+Settings → MQTT clients manages multiple MQTT brokers for Meshtastic and MeshCore. Bind a client to a channel, a specific direct chat, all direct messages, telemetry, live adverts/new nodes or periodic own-device system status, optionally restricted to favorites. Advert/node clients can additionally publish only newly discovered nodes. Received data is published as text, individual metadata topics and complete JSON. The optional “Allow sending via MQTT” checkbox enables text commands to the selected channel/contact; it is disabled by default. Debug → MQTT client status shows connections, queues and errors. TCP and TLS are supported on Windows and Linux, with independent reconnect and bounded in-memory queues. See [MQTT-PROTOCOL.md](MQTT-PROTOCOL.md) (also shipped in `Protocols`) for topic names and examples. MQTT credentials are stored in the settings file and must be protected accordingly.

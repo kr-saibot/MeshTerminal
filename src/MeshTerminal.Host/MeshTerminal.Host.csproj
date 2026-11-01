@@ -9,13 +9,18 @@
     <Product>MeshTerminal</Product>
     <Title>MeshTerminal</Title>
     <RootNamespace>MeshTerminal.Host</RootNamespace>
-    <Version>1.4.3</Version>
-    <AssemblyVersion>1.4.3.0</AssemblyVersion>
-    <FileVersion>1.4.3.0</FileVersion>
+    <Version>2.1.0</Version>
+    <AssemblyVersion>2.1.0.0</AssemblyVersion>
+    <FileVersion>2.1.0.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="../MeshTerminal/HostQrBridge.cs" Link="HostQrBridge.cs" />
+    <Compile Include="../MeshTerminal/TerminalPalette.cs" Link="TerminalPalette.cs" />
+    <Compile Include="../MeshTerminal/MapSymbolCatalog.cs" Link="MapSymbolCatalog.cs" />
     <Compile Remove="tools\GenerateDefaultAlertSound.cs" />
+    <None Update="LICENSE-ZXing.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
     <None Update="assets\meshtastic-alert.wav" CopyToOutputDirectory="PreserveNewest" />
     <EmbeddedResource Include="assets\meshtastic-chirp.ico" />
     <EmbeddedResource Include="assets\icons\*.ico" />
@@ -23,6 +28,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="ZXing.Net" Version="0.16.11" />
     <PackageReference Include="EasyWindowsTerminalControl" Version="1.0.38" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
   </ItemGroup>

@@ -74,7 +74,7 @@ namespace MeshTerminal.Client
         public int GetMaximumTextPayloadBytes(bool channelMessage)
         {
             if (Protocol != MeshProtocol.MeshCore) return MaximumTextPayloadBytes;
-            return channelMessage ? Math.Max(0, 160 - Encoding.UTF8.GetByteCount((Device.LocalNode == null ? "" : Device.LocalNode.LongName) ?? "") - 2) : 160;
+            return channelMessage ? Math.Max(0, 160 - Encoding.UTF8.GetByteCount((Device.LocalNode == null ? "" : Device.LocalNode.LongName) ?? "") - 2) : 158;
         }
 
         public MessageDeliveryEventArgs GetMessageDelivery(uint packetId)
@@ -85,9 +85,18 @@ namespace MeshTerminal.Client
 
         private void UpdateMeshCoreDelivery(uint packetId, MessageDeliveryState state)
         {
-            var value = new MessageDeliveryEventArgs(packetId, state, Routing.Types.Error.None);
+            MessageDeliveryEventArgs previous;
+            _meshCoreDeliveries.TryGetValue(packetId, out previous);
+            if (previous != null && previous.State == MessageDeliveryState.Delivered && state != MessageDeliveryState.Delivered) return;
+            var value = new MessageDeliveryEventArgs(packetId, state, Routing.Types.Error.None) { Detail = previous?.Detail };
             _meshCoreDeliveries[packetId] = value;
             Raise(MessageDeliveryChanged, value);
+        }
+
+        private void UpdateMeshCoreAttempt(uint packet, int attempt, int maximum, bool flood)
+        {
+            _meshCoreDeliveries[packet] = new MessageDeliveryEventArgs(packet, MessageDeliveryState.QueuedAtDevice, Routing.Types.Error.None)
+            { Detail = "Attempt " + attempt + "/" + maximum + " | " + (flood ? "Flood" : "Direct") };
         }
 
         private uint ResolveMeshCoreIdentity(string identity)
@@ -228,7 +237,8 @@ namespace MeshTerminal.Client
                 if (direct) writer.Write(publicKey, 0, 6);
                 writer.Write(Encoding.UTF8.GetBytes(text)); command = buffer.ToArray();
             }
-            await session.SendTextAsync(command, direct, packetId, token).ConfigureAwait(false);
+            if (direct) await session.SendTextWithRetriesAsync(command, publicKey, packetId, token).ConfigureAwait(false);
+            else await session.SendTextAsync(command, false, packetId, token).ConfigureAwait(false);
             return packetId;
         }
 
@@ -251,6 +261,13 @@ namespace MeshTerminal.Client
                     break;
                 case 24:
                     if (frame.Length >= 14 && frame[1] == 1) { var noise = unchecked((short)(frame[2] | (frame[3] << 8))); Device.NoiseFloorDbm = noise == 0 ? (int?)null : noise; Raise(DeviceInfoUpdated, EventArgs.Empty); }
+                    if(frame.Length>=10&&frame[1]==2)
+                    {
+                        Device.RadioReceivedPackets=MeshCoreSession.ReadUInt32(frame,2);
+                        Device.RadioSentPackets=MeshCoreSession.ReadUInt32(frame,6);
+                        Device.RadioReceiveErrors=frame.Length>=30?(uint?)MeshCoreSession.ReadUInt32(frame,26):null;
+                        Device.RadioStatisticsReadUtc=DateTime.UtcNow;Raise(DeviceInfoUpdated,EventArgs.Empty);
+                    }
                     break;
                 case 12:
                     RequireMeshCoreLength(frame, 3);
@@ -274,9 +291,12 @@ namespace MeshTerminal.Client
                 case 3:
                 case 0x8A:
                     RequireMeshCoreLength(frame, 148); RecordMeshCoreContactFrame(frame);
+                    var advertIdentity=Hex(frame,1,32);
+                    var advertWasNew=!_nodes.Values.Any(n=>n.Id==advertIdentity);
+                    var advertReceivedUtc=DateTime.UtcNow;
                     if (frame[0] == 0x8A) _meshCoreLastReception[Hex(frame, 1, 32)] = DateTime.UtcNow;
                     UpdateMeshCoreNode(frame.Skip(1).Take(32).ToArray(), MeshCoreString(frame, 100, 32), ReadMeshCorePosition(frame, 136), MeshCoreSession.ReadUInt32(frame, 132), frame[33]);
-                    if (frame[0] == 0x8A && _meshCore != null && _lifetime != null) _ = RefreshMeshCoreAdvertPathAsync(_meshCore, frame.Skip(1).Take(32).ToArray(), _lifetime.Token);
+                    if (frame[0] == 0x8A && _meshCore != null && _lifetime != null) _ = AnnounceMeshCoreAdvertAsync(_meshCore, frame.Skip(1).Take(32).ToArray(), advertWasNew, advertReceivedUtc, _lifetime.Token);
                     if (_loadingMeshCoreContacts && frame[0] == 3)
                     {
                         if (_meshCoreSyncContactKeys.Add(Hex(frame, 1, 32))) _loadedMeshCoreContacts++;
@@ -292,8 +312,9 @@ namespace MeshTerminal.Client
                     var refreshSession = _meshCore;
                     var refreshLifetime = _lifetime;
                     if (refreshSession != null && refreshLifetime != null)
-                        _ = RefreshMeshCoreContactAsync(refreshSession, frame.Skip(1).Take(32).ToArray(), refreshLifetime.Token);
+                        _ = RefreshMeshCoreContactAsync(refreshSession, frame.Skip(1).Take(32).ToArray(), refreshLifetime.Token, frame[0]==0x80, DateTime.UtcNow);
                     break;
+                case 0x87: ReceiveMeshCoreRepeaterStatus(frame); break;
                 case 0x8E: HandleMeshCoreDiscoveryResponse(frame); break;
                 case 0x88: HandleMeshCoreRxLog(frame); break;
                 case 18:
@@ -317,20 +338,30 @@ namespace MeshTerminal.Client
 
         // Run outside the receive loop: the response must still be read while
         // this request waits for synchronization and the command semaphore.
-        private async Task RefreshMeshCoreContactAsync(MeshCoreSession session, byte[] key, CancellationToken token)
+        private async Task RefreshMeshCoreContactAsync(MeshCoreSession session, byte[] key, CancellationToken token, bool advert=false, DateTime? receivedUtc=null)
         {
             var acquired = false;
+            var wasNew=!_nodes.Values.Any(n=>n.Id==Hex(key,0,32));
             try
             {
                 await _meshCoreSync.WaitAsync(token).ConfigureAwait(false);
                 acquired = true;
                 if (!ReferenceEquals(session, _meshCore) || !IsConnected) return;
                 await session.CommandAsync(new byte[] { 30 }.Concat(key).ToArray(), new byte[] { 3 }, token).ConfigureAwait(false);
-                await RefreshMeshCoreAdvertPathAsync(session, key, token).ConfigureAwait(false);
+                if(advert) await AnnounceMeshCoreAdvertAsync(session,key,wasNew,receivedUtc??DateTime.UtcNow,token).ConfigureAwait(false);
+                else await RefreshMeshCoreAdvertPathAsync(session, key, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { Debug("MeshCore contact refresh failed: " + ex.Message); }
             finally { if (acquired) _meshCoreSync.Release(); }
+        }
+
+        private async Task AnnounceMeshCoreAdvertAsync(MeshCoreSession session, byte[] key, bool isNew, DateTime receivedUtc, CancellationToken token)
+        {
+            await RefreshMeshCoreAdvertPathAsync(session,key,token).ConfigureAwait(false);
+            if(token.IsCancellationRequested||!ReferenceEquals(session,_meshCore))return;
+            MeshNode node;
+            if(_nodes.TryGetValue(ResolveMeshCoreIdentity(Hex(key,0,32)),out node))AnnounceNode(node,isNew,receivedUtc);
         }
 
         private void UpdateMeshCoreNode(byte[] key, string name, Position position, uint lastHeard, byte type)

@@ -65,6 +65,11 @@ namespace MeshTerminal
         public Color BackgroundColor { get; set; } = Color.Black;
         public Color NormalTextColor { get; set; } = Color.Gray;
         public Color DaySeparatorColor { get; set; } = Color.DarkGray;
+        public Color SenderNameColor { get; set; } = Color.Gray;
+        public Color FailedStatusColor { get; set; } = Color.Red;
+        public Color TimestampColor { get; set; } = Color.Gray;
+        public Color SuccessfulStatusColor { get; set; } = Color.Green;
+        public Func<StoredMeshMessage, string> SenderLabel { get; set; }
 
         public void SetMessages(IEnumerable<StoredMeshMessage> messages, Func<StoredMeshMessage, string> formatter)
         {
@@ -128,6 +133,7 @@ namespace MeshTerminal
             var width = Math.Max(2, Bounds.Width);
             var height = Math.Max(0, Bounds.Height);
             var displayLines = BuildDisplayLines(width);
+            var displayStyles = BuildDisplayStyles(width);
             List<StoredMeshMessage> displayOwners;
             List<bool> displayStarts;
             BuildDisplayMetadata(width, out displayOwners, out displayStarts);
@@ -149,7 +155,7 @@ namespace MeshTerminal
                 var row = index - start;
                 var line = displayLines[index];
                 Move(0, row);
-                DrawMessageLine(line.Item1, line.Item2 ? OutgoingColor : IncomingColor, ref emojiIndex, HasFocus && displayStarts[index] && displayOwners[index] != null && _selectedMessageId == displayOwners[index].Id);
+                DrawMessageLine(line.Item1, line.Item2 ? OutgoingColor : IncomingColor, ref emojiIndex, HasFocus && displayStarts[index] && displayOwners[index] != null && _selectedMessageId == displayOwners[index].Id, displayStyles[index]);
             }
             if (displayLines.Count > height && height > 0)
             {
@@ -269,6 +275,23 @@ namespace MeshTerminal
             foreach (var line in _lines) AddWrappedLines(displayLines, line, width - 1);
             for (var blank = 0; blank < TrailingBlankLineCount; blank++) displayLines.Add(Tuple.Create("", false));
             return displayLines;
+        }
+
+        private List<List<ChatHeaderRange>> BuildDisplayStyles(int width)
+        {
+            var result = new List<List<ChatHeaderRange>>();
+            for (int index = 0; index < _lines.Count; index++)
+            {
+                var message = _messageItems[index];
+                var ranges = message == null ? new List<ChatHeaderRange>() : ChatHeaderStyles.Find(_lines[index].Item1,
+                    SenderLabel?.Invoke(message), message.Direction == MessageDirection.Outgoing && String.Equals(message.DeliveryStatus, "Failed", StringComparison.OrdinalIgnoreCase),
+                    message.Direction == MessageDirection.Outgoing && (String.Equals(message.DeliveryStatus, "Sent", StringComparison.OrdinalIgnoreCase) || String.Equals(message.DeliveryStatus, "Delivered", StringComparison.OrdinalIgnoreCase)));
+                var wrapped = new List<Tuple<string, bool>>(); AddWrappedLines(wrapped, _lines[index], width - 1);
+                int offset = 0;
+                foreach (var row in wrapped) { result.Add(ChatHeaderStyles.Clip(ranges, offset, row.Item1.Length)); offset += row.Item1.Length; }
+            }
+            for (int i = 0; i < TrailingBlankLineCount; i++) result.Add(new List<ChatHeaderRange>());
+            return result;
         }
 
         private void BuildDisplayMetadata(int width, out List<StoredMeshMessage> owners, out List<bool> starts)
@@ -441,7 +464,7 @@ namespace MeshTerminal
             if (handler != null) handler();
         }
 
-        private void DrawMessageLine(string text, Color messageColor, ref int emojiIndex, bool selectedTimestamp)
+        private void DrawMessageLine(string text, Color messageColor, ref int emojiIndex, bool selectedTimestamp, List<ChatHeaderRange> styles)
         {
             if (text.StartsWith(DaySeparatorPrefix, StringComparison.Ordinal))
             {
@@ -452,22 +475,38 @@ namespace MeshTerminal
             var timestampLength = GetTimestampLength(text);
             if (selectedTimestamp && timestampLength > 0)
             {
-                DrawText(text.Substring(0, timestampLength), messageColor, true);
+                DrawText(text.Substring(0, timestampLength), TimestampColor, true);
                 position = timestampLength;
             }
             while (position < text.Length)
             {
                 var emojiStart = text.IndexOf("[:", position, StringComparison.Ordinal);
-                if (emojiStart < 0) { DrawText(text.Substring(position), messageColor, false); break; }
-                if (emojiStart > position) DrawText(text.Substring(position, emojiStart - position), messageColor, false);
+                if (emojiStart < 0) { DrawStyledFragment(text, position, text.Length - position, messageColor, styles); break; }
+                if (emojiStart > position) DrawStyledFragment(text, position, emojiStart - position, messageColor, styles);
                 var emojiEnd = text.IndexOf(":]", emojiStart + 2, StringComparison.Ordinal);
-                if (emojiEnd < 0) { DrawText(text.Substring(emojiStart), messageColor, false); break; }
-                DrawText(text.Substring(emojiStart, emojiEnd - emojiStart + 2), EmojiTextColor, HasFocus && emojiIndex == _selectedEmojiIndex);
+                if (emojiEnd < 0) { DrawStyledFragment(text, emojiStart, text.Length - emojiStart, messageColor, styles); break; }
+                var emojiStyle = styles.FirstOrDefault(range => emojiStart >= range.Start && emojiStart < range.Start + range.Length);
+                DrawText(text.Substring(emojiStart, emojiEnd - emojiStart + 2), emojiStyle == null ? EmojiTextColor : HeaderColor(emojiStyle.Style), HasFocus && emojiIndex == _selectedEmojiIndex);
                 emojiIndex++;
                 position = emojiEnd + 2;
             }
         }
 
+
+        private Color HeaderColor(ChatHeaderStyle style)
+        { return style == ChatHeaderStyle.Timestamp ? TimestampColor : style == ChatHeaderStyle.Sender ? SenderNameColor : style == ChatHeaderStyle.SuccessfulStatus ? SuccessfulStatusColor : FailedStatusColor; }
+        private void DrawStyledFragment(string text, int start, int length, Color normal, List<ChatHeaderRange> styles)
+        {
+            int position = start, end = start + length;
+            foreach (var range in styles)
+            {
+                int left = Math.Max(start, range.Start), right = Math.Min(end, range.Start + range.Length);
+                if (right <= left) continue;
+                if (left > position) DrawText(text.Substring(position, left - position), normal, false);
+                DrawText(text.Substring(left, right - left), HeaderColor(range.Style), false); position = right;
+            }
+            if (position < end) DrawText(text.Substring(position, end - position), normal, false);
+        }
 
         private static int GetTimestampLength(string text)
         {
@@ -693,12 +732,17 @@ namespace MeshTerminal
         private static FrameView _nodeInfoFrame;
         private static FrameView _inputFrame;
         private static Label _messageCharacterCounter;
-        private const string MessageInputTitle = "New message [F5] emoji [F6]";
+        private const string MessageInputTitle = "New message [F5] insert [F6]";
         private static Label _logoText;
         private static readonly List<string> LogoFiles = new List<string>();
         private static int _logoIndex;
         private static DateTime _nextLogoChangeUtc;
         private static string[] _animatedLogoLines;
+        private static string _animatedLogoSource;
+        private static LogoActivityCycle _logoActivityCycle;
+        private static int _logoTrafficUiQueued, _logoPendingFrames, _logoPendingLoRa;
+        private static bool _logoFrameFlashActive;
+        private static DateTime _logoNextFrameFlashUtc;
         private static int _animatedLogoVerticalOffset;
         private static int _animatedLogoHorizontalOffset;
         private static int _animatedLogoVerticalDirection = 1;
@@ -721,6 +765,7 @@ namespace MeshTerminal
         private const string SharedMapPointPrefix = "///MAP+";
         private const string SharedMapPointDeletionPrefix = "///MAP-";
         private static bool _mapFollowGps;
+        private static bool _mapOpened;
         private static int _deviceTimeSyncActive;
         private static System.Windows.Forms.NotifyIcon _desktopNotificationIcon;
 
@@ -747,14 +792,19 @@ namespace MeshTerminal
             SubscribeMeshEvents();
             _store.MessageStored += message => { if (message.Kind == StoredMessageKind.Channel && message.ChannelIndex.HasValue && !(message.Direction == MessageDirection.Incoming && _mesh.Device.MyNode != null && message.FromNode == _mesh.Device.MyNode.MyNodeNum)) _telnetServers?.Publish(message.ChannelIndex.Value, serverSettings => FormatTelnetMessage(message, serverSettings), message.Direction == MessageDirection.Outgoing); };
 
+            _store.MessageStored += PublishMqttMessage;
+            _store.PositionStored += PublishMqttTelemetry;
             Application.Init();
             InitializeDesktopNotifications();
             BuildUi();
+            StartHostQrBridge();
             Task.Run(async () => { try { await RestartTelnetServersAsync(); } catch { } });
+            Task.Run(async () => { try { await RestartMqttClientsAsync(); } catch { } });
             // Start only after the first UI cycle so the waiting window can be drawn first.
             Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(500), delegate(MainLoop loop) { if (Volatile.Read(ref _shutdownStarted) == 0) StartConnect(); return false; });
             Application.Run(HandleTerminalGuiException);
             WriteShutdownLog("UI loop returned");
+            _hostQrBridge?.Dispose();
             RunShutdownStep("save settings", delegate { SaveMapViewState(); SaveNodeListState(); MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); });
             RunShutdownStep("wait for shutdown worker", EnsureShutdownCompleted);
             if (_mesh != null && Environment.OSVersion.Platform == PlatformID.Win32NT) RunShutdownStep("dispose mesh", _mesh.Dispose);
@@ -838,8 +888,8 @@ namespace MeshTerminal
         {
             if (Environment.OSVersion.Platform == PlatformID.Win32NT) return;
             var term = Environment.GetEnvironmentVariable("TERM");
-            if (String.Equals(term, "xterm", StringComparison.OrdinalIgnoreCase) || String.Equals(term, "xterm-color", StringComparison.OrdinalIgnoreCase))
-                Environment.SetEnvironmentVariable("TERM", "xterm-256color");
+            var normalized = UnixTerminalColors.Normalize(term, UnixTerminalColors.HasDefinition);
+            if (!String.Equals(term, normalized, StringComparison.Ordinal)) Environment.SetEnvironmentVariable("TERM", normalized);
 
         }
 
@@ -884,18 +934,21 @@ namespace MeshTerminal
             _mapMenu = new MenuBarItem("_Map", BuildMapMenuItems());
             var menu = new MenuBar(new[]
             {
-                new MenuBarItem("_Chats", new[] { new MenuItem("_Show chats", "", ShowChatPage), new MenuItem("_Refresh", "", RefreshChats), new MenuItem("_Send", "", SendCurrentMessage), new MenuItem("_Delete active chat", "", DeleteActiveChat) }),
+                new MenuBarItem("_Chats", new[] { new MenuItem("_Show chats", "", ShowChatPage), new MenuItem("_Refresh", "", RefreshChats), new MenuItem("_Send", "", SendCurrentMessage), new MenuItem("_Chess", "", ShowChessForCurrentChat), new MenuItem("_Delete active chat", "", DeleteActiveChat) }),
                 new MenuBarItem("_Nodes", new[] { new MenuItem("_Show nodes", "", ShowNodesPage), new MenuItem("_Copy node list", "", CopyNodeList), new MenuItem("_Create node", "", CreateNode), new MenuItem("_Refresh from device", "", RefreshNodesFromDevice), new MenuItem("_Delete all nodes", "", DeleteAllNodes) }),
                 _mapMenu,
                 new MenuBarItem("_Telemetry", new[] { new MenuItem("_Show telemetry", "", ShowAllTelemetry), new MenuItem("Request _MeshCore telemetry", "", RequestMeshCoreTelemetry), new MenuItem("_Delete current node telemetry", "", DeleteCurrentNodeTelemetry), new MenuItem("_Delete all telemetry", "", DeleteAllTelemetry) }),
                 new MenuBarItem("Mes_htastic", new[] { new MenuItem("Import channel _link", "", PasteMeshtasticChannelLink, () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("Import _contact link", "", () => PasteSharedContactLink(MeshProtocol.Meshtastic), () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("Edit _channels", "", ShowChannelEditor, () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("_Device info", "", ShowOwnDeviceInfo, () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("Own contact _QR", "", ShowOwnMeshtasticContact, () => _mesh.Protocol == MeshProtocol.Meshtastic), new MenuItem("Send _advert", "", SendNodeAnnouncement, () => _mesh.Protocol == MeshProtocol.Meshtastic) }),
                 new MenuBarItem("Mesh_Core", new[] { new MenuItem("Import contact _link", "", () => PasteSharedContactLink(MeshProtocol.MeshCore), () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("_Import channel link", "", PasteMeshCoreChannelLink, () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("Remove all device _contacts", "", RemoveAllMeshCoreDeviceContacts, () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("Edit _channels", "", ShowChannelEditor, () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("_Device info", "", ShowOwnDeviceInfo, () => _mesh.Protocol == MeshProtocol.MeshCore), new MenuItem("_Room Server login", "", ShowRoomLogin), new MenuItem("Send _advert", "", SendMeshCoreAdvert), new MenuItem("Own contact _QR", "", ShowOwnMeshCoreContact), new MenuItem("_Find repeaters", "", ShowMeshCoreRepeaterDiscovery), new MenuItem("Repeater _administration", "", ShowMeshCoreRepeaterAdmin) }),
                 new MenuBarItem("_Connection", new[] { new MenuItem("_Connect", "", StartConnect), new MenuItem("_Disconnect", "", Disconnect), new MenuItem("Connection _status", "", ShowConnectionStatus) }),
-                new MenuBarItem("_Settings", new[] { new MenuItem("_Connection settings", "", ShowSettings), new MenuItem("_Telemetry storage", "", ShowTelemetryStorageSettings), new MenuItem("_GPS position", "", ShowPositionSettings), new MenuItem("_Use device GPS", "", UseDeviceGps), new MenuItem("_Telegram Gateways", "", ShowTelegramGateways), new MenuItem("_Alerts", "", ShowAlertSettings), new MenuItem("_Appearance", "", ShowAppearanceSettings), new MenuItem("_Logo", "", ShowLogoSettings), new MenuItem("_Chat bots", "", ShowChatBots), new MenuItem("_HTTP bots", "", ShowHttpBots), new MenuItem("Telnet _Server", "", ShowTelnetServers) }),
-                new MenuBarItem("_Debug", new[] { new MenuItem("_Telegram gateway status", "", ShowTelegramGatewayStatus), new MenuItem("_Chat bot", "", ShowChatBotDebug), new MenuItem("_HTTP bot", "", ShowHttpBotDebug), new MenuItem("_Alert HTTP", "", ShowAlertHttpDebug), new MenuItem("Alert shell _command", "", ShowAlertProcessDebug), new MenuItem("Serial _COM log", "", ShowSerialComLog), new MenuItem("Device communication _log", "", ShowCommunicationLog), new MenuItem("_Delete current logo", "", DeleteCurrentLogo), new MenuItem("Telnet _Server status", "", ShowTelnetServerDebug) }),
-                new MenuBarItem("_Info", new[] { new MenuItem("_About", "", ShowInfo) }),
+                new MenuBarItem("_Settings", new[] { new MenuItem("_Connection settings", "", ShowSettings), new MenuItem("_Telemetry storage", "", ShowTelemetryStorageSettings), new MenuItem("_GPS position", "", ShowPositionSettings), new MenuItem("_Use device GPS", "", UseDeviceGps), new MenuItem("_Telegram Gateways", "", ShowTelegramGateways), new MenuItem("_Alerts", "", ShowAlertSettings), new MenuItem("_Appearance", "", ShowAppearanceSettings), new MenuItem("_Logo", "", ShowLogoSettings), new MenuItem("_Chat bots", "", ShowChatBots), new MenuItem("_HTTP bots", "", ShowHttpBots), new MenuItem("Telnet _Server", "", ShowTelnetServers), new MenuItem("_MQTT clients", "", ShowMqttClients) }),
+                new MenuBarItem("_Debug", new[] { new MenuItem("_Telegram gateway status", "", ShowTelegramGatewayStatus), new MenuItem("_Chat bot", "", ShowChatBotDebug), new MenuItem("_HTTP bot", "", ShowHttpBotDebug), new MenuItem("_Alert HTTP", "", ShowAlertHttpDebug), new MenuItem("Alert shell _command", "", ShowAlertProcessDebug), new MenuItem("Serial _COM log", "", ShowSerialComLog), new MenuItem("Device communication _log", "", ShowCommunicationLog), new MenuItem("_Delete current logo", "", DeleteCurrentLogo), new MenuItem("Telnet _Server status", "", ShowTelnetServerDebug), new MenuItem("_MQTT client status", "", ShowMqttStatus) }),
+                new MenuBarItem("_Info", new[] { new MenuItem("_Protocols", "", ShowProtocolDocuments), new MenuItem("_About", "", ShowInfo) }),
                 new MenuBarItem("_Quit", new[] { new MenuItem("_Exit", "", RequestQuit) })
             }) { Key = Key.F10 };
+            menu.Menus = menu.Menus.Where(item =>
+                (_mesh.Protocol == MeshProtocol.Meshtastic || item.Title.ToString().Replace("_", "") != "Meshtastic") &&
+                (_mesh.Protocol == MeshProtocol.MeshCore || item.Title.ToString().Replace("_", "") != "MeshCore")).ToArray();
             top.Add(menu);
             top.KeyPress += e =>
             {
@@ -947,7 +1000,8 @@ namespace MeshTerminal
                 }
                 else if (e.KeyEvent.Key == Key.F6)
                 {
-                    ShowEmojiPicker();
+                    ShowChatPage();
+                    ShowMessageInsertMenu();
                     e.Handled = true;
                 }
                 else if (e.KeyEvent.Key == Key.F10)
@@ -1059,9 +1113,10 @@ namespace MeshTerminal
             MainButtons.Add(chatInfo);
             chatInfo.Clicked += ShowCurrentChatNodeDetails;
             _nodeInfoFrame.Add(_header, _latestTelemetry, _nodeConnectionInfo, chatInfo);
-            _messagesFrame = new FrameView("Messages") { X = sidebarOuterWidth + 1, Y = Pos.Bottom(_nodeInfoFrame), Width = Dim.Fill(), Height = Dim.Fill(4) };
+            _messagesFrame = new FrameView("Messages") { X = sidebarOuterWidth + 1, Y = Pos.Bottom(_nodeInfoFrame), Width = Dim.Fill(), Height = Dim.Fill(5) };
             Frames.Add(_messagesFrame);
             _messages = new ChatTranscriptView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
+            _messages.SenderLabel = MessageSenderLabel;
             _messages.EmojiResolver = ResolveEmojiReplacement;
             _messages.EmojiActivated = ShowEmojiPreview;
             _messages.EmojiUnavailable = ShowEmojiUnavailable;
@@ -1069,18 +1124,21 @@ namespace MeshTerminal
             _messages.ScrollPositionChanged += UpdateMessageScrollPosition;
             _messages.SelectionChanged += ShowCurrentLogo;
             _messagesFrame.Add(_messages);
-            _inputFrame = new FrameView(MessageInputTitle) { X = sidebarOuterWidth + 1, Y = Pos.AnchorEnd(4), Width = Dim.Fill(10), Height = 4 };
+            _inputFrame = new FrameView(MessageInputTitle) { X = sidebarOuterWidth + 1, Y = Pos.AnchorEnd(5), Width = Dim.Fill(11), Height = 5 };
             Frames.Add(_inputFrame);
             _input = new MessageInputView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), WordWrap = true };
             _input.TextChanged += delegate { UpdateMessageCharacterCounter(); };
-            _input.KeyPress += e => { if (e.KeyEvent.Key == Key.F6) { ShowEmojiPicker(); e.Handled = true; } };
+            _input.KeyPress += e => { if (e.KeyEvent.Key == Key.F6) { ShowMessageInsertMenu(); e.Handled = true; } };
             _inputFrame.Add(_input);
             _messageCharacterCounter = new Label("") { X = Pos.Right(_inputFrame) - 1, Y = Pos.Top(_inputFrame), Width = 0 };
             UpdateMessageCharacterCounter();
-            var send = new Button("Send") { X = Pos.AnchorEnd(9), Y = Pos.AnchorEnd(2) };
+            var send = new Button("Send") { X = Pos.AnchorEnd(10), Y = Pos.AnchorEnd(4) };
+            var insert = new Button("Insert") { X = Pos.AnchorEnd(10), Y = Pos.AnchorEnd(2) };
+            insert.Clicked += ShowMessageInsertMenu;
             MainButtons.Add(send);
+            MainButtons.Add(insert);
             send.Clicked += SendCurrentMessage;
-            _chatPage.Add(_logoFrame, _channelsFrame, _directChatsFrame, _nodeInfoFrame, _messagesFrame, _inputFrame, _messageCharacterCounter, send);
+            _chatPage.Add(_logoFrame, _channelsFrame, _directChatsFrame, _nodeInfoFrame, _messagesFrame, _inputFrame, _messageCharacterCounter, send, insert);
             top.Add(_chatPage);
 
             _nodesPage = new Window("Nodes") { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1), Visible = false };
@@ -1109,6 +1167,7 @@ namespace MeshTerminal
             _nodeSearch.TextChanged += delegate { SaveNodeListState(); RefreshNodePage(); };
             _nodeScrollInfo = new Label("") { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill() };
             nodeListFrame.Add(_nodeList);
+            ListViewScrollBar.Attach(_nodeList);
             _nodesPage.Add(nodeListFrame, favoriteFilter, _sortButton, _nodeSortDirectionButton, contactFilter, searchLabel, _nodeSearch, _nodeScrollInfo);
             top.Add(_nodesPage);
 
@@ -1207,9 +1266,10 @@ namespace MeshTerminal
             _mesh.ConnectionStateChanged += delegate(object sender, ConnectionStateChangedEventArgs e) { if (e.State == ConnectionState.Disconnected) Interlocked.Exchange(ref _deviceTimeSyncActive, 0); Ui(UpdateStatus); };
             _mesh.ConfirmSynchronizationRetryAsync = ConfirmSynchronizationRetryAsync;
             _mesh.SynchronizationProgress += (sender, e) => Ui(() => { if (_connectionAttemptCancellation != null || _manualNodeRefreshCancellation != null) ShowConnectionProgress(e.Text); });
-            _mesh.CommunicationFrame += (sender, frame) => DeviceCommunicationLog.Add(frame);
+            _mesh.CommunicationFrame += (sender, frame) => { DeviceCommunicationLog.Add(frame); QueueLogoTraffic(frame); };
             _mesh.SerialTraffic += delegate(object sender, SerialTrafficEventArgs e) { WriteSerialComLog(e); };
             _mesh.DeviceInfoUpdated += delegate { TrySynchronizeDeviceTime(); Ui(delegate { UpdateStatus(); UpdateChatPageTitle(); UpdateMapGpsPosition(); }); };
+            _mesh.NodeAnnouncementReceived += (sender, e) => PublishMqttAnnouncement(e);
             _mesh.NodeDiscovered += delegate(object sender, NodeEventArgs e) { if (Volatile.Read(ref _bufferNodeSynchronization) != 0) return; Save(delegate { _store.AddOrUpdateNode(e.Node); Ui(QueueNodePageRefresh); }, "node:" + e.Node.Number.ToString(CultureInfo.InvariantCulture)); };
             _mesh.NodeUpdated += delegate(object sender, NodeEventArgs e) { if (Volatile.Read(ref _bufferNodeSynchronization) != 0) return; Save(delegate { _store.AddOrUpdateNode(e.Node); Ui(QueueNodePageRefresh); }, "node:" + e.Node.Number.ToString(CultureInfo.InvariantCulture)); };
             _mesh.MeshCoreDeviceContactsChanged += delegate { Ui(() => { QueueNodePageRefresh(); }); };
@@ -1225,16 +1285,18 @@ namespace MeshTerminal
                     if (!ownEcho) ReceiveLocPosition(e.Message, receivedPositionUtc);
                     if (!ownEcho) NotifyAlertStateChanged(e.Message);
                     RefreshChatsUi();
+                    Ui(() => _refreshChessDialog?.Invoke());
                 });
                 if (!ownEcho) TryReceiveSharedMapPoint(e.Message);
                 if (!ownEcho) Task.Run(async delegate { await RunMatchingChatBotsAsync(e.Message); await RunMatchingHttpBotsAsync(e.Message); });
             };
             _mesh.MessageDeliveryChanged += delegate(object sender, MessageDeliveryEventArgs e)
             {
-                Save(delegate { _store.UpdateDeliveryStatus(e.PacketId, e.State, e.Error == Meshtastic.Protobufs.Routing.Types.Error.None ? null : e.Error.ToString()); Ui(ShowSelectedChat); });
+                Save(delegate { _store.UpdateDeliveryStatus(e.PacketId, e.State, e.Error == Meshtastic.Protobufs.Routing.Types.Error.None ? null : e.Error.ToString(), e.Detail); Ui(ShowSelectedChat); });
             };
             _mesh.TelemetryReceived += delegate(object sender, MeshTelemetryEventArgs e)
             {
+                if (_mqttClients?.HasTelemetryClients == true) PublishMqttTelemetry(MqttTelemetry.From(e.Telemetry));
                 if (!_settings.StoreTelemetryData) return;
                 Save(delegate
                 {
@@ -1243,25 +1305,42 @@ namespace MeshTerminal
                     RefreshTelemetryViews(e.Telemetry.From);
                 });
             };
+            _mesh.MeshCoreRepeaterStatusReceived += status =>
+            {
+                if (_mqttClients?.HasTelemetryClients == true) PublishMqttTelemetry(MqttTelemetry.From(status));
+                if (!_settings.StoreTelemetryData) return;
+                Save(() =>
+                {
+                    if (_settings.StoreTelemetryFavoritesOnly && !IsFavoriteNode(status.NodeNumber)) return;
+                    _store.AddMeshCoreRepeaterStatus(status);
+                    RefreshTelemetryViews(status.NodeNumber);
+                });
+            };
             _mesh.MeshCorePositionReceived += delegate(object sender, MeshCorePositionEventArgs e)
             {
+                if (_mqttClients?.HasTelemetryClients == true) PublishMqttTelemetry(MqttTelemetry.From(e.NodeNumber, e.Position, e.ReceivedUtc));
                 if (!_settings.StorePositionData) return;
                 Save(delegate
                 {
                     if (_settings.StorePositionFavoritesOnly && !IsFavoriteNode(e.NodeNumber)) return;
-                    _store.AddPosition(e.NodeNumber, e.Position, e.ReceivedUtc);
+                    _store.AddPosition(e.NodeNumber, e.Position, e.ReceivedUtc, false);
                     RefreshTelemetryViews(e.NodeNumber, true);
                 });
             };
             _mesh.PacketReceived += delegate(object sender, PacketEventArgs e)
             {
-                if (!_settings.StorePositionData || e.Packet.PayloadVariantCase != Meshtastic.Protobufs.MeshPacket.PayloadVariantOneofCase.Decoded || e.Packet.Decoded.Portnum != Meshtastic.Protobufs.PortNum.PositionApp) return;
+                if (e.Packet.PayloadVariantCase != Meshtastic.Protobufs.MeshPacket.PayloadVariantOneofCase.Decoded || e.Packet.Decoded.Portnum != Meshtastic.Protobufs.PortNum.PositionApp) return;
                 var receivedAtUtc = DateTime.UtcNow;
+                if (_mqttClients?.HasTelemetryClients == true)
+                {
+                    try { PublishMqttTelemetry(MqttTelemetry.From(e.Packet.From, Meshtastic.Protobufs.Position.Parser.ParseFrom(e.Packet.Decoded.Payload), receivedAtUtc)); } catch { }
+                }
+                if (!_settings.StorePositionData) return;
                 Save(delegate
                 {
                     if (_settings.StorePositionFavoritesOnly && !IsFavoriteNode(e.Packet.From)) return;
                     var position = Meshtastic.Protobufs.Position.Parser.ParseFrom(e.Packet.Decoded.Payload);
-                    _store.AddPosition(e.Packet.From, position, receivedAtUtc);
+                    _store.AddPosition(e.Packet.From, position, receivedAtUtc, false);
                     RefreshTelemetryViews(e.Packet.From, true);
                 });
             };
@@ -1624,27 +1703,20 @@ namespace MeshTerminal
             RefreshChats();
         }
 
+        private static string MessageSenderLabel(StoredMeshMessage message)
+        { return message.Direction == MessageDirection.Outgoing ? "You" : (String.IsNullOrEmpty(message.SenderName) ? DisplayNodeName(message.FromNode.GetValueOrDefault()) : message.SenderName); }
+
         private static string FormatMessage(StoredMeshMessage m)
         {
             var who = m.Direction == MessageDirection.Outgoing ? "You" : (String.IsNullOrEmpty(m.SenderName) ? DisplayNodeName(m.FromNode.GetValueOrDefault()) : m.SenderName);
-            var delivery = m.Direction == MessageDirection.Outgoing && !String.IsNullOrEmpty(m.DeliveryStatus) ? " [" + m.DeliveryStatus + "]" : "";
+            var delivery = m.Direction == MessageDirection.Outgoing && !String.IsNullOrEmpty(m.DeliveryStatus) ? " [" + m.DeliveryStatus + (String.IsNullOrEmpty(m.DeliveryDetail) ? "" : " | " + m.DeliveryDetail) + "]" : "";
             var timePrefix = "[" + m.OccurredUtc.ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture) + "] ";
             return timePrefix + who + delivery + ": " + ConvertEmojiForTerminal(m.Text ?? "").Replace("\r\n", "\n").Replace("\n", "\n" + new string(' ', timePrefix.Length));
         }
 
         private static string ConvertEmojiForTerminal(string text)
         {
-            var result = new StringBuilder();
-            var elements = StringInfo.GetTextElementEnumerator(text);
-            while (elements.MoveNext())
-            {
-                var element = (string)elements.Current;
-                string replacement;
-                if (EmojiReplacements.TryGetValue(element, out replacement)) result.Append(replacement);
-                else if (ContainsEmoji(element)) result.Append("[:emoji:]");
-                else result.Append(element);
-            }
-            return result.ToString();
+            return MapSymbolCatalog.ConvertMessage(ChessPresentation.Notation(text, _settings != null && _settings.ChessUseLetters), EmojiReplacements, ContainsEmoji);
         }
 
         private static void LoadEmojiReplacements()
@@ -1792,10 +1864,11 @@ namespace MeshTerminal
             search.TextChanged += delegate { refresh(); };
             list.SelectedItemChanged += delegate { updatePreview(); };
             refresh();
+            string chosenEmoji = null;
             Action insert = delegate
             {
                 if (list.SelectedItem < 0 || list.SelectedItem >= visibleEntries.Count) return;
-                InsertEmojiIntoMessage(visibleEntries[list.SelectedItem].Value);
+                chosenEmoji = visibleEntries[list.SelectedItem].Value;
                 Application.RequestStop();
             };
             list.KeyPress += e => { if (e.KeyEvent.Key == Key.Enter) { insert(); e.Handled = true; } };
@@ -1808,6 +1881,7 @@ namespace MeshTerminal
             dialog.AddButton(insertButton);
             dialog.AddButton(cancel);
             Application.Run(dialog, HandleTerminalGuiException);
+            if (chosenEmoji != null) InsertEmojiIntoMessage(chosenEmoji);
             _input.SetFocus();
         }
 
@@ -1840,6 +1914,7 @@ namespace MeshTerminal
             details.AppendLine("RSSI: " + (message.ReceivedRssi.HasValue ? message.ReceivedRssi.Value.ToString(CultureInfo.InvariantCulture) + " dBm" : "not available"));
             details.AppendLine("SNR: " + (message.ReceivedSnr.HasValue ? message.ReceivedSnr.Value.ToString("F1", CultureInfo.InvariantCulture) + " dB" : "not available"));
             details.AppendLine("Delivery status: " + (String.IsNullOrEmpty(message.DeliveryStatus) ? "-" : message.DeliveryStatus));
+            details.AppendLine("Send attempts: " + (String.IsNullOrEmpty(message.DeliveryDetail) ? "-" : message.DeliveryDetail));
             details.AppendLine("Delivery error: " + (String.IsNullOrEmpty(message.DeliveryError) ? "-" : message.DeliveryError));
             details.AppendLine("Unread: " + message.IsNew);
             details.AppendLine("Latitude: " + (message.Latitude.HasValue ? message.Latitude.Value.ToString("F6", CultureInfo.InvariantCulture) : "-"));
@@ -1860,6 +1935,7 @@ namespace MeshTerminal
             senderChat.Clicked += delegate { senderAction = 2; Application.RequestStop(); };
             showOnMap.Clicked += delegate { senderAction = 3; Application.RequestStop(); };
             var deleted = false;
+            var resendRequested = false;
             var copy = new Button("Copy message");
             copy.Clicked += delegate
             {
@@ -1878,11 +1954,19 @@ namespace MeshTerminal
             var close = new Button("Close", true);
             close.Clicked += delegate { Application.RequestStop(); };
             dialog.Add(view, senderButtons);
+            if (MessageResend.CanRetry(message))
+            {
+                var resend = new Button("Resend") { X = Pos.Center(), Y = Pos.AnchorEnd(4), Enabled = !ResendingMessages.Contains(message.Id) };
+                resend.Clicked += () => { resendRequested = true; Application.RequestStop(); };
+                dialog.Add(resend);
+                view.Height = Dim.Fill(5);
+            }
             dialog.AddButton(copy);
             dialog.AddButton(copyChat);
             dialog.AddButton(delete);
             dialog.AddButton(close);
             Application.Run(dialog, HandleTerminalGuiException);
+            if (resendRequested) ResendFailedMessage(message);
             if (deleted)
             {
                 NotifyAlertStateChanged(null);
@@ -1895,33 +1979,12 @@ namespace MeshTerminal
                 var sender = _store.GetNodes(StoredNodeSort.Name).FirstOrDefault(node => node.NodeNumber == number);
                 if (senderAction == 1)
                 {
-                    if (sender == null && _mesh.Protocol == MeshProtocol.MeshCore && message.Kind == StoredMessageKind.Channel && !String.IsNullOrWhiteSpace(message.SenderName))
-                    {
-                        var candidates = _store.GetNodes(StoredNodeSort.Name).Where(n =>
-                            n.NodeId != null && n.NodeId.Length == 64 && n.NodeId.All(Uri.IsHexDigit) &&
-                            String.Equals(n.LongName, message.SenderName, StringComparison.Ordinal)).ToList();
-                        if (candidates.Count == 1) sender = candidates[0];
-                        else if (candidates.Count > 1)
-                        {
-                            var chooser = new Dialog("Select sender: " + message.SenderName, 90, 17);
-                            var choices = new ListView(candidates.Select(n => n.LongName + " | " + MeshCoreNodeType(n) + " | " + n.NodeId).ToList())
-                            { X = 1, Y = 1, Width = Dim.Fill(2), Height = Dim.Fill(3) };
-                            var open = new Button("Open");
-                            Action choose = () => { if (choices.SelectedItem >= 0 && choices.SelectedItem < candidates.Count) { sender = candidates[choices.SelectedItem]; Application.RequestStop(); } };
-                            open.Clicked += choose; choices.OpenSelectedItem += args => choose();
-                            var cancel = new Button("Cancel"); cancel.Clicked += () => Application.RequestStop();
-                            chooser.Add(choices); chooser.AddButton(open); chooser.AddButton(cancel);
-                            Application.Run(chooser, HandleTerminalGuiException);
-                            if (sender == null) return;
-                        }
-                    }
-                    if (sender != null) ShowNodeDetails(sender);
-                    else MessageBox.Query("Sender details", "Node: !" + number.ToString("x8") + "\nNo stored node details are available for this sender.", "OK");
+                    ShowMessageSenderDetails(message);
                 }
                 else if (senderAction == 2)
                 {
-                    _selected = new ChatItem { Kind = ChatKind.Direct, Id = number, Name = sender == null || String.IsNullOrWhiteSpace(sender.LongName) ? "!" + number.ToString("x8") : sender.LongName };
-                    ShowChatPage(); ShowSelectedChat(); _input.SetFocus();
+                    var recipient = ResolveMessageSender(message);
+                    if (recipient != null) StartChatForNode(recipient);
                 }
                 else
                 {
@@ -1963,7 +2026,7 @@ namespace MeshTerminal
         private static string FormatMessageForClipboard(StoredMeshMessage message)
         {
             var who = message.Direction == MessageDirection.Outgoing ? "You" : (String.IsNullOrEmpty(message.SenderName) ? DisplayNodeName(message.FromNode.GetValueOrDefault()) : message.SenderName);
-            var delivery = message.Direction == MessageDirection.Outgoing && !String.IsNullOrEmpty(message.DeliveryStatus) ? " [" + message.DeliveryStatus + "]" : "";
+            var delivery = message.Direction == MessageDirection.Outgoing && !String.IsNullOrEmpty(message.DeliveryStatus) ? " [" + message.DeliveryStatus + (String.IsNullOrEmpty(message.DeliveryDetail) ? "" : " | " + message.DeliveryDetail) + "]" : "";
             var prefix = "[" + message.OccurredUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) + "] " + who + delivery + ": ";
             return prefix + (message.Text ?? "").Replace("\r\n", "\n").Replace("\r", "\n").Replace("\n", Environment.NewLine + new string(' ', prefix.Length));
         }
@@ -2028,15 +2091,9 @@ namespace MeshTerminal
         }
         private static void InsertEmojiIntoMessage(string emoji)
         {
-            var text = _input.Text.ToString().Replace("\r\n", "\n");
-            var cursor = _input.CursorPosition;
-            var lines = text.Split('\n');
-            var row = Math.Max(0, Math.Min(cursor.Y, lines.Length - 1));
-            var column = Math.Max(0, Math.Min(cursor.X, lines[row].Length));
-            var index = column;
-            for (var line = 0; line < row; line++) index += lines[line].Length + 1;
-            _input.Text = text.Insert(index, emoji);
-            _input.CursorPosition = new Point(column + emoji.Length, row);
+            if (_input == null || String.IsNullOrEmpty(emoji)) return;
+            MessageTextInsertion.Insert(_input, emoji);
+            UpdateMessageCharacterCounter();
         }
 
         private static void SendCurrentMessage()
@@ -2056,7 +2113,7 @@ namespace MeshTerminal
                     uint packetId = chat.Kind == ChatKind.Channel ? await _mesh.SendTextToChannelWithIdAsync((int)chat.Id, text) : await _mesh.SendTextWithIdAsync(chat.Id, text);
                     _store.AddOutgoing(packetId, _mesh.Device.MyNode == null ? 0u : _mesh.Device.MyNode.MyNodeNum, chat.Kind == ChatKind.Channel ? UInt32.MaxValue : chat.Id, text, chat.Kind == ChatKind.Channel ? (int?)chat.Id : null, chat.Kind == ChatKind.Channel ? chat.Name : null);
                     var delivery = _mesh.GetMessageDelivery(packetId);
-                    if (delivery != null) _store.UpdateDeliveryStatus(packetId, delivery.State);
+                    if (delivery != null) _store.UpdateDeliveryStatus(packetId, delivery.State, detail: delivery.Detail);
                     Ui(delegate { _input.Text = ""; RefreshChats(); _input.SetFocus(); });
                 }
                 catch (Exception ex) { Ui(delegate { MessageBox.ErrorQuery("Send failed", ex.Message, "OK"); }); }
@@ -2149,6 +2206,14 @@ namespace MeshTerminal
             _nodeMap.SetData(_store.GetNodes(StoredNodeSort.Name), _mesh.Device.Latitude, _mesh.Device.Longitude);
             RefreshMapOverlays();
             if (savedLatitude.HasValue && savedLongitude.HasValue) _nodeMap.RestoreView(savedLatitude.Value, savedLongitude.Value, savedScale);
+            if (!_mapOpened)
+            {
+                var latitude = _mesh.Device.Latitude; var longitude = _mesh.Device.Longitude;
+                if (latitude.HasValue && longitude.HasValue && !Double.IsNaN(latitude.Value) && !Double.IsNaN(longitude.Value) &&
+                    latitude.Value >= -90 && latitude.Value <= 90 && longitude.Value >= -180 && longitude.Value <= 180)
+                    _nodeMap.CenterOn(latitude.Value, longitude.Value);
+                _mapOpened = true;
+            }
             SaveMapViewState();
             _chatPage.Visible = false; _nodesPage.Visible = false; _telemetryPage.Visible = false; _mapPage.Visible = true;
             _nodeMap.SetFocus();
@@ -2723,46 +2788,12 @@ namespace MeshTerminal
                 colorCode.ToString("x", CultureInfo.InvariantCulture) + "|" + shapeCode.ToString(CultureInfo.InvariantCulture) + "|" + point.EffectiveFillDensity.ToString(CultureInfo.InvariantCulture) + "|" +
                 EncodeSharedMapText(point.ShortName) + "|" + EncodeSharedMapText(point.Description) + "|" + EncodeSharedMapText(point.FillSymbol) + "|" +
                 (point.ReferenceLatitude.HasValue ? FormatSharedMapCoordinate(point.ReferenceLatitude.Value) : "") + "|" +
-                (point.ReferenceLongitude.HasValue ? FormatSharedMapCoordinate(point.ReferenceLongitude.Value) : "");
+                (point.ReferenceLongitude.HasValue ? FormatSharedMapCoordinate(point.ReferenceLongitude.Value) : "") + "|" +
+                (point.Priority.HasValue ? point.Priority.Value.ToString(CultureInfo.InvariantCulture) : "");
         }
 
         private static bool TryParseSharedMapPoint(string text, out MapOverlayPoint point)
-        {
-            point = null;
-            if (String.IsNullOrWhiteSpace(text) || !text.StartsWith(SharedMapPointPrefix, StringComparison.Ordinal)) return false;
-            var parts = text.Substring(SharedMapPointPrefix.Length).Split('|');
-            Guid uuid;
-            double latitude, longitude;
-            if (parts.Length != 12 || parts[0] != "1") return false;
-            if (!Guid.TryParse(parts[1], out uuid) ||
-                !Double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out latitude) ||
-                !Double.TryParse(parts[3], NumberStyles.Float, CultureInfo.InvariantCulture, out longitude) ||
-                latitude < -90d || latitude > 90d || longitude < -180d || longitude > 180d) return false;
-            try
-            {
-                int colorCode, shapeCode, fillDensity;
-                if (!Int32.TryParse(parts[4], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out colorCode) || colorCode < 0 || colorCode > 15 || !Int32.TryParse(parts[5], out shapeCode) || shapeCode < 0 || shapeCode > 3 || !Int32.TryParse(parts[6], out fillDensity) || fillDensity < 0 || fillDensity > 9) return false;
-                var colors = new[] { "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Brown", "Gray", "DarkGray", "BrightBlue", "BrightGreen", "BrightCyan", "BrightRed", "BrightMagenta", "BrightYellow", "White" };
-                var shapes = new[] { "Point", "Line", "Rectangle", "Circle" };
-                var name = DecodeSharedMapText(parts[7]).Trim();
-                if (String.IsNullOrWhiteSpace(name)) return false;
-                point = new MapOverlayPoint
-                {
-                    Uuid = uuid.ToString("D"), Latitude = latitude, Longitude = longitude,
-                    Color = colors[colorCode], Shape = shapes[shapeCode], Filled = fillDensity > 0, FillDensity = fillDensity,
-                    ShortName = name, Description = DecodeSharedMapText(parts[8]).Trim(), FillSymbol = DecodeSharedMapText(parts[9])
-                };
-                if (point.Shape != "Point")
-                {
-                    double referenceLatitude, referenceLongitude;
-                    if (Double.TryParse(parts[10], NumberStyles.Float, CultureInfo.InvariantCulture, out referenceLatitude) && Double.TryParse(parts[11], NumberStyles.Float, CultureInfo.InvariantCulture, out referenceLongitude) && referenceLatitude >= -90d && referenceLatitude <= 90d && referenceLongitude >= -180d && referenceLongitude <= 180d)
-                    { point.ReferenceLatitude = referenceLatitude; point.ReferenceLongitude = referenceLongitude; }
-                    else return false;
-                }
-                return true;
-            }
-            catch { return false; }
-        }
+        { return SharedMapObjectProtocol.TryParse(text, out point); }
 
         private static string FormatMapPointCreator(uint nodeNumber)
         {
@@ -2791,6 +2822,7 @@ namespace MeshTerminal
             {
                 if (!_settings.Map.ReceivePositionMarkers) return;
                 var receivedUtc = DateTime.UtcNow;
+                if (_mqttClients?.HasTelemetryClients == true) PublishMqttTelemetry(MqttTelemetry.From(position.NodeNumber, new Meshtastic.Protobufs.Position { LatitudeI = (int)Math.Round(position.Latitude * 10000000d), LongitudeI = (int)Math.Round(position.Longitude * 10000000d) }, receivedUtc));
                 Save(delegate
                 {
                     if (_settings.StorePositionData && (!_settings.StorePositionFavoritesOnly || IsFavoriteNode(position.NodeNumber)))
@@ -2799,7 +2831,7 @@ namespace MeshTerminal
                         {
                             LatitudeI = (int)Math.Round(position.Latitude * 10000000d),
                             LongitudeI = (int)Math.Round(position.Longitude * 10000000d)
-                        }, receivedUtc);
+                        }, receivedUtc, false);
                         RefreshTelemetryViews(position.NodeNumber, true);
                     }
                 });
@@ -2850,15 +2882,15 @@ namespace MeshTerminal
 
         private static void ShowMapPointSymbolPicker(TextField shortName)
         {
-            var symbols = new[]
-            {
-                "␀", "☺", "☻", "♥", "♦", "♣", "♠", "•", "◘", "○", "◙", "♂", "♀", "♪", "♫", "☼",
-                "►", "◄", "↕", "‼", "¶", "§", "▬", "↨", "↑", "↓", "→", "←", "∟", "↔", "▲", "▼"
-            };
-            symbols = symbols.Concat(new[] { "\u2302" })
-                .Concat(Enumerable.Range(0x2295, 0x22A1 - 0x2295 + 1).Select(code => Char.ConvertFromUtf32(code)))
-                .Concat(Enumerable.Range(0x29E8, 0x29F3 - 0x29E8 + 1).Select(code => Char.ConvertFromUtf32(code))).ToArray();
-            var labels = symbols.Select((symbol, index) => index.ToString("00", CultureInfo.InvariantCulture) + "   " + symbol +
+            var selected = SelectMapPointSymbol();
+            if (selected != null) shortName.Text = selected;
+            shortName.SetFocus();
+        }
+        private static string SelectMapPointSymbol()
+        {
+            string selected = null;
+            var symbols = MapSymbolCatalog.Symbols;
+            var labels = symbols.Select((symbol, index) => index.ToString("00", CultureInfo.InvariantCulture) + "   " + MapSymbolCatalog.Display(symbol) +
                 "   U+" + Char.ConvertToUtf32(symbol, 0).ToString("X4", CultureInfo.InvariantCulture)).ToList();
             var dialog = new Dialog("Map point symbol", 54, 19);
             var list = new ListView(labels) { X = 2, Y = 3, Width = 30, Height = 10 };
@@ -2869,13 +2901,13 @@ namespace MeshTerminal
             select.Clicked += delegate
             {
                 if (list.SelectedItem < 0 || list.SelectedItem >= symbols.Length) return;
-                shortName.Text = symbols[list.SelectedItem];
+                selected = symbols[list.SelectedItem];
                 Application.RequestStop();
             };
             var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
             dialog.AddButton(select); dialog.AddButton(cancel);
             Application.Run(dialog, HandleTerminalGuiException);
-            shortName.SetFocus();
+            return selected;
         }
 
         private static void CreateMapOverlayPoint(double latitudeValue, double longitudeValue)
@@ -2884,6 +2916,9 @@ namespace MeshTerminal
             if (writableFiles.Count == 0) { MessageBox.Query("New map point", "Create or unlock a map XML file first.", "OK"); return; }
             var dialog = new Dialog("New map item", 92, 29);
             var pendingUuid = Guid.NewGuid().ToString("D");
+            if (_settings.Map == null) _settings.Map = new MeshtasticMapSettings();
+            var previousPriority = _settings.Map.MapItemPriority;
+            var priority = new TextField(previousPriority.ToString(CultureInfo.InvariantCulture)) { X = 16, Y = 17, Width = 24 };
             var latitude = new TextField(latitudeValue.ToString("F6", CultureInfo.InvariantCulture)) { X = 16, Y = 1, Width = 22 };
             var longitude = new TextField(longitudeValue.ToString("F6", CultureInfo.InvariantCulture)) { X = 16, Y = 2, Width = 22 };
             var files = new ListView(writableFiles.Select(file => file.DisplayName + " (" + Path.GetFileName(file.FileName) + ")").ToList()) { X = 16, Y = 4, Width = 38, Height = 5 };
@@ -2912,7 +2947,8 @@ namespace MeshTerminal
                 var selectedColor = color.SelectedItem >= 0 && color.SelectedItem < colorNames.Length ? colorNames[color.SelectedItem] : "Green";
                 double currentLatitude, currentLongitude; if (!TryParseCoordinate(latitude.Text.ToString(), out currentLatitude)) currentLatitude = latitudeValue; if (!TryParseCoordinate(longitude.Text.ToString(), out currentLongitude)) currentLongitude = longitudeValue;
                 int density; if (!Int32.TryParse(fillDensity.Text.ToString(), out density)) density = 0;
-                var previewPoint = new MapOverlayPoint { Uuid = pendingUuid, Shape = selectedShape, Filled = density > 0, FillDensity = density, Latitude = currentLatitude, Longitude = currentLongitude, ReferenceLatitude = selectedShape != "Point" && _nodeMap.HasMeasurementPoint ? (double?)_nodeMap.MeasurementLatitude : null, ReferenceLongitude = selectedShape != "Point" && _nodeMap.HasMeasurementPoint ? (double?)_nodeMap.MeasurementLongitude : null, Color = selectedColor, ShortName = shortName.Text.ToString().Trim(), Description = description.Text.ToString().Trim(), FillSymbol = fillSymbol.Text.ToString() };
+                long currentPriority; if (!Int64.TryParse(priority.Text.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out currentPriority)) currentPriority = _settings.Map.MapItemPriority;
+                var previewPoint = new MapOverlayPoint { Priority = currentPriority, Uuid = pendingUuid, Shape = selectedShape, Filled = density > 0, FillDensity = density, Latitude = currentLatitude, Longitude = currentLongitude, ReferenceLatitude = selectedShape != "Point" && _nodeMap.HasMeasurementPoint ? (double?)_nodeMap.MeasurementLatitude : null, ReferenceLongitude = selectedShape != "Point" && _nodeMap.HasMeasurementPoint ? (double?)_nodeMap.MeasurementLongitude : null, Color = selectedColor, ShortName = shortName.Text.ToString().Trim(), Description = description.Text.ToString().Trim(), FillSymbol = fillSymbol.Text.ToString() };
                 if (selectedShape == "Circle" && _nodeMap.HasMeasurementPoint)
                 {
                     previewPoint.ReferenceLatitude = currentLatitude; previewPoint.ReferenceLongitude = currentLongitude;
@@ -2927,6 +2963,7 @@ namespace MeshTerminal
                 remaining.Text = _mesh.Protocol + " message: " + Math.Abs(available).ToString(CultureInfo.InvariantCulture) + (available >= 0 ? " bytes remaining" : " bytes over limit");
                 remaining.SetNeedsDisplay();
             };
+            priority.TextChanged += delegate { long value; if (Int64.TryParse(priority.Text.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value)) _settings.Map.MapItemPriority = value; updateRemaining(); };
             latitude.TextChanged += delegate { updateRemaining(); }; longitude.TextChanged += delegate { updateRemaining(); }; shortName.TextChanged += delegate { updateRemaining(); }; description.TextChanged += delegate { updateRemaining(); }; description.ContentsChanged += delegate { updateRemaining(); }; fillDensity.TextChanged += delegate { updateRemaining(); }; fillSymbol.TextChanged += delegate { updateRemaining(); }; shape.SelectedItemChanged += delegate { updateRemaining(); }; color.SelectedItemChanged += delegate { updateRemaining(); };
             dialog.Add(new Label("Latitude:") { X = 1, Y = 1 }, latitude,
                 new Label("Longitude:") { X = 1, Y = 2 }, longitude,
@@ -2937,6 +2974,7 @@ namespace MeshTerminal
                 new Label("Fill density:") { X = 1, Y = 14 }, fillDensity, new Label("(0-9)") { X = 21, Y = 14 },
                 new Label("Fill symbol:") { X = 1, Y = 15 }, fillSymbol, selectFillSymbol,
                 new Label("Short name:") { X = 1, Y = 16 }, shortName, selectSymbol,
+                new Label("Priority:") { X = 1, Y = 17 }, priority,
                 new Label("Description:") { X = 1, Y = 18 }, description,
                 remaining, sendPoint);
             updateRemaining();
@@ -2951,6 +2989,8 @@ namespace MeshTerminal
                 if (color.SelectedItem < 0 || color.SelectedItem >= colorNames.Length) { MessageBox.ErrorQuery("New map point", "Select a color.", "OK"); return; }
                 if (shape.SelectedItem < 0 || shape.SelectedItem >= shapeNames.Length) { MessageBox.ErrorQuery("New map item", "Select a shape.", "OK"); return; }
                 if (shape.SelectedItem > 0 && !_nodeMap.HasMeasurementPoint) { MessageBox.ErrorQuery("New map item", "Press M on the map first to set the second reference point.", "OK"); return; }
+                long parsedPriority;
+                if (!Int64.TryParse(priority.Text.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out parsedPriority)) { MessageBox.ErrorQuery("New map item", "Enter a valid whole-number priority.", "OK"); return; }
                 int parsedFillDensity;
                 if (!Int32.TryParse(fillDensity.Text.ToString(), out parsedFillDensity) || parsedFillDensity < 0 || parsedFillDensity > 9) { MessageBox.ErrorQuery("New map item", "Enter a fill density from 0 to 9.", "OK"); return; }
                 if (parsedFillDensity > 0 && (String.IsNullOrEmpty(fillSymbol.Text.ToString()) || new StringInfo(fillSymbol.Text.ToString()).LengthInTextElements != 1)) { MessageBox.ErrorQuery("New map item", "Select exactly one fill symbol.", "OK"); return; }
@@ -2980,7 +3020,13 @@ namespace MeshTerminal
                 _nodeMap.ResetMeasurement(); SaveMapOverlayState(); RefreshMapOverlays(); if (_mapMenu != null) _mapMenu.Children = BuildMapMenuItems(); Application.RequestStop();
             };
             var cancel = new Button("Cancel"); cancel.Clicked += delegate { Application.RequestStop(); };
-            dialog.AddButton(save); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException); _nodeMap.SetFocus();
+            dialog.AddButton(save); dialog.AddButton(cancel); Application.Run(dialog, HandleTerminalGuiException);
+            if (_settings.Map.MapItemPriority != previousPriority)
+            {
+                try { MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings); }
+                catch (Exception ex) { MessageBox.ErrorQuery("Map item settings", "Could not save the priority preference: " + ex.Message, "OK"); }
+            }
+            _nodeMap.SetFocus();
         }
         private static void ChangeMapOverlayProtection()
         {
@@ -3282,6 +3328,7 @@ namespace MeshTerminal
                 "\nOverlay: " + (point.OverlayName ?? "-") +
                 "\nFile: " + Path.GetFileName(point.SourceFile ?? "-") +
                 "\nDescription: " + (String.IsNullOrWhiteSpace(point.Description) ? "-" : point.Description) +
+                "\nPriority: " + (point.Priority.HasValue ? point.Priority.Value.ToString(CultureInfo.InvariantCulture) : "not set") +
                 "\nShort name: " + (String.IsNullOrWhiteSpace(point.ShortName) ? "-" : point.ShortName) +
                 "\nUUID: " + (String.IsNullOrWhiteSpace(point.Uuid) ? "-" : point.Uuid) +
                 "\nCreator: " + (String.IsNullOrWhiteSpace(point.Creator) ? "-" : point.Creator) +
@@ -3479,6 +3526,9 @@ namespace MeshTerminal
         {
             var values = new List<string>();
             if (telemetry.BatteryLevel.HasValue) values.Add("Battery: " + telemetry.BatteryLevel.Value + "%");
+            if (telemetry.NoiseFloorDbm.HasValue) values.Add("Noise floor: " + telemetry.NoiseFloorDbm.Value + " dBm");
+            if (telemetry.LastRssiDbm.HasValue) values.Add("Repeater RSSI: " + telemetry.LastRssiDbm.Value + " dBm");
+            if (telemetry.LastSnrDb.HasValue) values.Add("Repeater SNR: " + telemetry.LastSnrDb.Value.ToString("0.##", CultureInfo.InvariantCulture) + " dB");
             if (telemetry.Voltage.HasValue) values.Add("Voltage: " + telemetry.Voltage.Value.ToString("F2", CultureInfo.InvariantCulture) + " V");
             if (telemetry.ChannelUtilization.HasValue) values.Add("Channel utilization: " + telemetry.ChannelUtilization.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
             if (telemetry.AirUtilTx.HasValue) values.Add("Air utilization TX: " + telemetry.AirUtilTx.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
@@ -3500,6 +3550,9 @@ namespace MeshTerminal
             var telemetry = TelemetryItems[index];
             var values = new List<string>();
             if (telemetry.BatteryLevel.HasValue) values.Add("Battery: " + telemetry.BatteryLevel.Value + "%");
+            if (telemetry.NoiseFloorDbm.HasValue) values.Add("Noise floor: " + telemetry.NoiseFloorDbm.Value + " dBm");
+            if (telemetry.LastRssiDbm.HasValue) values.Add("Repeater RSSI: " + telemetry.LastRssiDbm.Value + " dBm");
+            if (telemetry.LastSnrDb.HasValue) values.Add("Repeater SNR: " + telemetry.LastSnrDb.Value.ToString("0.##", CultureInfo.InvariantCulture) + " dB");
             if (telemetry.Voltage.HasValue) values.Add("Voltage: " + telemetry.Voltage.Value.ToString("F2", CultureInfo.InvariantCulture) + " V");
             if (telemetry.ChannelUtilization.HasValue) values.Add("Channel utilization: " + telemetry.ChannelUtilization.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
             if (telemetry.AirUtilTx.HasValue) values.Add("Air utilization TX: " + telemetry.AirUtilTx.Value.ToString("F1", CultureInfo.InvariantCulture) + "%");
@@ -3527,7 +3580,7 @@ namespace MeshTerminal
                 var fields = new[]
                 {
                     telemetry.ReceivedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
-                    NullableText(telemetry.BatteryLevel), NullableText(telemetry.Voltage, excelFormat), NullableText(telemetry.ChannelUtilization, excelFormat), NullableText(telemetry.AirUtilTx, excelFormat), NullableText(telemetry.UptimeSeconds), NullableText(telemetry.Temperature, excelFormat), NullableText(telemetry.RelativeHumidity, excelFormat), NullableText(telemetry.BarometricPressure, excelFormat), NullableText(telemetry.Latitude, excelFormat), NullableText(telemetry.Longitude, excelFormat), NullableText(telemetry.Altitude)
+                    NullableText(telemetry.BatteryLevel), NullableText(telemetry.Voltage, excelFormat), NullableText(telemetry.ChannelUtilization, excelFormat), NullableText(telemetry.AirUtilTx, excelFormat), NullableText(telemetry.UptimeSeconds), NullableText(telemetry.Temperature, excelFormat), NullableText(telemetry.RelativeHumidity, excelFormat), NullableText(telemetry.BarometricPressure, excelFormat), NullableText(telemetry.Latitude, excelFormat), NullableText(telemetry.Longitude, excelFormat), NullableText(telemetry.Altitude), NullableText(telemetry.NoiseFloorDbm), NullableText(telemetry.LastRssiDbm), NullableText(telemetry.LastSnrDb, excelFormat)
                 };
                 rows.Add(String.Join(separator, fields.Select(value => ClipboardField(value, excelFormat))));
             }
@@ -3787,9 +3840,12 @@ namespace MeshTerminal
             int serviceButton = -1;
             var serviceType = _mesh.Protocol == MeshProtocol.MeshCore ? MeshCoreNodeType(node) : "";
             if (serviceType == "Repeater" || serviceType == "Roomserver") { serviceButton = buttons.Count; buttons.Add(serviceType == "Repeater" ? "Repeater admin" : "Room login"); }
+            int pingButton = -1;
+            if (_mesh.Protocol == MeshProtocol.MeshCore) { pingButton = buttons.Count; buttons.Add("Ping"); }
             buttons.Add("Close" );
             var selectedButton = ShowNodeDetailsDialog(text, buttons);
-            if (selectedButton == serviceButton && serviceButton >= 0) { if (serviceType == "Repeater") ShowMeshCoreRepeaterAdmin(node.NodeNumber); else ShowRoomLogin(node.NodeNumber); }
+            if (selectedButton == pingButton && pingButton >= 0) ShowMeshCorePing(node);
+            else if (selectedButton == serviceButton && serviceButton >= 0) { if (serviceType == "Repeater") ShowMeshCoreRepeaterAdmin(node.NodeNumber); else ShowRoomLogin(node.NodeNumber); }
             else if (selectedButton == 0) StartChatForNode(node);
             else if (selectedButton == 1) ShowTelemetryPage(node.NodeNumber);
             else if (selectedButton == 2) ShowNodePositionHistory(node);
@@ -3907,27 +3963,29 @@ namespace MeshTerminal
         private static void ShowLogoSettings()
         {
             var logo = _settings.Logo ?? (_settings.Logo = new MeshtasticLogoSettings());
-            var dialog = new Dialog("Logo settings", 70, 22);
+            var dialog = new Dialog("Logo settings", 70, 24);
             var enabled = new CheckBox("Show logo on the chat page") { X = 1, Y = 1, Checked = logo.ShowLogo };
             var showFrame = new CheckBox("Show logo frame") { X = 1, Y = 2, Checked = logo.ShowFrame };
             var automatic = new CheckBox("Automatically change logos") { X = 1, Y = 3, Checked = logo.AutomaticRotation };
             var showEmoji = new CheckBox("Show selected message emoji in logo frame") { X = 1, Y = 4, Checked = logo.ShowSelectedEmoji };
             var animateTall = new CheckBox("Animate logo files larger than the logo frame") { X = 1, Y = 5, Checked = logo.AnimateTallLogos };
             var pingPong = new CheckBox("Ping-pong animation (reverse at the end)") { X = 1, Y = 6, Checked = logo.AnimationPingPong };
+            var onLoRa = new CheckBox("Play animation once on LoRa RX / TX") { X = 1, Y = 14, Checked = logo.AnimateOnLoRaTraffic };
+            var onFrames = new CheckBox("Flash logo once on LoRa RX / TX") { X = 1, Y = 15, Checked = logo.FlashOnDeviceFrames };
             var animationInterval = new TextField(logo.TallLogoFrameIntervalMilliseconds.ToString(CultureInfo.InvariantCulture)) { X = 42, Y = 7, Width = 8 };
             var verticalStep = new TextField(logo.AnimationVerticalStepLines.ToString(CultureInfo.InvariantCulture)) { X = 42, Y = 8, Width = 8 };
             var horizontalStep = new TextField(logo.AnimationHorizontalStepCharacters.ToString(CultureInfo.InvariantCulture)) { X = 42, Y = 9, Width = 8 };
             var interval = new TextField(logo.RotationIntervalSeconds.ToString(CultureInfo.InvariantCulture)) { X = 34, Y = 10, Width = 8 };
             var width = new TextField(logo.InnerWidth.ToString(CultureInfo.InvariantCulture)) { X = 34, Y = 11, Width = 8 };
             var height = new TextField(logo.InnerHeight.ToString(CultureInfo.InvariantCulture)) { X = 34, Y = 12, Width = 8 };
-            dialog.Add(enabled, showFrame, automatic, showEmoji, animateTall, pingPong,
+            dialog.Add(enabled, showFrame, automatic, showEmoji, animateTall, pingPong, onLoRa, onFrames,
                 new Label("Animation frame interval (milliseconds):") { X = 1, Y = 7 }, animationInterval,
                 new Label("Vertical step (lines):") { X = 1, Y = 8 }, verticalStep,
                 new Label("Horizontal step (characters):") { X = 1, Y = 9 }, horizontalStep,
                 new Label("Change logo every (seconds):") { X = 1, Y = 10 }, interval,
                 new Label("Logo and chat width:") { X = 1, Y = 11 }, width,
                 new Label("Logo height:") { X = 1, Y = 12 }, height,
-                new Label("F7: Previous logo | F8: Next logo") { X = 1, Y = 14 });
+                new Label("F7: Previous logo | F8: Next logo") { X = 1, Y = 17 });
             dialog.KeyPress += e =>
             {
                 if (e.KeyEvent.Key == Key.F7) { ShowPreviousLogo(); e.Handled = true; }
@@ -3971,7 +4029,9 @@ namespace MeshTerminal
                 logo.ShowFrame = showFrame.Checked;
                 logo.AutomaticRotation = automatic.Checked;
                 logo.ShowSelectedEmoji = showEmoji.Checked;
-                logo.AnimateTallLogos = animateTall.Checked;
+                logo.AnimateTallLogos = animateTall.Checked || onLoRa.Checked;
+                logo.AnimateOnLoRaTraffic = onLoRa.Checked;
+                logo.FlashOnDeviceFrames = onFrames.Checked;
                 logo.AnimationPingPong = pingPong.Checked;
                 logo.RotationIntervalSeconds = seconds;
                 logo.TallLogoFrameIntervalMilliseconds = animationMilliseconds;
@@ -3993,6 +4053,8 @@ namespace MeshTerminal
         {
             if (_logoFrame == null || _channelsFrame == null || _directChatsFrame == null) return;
             if (_settings.Logo == null) _settings.Logo = new MeshtasticLogoSettings();
+            ClearAnimatedLogo();
+            if (!_settings.Logo.FlashOnDeviceFrames) { _logoFrameFlashActive = false; ApplyLogoTextColorScheme(); }
             var visible = _settings.Logo.ShowLogo;
             var sidebarOuterWidth = GetSidebarOuterWidth();
             _logoFrame.Width = sidebarOuterWidth;
@@ -4105,8 +4167,11 @@ namespace MeshTerminal
         private static void ShowCurrentLogo()
         {
             if (_logoText == null) return;
+            if (TryShowSelectedEmojiInLogo()) { ClearAnimatedLogo(); return; }
+            if (_settings.Logo.AnimateOnLoRaTraffic && _animatedLogoLines != null && LogoFiles.Count > 0 &&
+                String.Equals(_animatedLogoSource, LogoFiles[_logoIndex], StringComparison.OrdinalIgnoreCase))
+            { _nextLogoChangeUtc = DateTime.UtcNow.AddSeconds(Math.Max(1, _settings.Logo.RotationIntervalSeconds)); return; }
             ClearAnimatedLogo();
-            if (TryShowSelectedEmojiInLogo()) return;
             if (LogoFiles.Count == 0) _logoText.Text = "No logo files found.\nPlace *.txt files in .\\logo.";
             else
             {
@@ -4120,6 +4185,7 @@ namespace MeshTerminal
                     if (_settings.Logo.AnimateTallLogos && (logoLines.Length > frameHeight || logoWidth > frameWidth))
                     {
                         _animatedLogoLines = logoLines;
+                        _animatedLogoSource = LogoFiles[_logoIndex];
                         _animatedLogoVerticalOffset = 0;
                         _animatedLogoHorizontalOffset = 0;
                         _animatedLogoVerticalDirection = 1;
@@ -4138,6 +4204,7 @@ namespace MeshTerminal
         {
             _animatedLogoScheduleGeneration++;
             _animatedLogoLines = null;
+            _animatedLogoSource = null; _logoActivityCycle = null;
             _animatedLogoVerticalOffset = 0;
             _animatedLogoHorizontalOffset = 0;
             _animatedLogoVerticalDirection = 1;
@@ -4147,11 +4214,19 @@ namespace MeshTerminal
         private static void ScheduleAnimatedLogoFrame()
         {
             if (_animatedLogoLines == null || _animatedLogoLines.Length == 0 || _settings == null || _settings.Logo == null || !_settings.Logo.AnimateTallLogos) return;
+            if (_settings.Logo.AnimateOnLoRaTraffic && (_logoActivityCycle == null || !_logoActivityCycle.Active)) return;
             var generation = _animatedLogoScheduleGeneration;
             var interval = Math.Max(50, _settings.Logo.TallLogoFrameIntervalMilliseconds);
             Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(interval), delegate(MainLoop loop)
             {
                 if (generation != _animatedLogoScheduleGeneration || _animatedLogoLines == null || Volatile.Read(ref _shutdownStarted) != 0) return false;
+                if (_settings.Logo.AnimateOnLoRaTraffic)
+                {
+                    if (_logoActivityCycle == null || !_logoActivityCycle.Active) return false;
+                    _logoActivityCycle.Advance();
+                    _animatedLogoVerticalOffset = _logoActivityCycle.VerticalOffset;
+                    _animatedLogoHorizontalOffset = _logoActivityCycle.HorizontalOffset;
+                }
                 ShowAnimatedLogoFrame();
                 return false;
             });
@@ -4178,8 +4253,11 @@ namespace MeshTerminal
             }
             _logoText.Text = String.Join(Environment.NewLine, visibleLines);
             _logoText.SetNeedsDisplay();
+            if (!_settings.Logo.AnimateOnLoRaTraffic)
+            {
             _animatedLogoVerticalOffset = AdvanceAnimatedLogoOffset(_animatedLogoVerticalOffset, maximumVerticalOffset, _settings.Logo.AnimationVerticalStepLines, ref _animatedLogoVerticalDirection);
             _animatedLogoHorizontalOffset = AdvanceAnimatedLogoOffset(_animatedLogoHorizontalOffset, maximumHorizontalOffset, _settings.Logo.AnimationHorizontalStepCharacters, ref _animatedLogoHorizontalDirection);
+            }
             ScheduleAnimatedLogoFrame();
         }
 
@@ -4824,6 +4902,45 @@ namespace MeshTerminal
             Task.Run(async delegate { await RunAlertActionsAsync(unreadCount, message); });
         }
 
+        private static void QueueLogoTraffic(CommunicationFrameEventArgs frame)
+        {
+            var logo = _settings?.Logo;
+            if (logo == null || !logo.ShowLogo || Volatile.Read(ref _shutdownStarted) != 0) return;
+            if ((!logo.FlashOnDeviceFrames && !logo.AnimateOnLoRaTraffic) || !frame.IsLoRaRelated()) return;
+            if (logo.FlashOnDeviceFrames) Interlocked.Exchange(ref _logoPendingFrames, 1);
+            if (logo.AnimateOnLoRaTraffic) Interlocked.Exchange(ref _logoPendingLoRa, 1);
+            if (Volatile.Read(ref _logoPendingFrames) == 0 && Volatile.Read(ref _logoPendingLoRa) == 0) return;
+            if (Interlocked.CompareExchange(ref _logoTrafficUiQueued, 1, 0) != 0) return;
+            Ui(() =>
+            {
+                Interlocked.Exchange(ref _logoTrafficUiQueued, 0);
+                bool frames = Interlocked.Exchange(ref _logoPendingFrames, 0) != 0;
+                bool radio = Interlocked.Exchange(ref _logoPendingLoRa, 0) != 0;
+                if (_settings?.Logo == null || !_settings.Logo.ShowLogo || _logoText == null || Volatile.Read(ref _shutdownStarted) != 0) return;
+                if (frames && _settings.Logo.FlashOnDeviceFrames && !_logoFrameFlashActive && DateTime.UtcNow >= _logoNextFrameFlashUtc)
+                {
+                    _logoFrameFlashActive = true; _logoNextFrameFlashUtc = DateTime.UtcNow.AddMilliseconds(350);
+                    ApplyLogoTextColorScheme(); _logoText.SetNeedsDisplay();
+                    Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(180), loop =>
+                    {
+                        _logoFrameFlashActive = false;
+                        if (Volatile.Read(ref _shutdownStarted) == 0) { ApplyLogoTextColorScheme(); _logoText.SetNeedsDisplay(); }
+                        return false;
+                    });
+                }
+                if (radio && _settings.Logo.AnimateOnLoRaTraffic && (_logoActivityCycle == null || !_logoActivityCycle.Active))
+                {
+                    if (_animatedLogoLines == null) ShowCurrentLogo();
+                    if (_animatedLogoLines == null || !_settings.Logo.AnimateTallLogos) return;
+                    var maxVertical = Math.Max(0, _animatedLogoLines.Length - Math.Max(1, _settings.Logo.InnerHeight));
+                    var maxHorizontal = Math.Max(0, _animatedLogoLines.Max(line => line?.Length ?? 0) - Math.Max(1, _settings.Logo.InnerWidth));
+                    _logoActivityCycle = new LogoActivityCycle(maxVertical, maxHorizontal, _settings.Logo.AnimationVerticalStepLines, _settings.Logo.AnimationHorizontalStepCharacters, _settings.Logo.AnimationPingPong);
+                    _animatedLogoScheduleGeneration++; _animatedLogoVerticalOffset = 0; _animatedLogoHorizontalOffset = 0;
+                    ShowAnimatedLogoFrame();
+                }
+            });
+        }
+
         private static void UpdateLogoBlink()
         {
             // Receive notifications and read actions run on different queues.
@@ -4846,7 +4963,7 @@ namespace MeshTerminal
             if (_logoText == null || _settings == null || _settings.Appearance == null) return;
             var foreground = ParseColor(_settings.Appearance.LogoTextColor, Color.BrightCyan);
             var background = ParseColor(_settings.Appearance.BackgroundColor, Color.Black);
-            var attribute = _logoColorsSwapped
+            var attribute = (_logoColorsSwapped ^ _logoFrameFlashActive)
                 ? Application.Driver.MakeAttribute(background, foreground)
                 : Application.Driver.MakeAttribute(foreground, background);
             _logoText.ColorScheme = new ColorScheme { Normal = attribute, Focus = attribute, HotNormal = attribute, HotFocus = attribute, Disabled = attribute };
@@ -5019,8 +5136,8 @@ namespace MeshTerminal
         private static void ShowAppearanceSettings()
         {
             var appearance = _settings.Appearance;
-            var propertyNames = new[] { "Background", "Frame", "Page frame", "Normal text", "Selected Item", "Sent messages", "Received messages", "Status text", "Status background", "Input background", "Input text", "Menu background", "Menu text", "Button background", "Button text", "Logo frame", "Logo text", "Emoji text", "Map nodes", "Map clusters", "Map grid / crosshair", "Day separators" };
-            var values = new[] { appearance.BackgroundColor, appearance.FrameColor, appearance.PageFrameColor, appearance.TextColor, appearance.SelectedItemColor, appearance.SentMessageColor, appearance.ReceivedMessageColor, appearance.StatusTextColor, appearance.StatusBackgroundColor, appearance.InputBackgroundColor, appearance.InputTextColor, appearance.MenuBackgroundColor, appearance.MenuTextColor, appearance.ButtonBackgroundColor, appearance.ButtonTextColor, appearance.LogoFrameColor, appearance.LogoTextColor, appearance.EmojiTextColor, appearance.MapNodeColor, appearance.MapClusterColor, appearance.MapGridColor, appearance.DaySeparatorColor };
+            var propertyNames = new[] { "Background", "Frame", "Page frame", "Normal text", "Selected Item", "Sent messages", "Received messages", "Status text", "Status background", "Input background", "Input text", "Menu background", "Menu text", "Button background", "Button text", "Logo frame", "Logo text", "Emoji text", "Map nodes", "Map clusters", "Map grid / crosshair", "Day separators", "Failed send status", "Sender names", "Timestamps", "Successful send status" };
+            var values = new[] { appearance.BackgroundColor, appearance.FrameColor, appearance.PageFrameColor, appearance.TextColor, appearance.SelectedItemColor, appearance.SentMessageColor, appearance.ReceivedMessageColor, appearance.StatusTextColor, appearance.StatusBackgroundColor, appearance.InputBackgroundColor, appearance.InputTextColor, appearance.MenuBackgroundColor, appearance.MenuTextColor, appearance.ButtonBackgroundColor, appearance.ButtonTextColor, appearance.LogoFrameColor, appearance.LogoTextColor, appearance.EmojiTextColor, appearance.MapNodeColor, appearance.MapClusterColor, appearance.MapGridColor, appearance.DaySeparatorColor, appearance.FailedMessageStatusColor, appearance.SenderNameColor, appearance.TimestampColor, appearance.SuccessfulMessageStatusColor };
             var colorNames = new[] { "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Brown", "Gray", "DarkGray", "BrightBlue", "BrightGreen", "BrightCyan", "BrightRed", "BrightMagenta", "BrightYellow", "White" };
             var dialog = new Dialog("Appearance", 82, 25);
             var propertiesFrame = new FrameView("Properties") { X = 1, Y = 1, Width = 26, Height = 17 };
@@ -5071,7 +5188,7 @@ namespace MeshTerminal
             var save = new Button("Save", true);
             save.Clicked += delegate
             {
-                appearance.BackgroundColor = values[0]; appearance.FrameColor = values[1]; appearance.PageFrameColor = values[2]; appearance.TextColor = values[3]; appearance.SelectedItemColor = values[4]; appearance.SentMessageColor = values[5]; appearance.ReceivedMessageColor = values[6]; appearance.StatusTextColor = values[7]; appearance.StatusBackgroundColor = values[8]; appearance.InputBackgroundColor = values[9]; appearance.InputTextColor = values[10]; appearance.MenuBackgroundColor = values[11]; appearance.MenuTextColor = values[12]; appearance.ButtonBackgroundColor = values[13]; appearance.ButtonTextColor = values[14]; appearance.LogoFrameColor = values[15]; appearance.LogoTextColor = values[16]; appearance.EmojiTextColor = values[17]; appearance.MapNodeColor = values[18]; appearance.MapClusterColor = values[19]; appearance.MapGridColor = values[20]; appearance.DaySeparatorColor = values[21];
+                appearance.BackgroundColor = values[0]; appearance.FrameColor = values[1]; appearance.PageFrameColor = values[2]; appearance.TextColor = values[3]; appearance.SelectedItemColor = values[4]; appearance.SentMessageColor = values[5]; appearance.ReceivedMessageColor = values[6]; appearance.StatusTextColor = values[7]; appearance.StatusBackgroundColor = values[8]; appearance.InputBackgroundColor = values[9]; appearance.InputTextColor = values[10]; appearance.MenuBackgroundColor = values[11]; appearance.MenuTextColor = values[12]; appearance.ButtonBackgroundColor = values[13]; appearance.ButtonTextColor = values[14]; appearance.LogoFrameColor = values[15]; appearance.LogoTextColor = values[16]; appearance.EmojiTextColor = values[17]; appearance.MapNodeColor = values[18]; appearance.MapClusterColor = values[19]; appearance.MapGridColor = values[20]; appearance.DaySeparatorColor = values[21]; appearance.FailedMessageStatusColor = values[22]; appearance.SenderNameColor = values[23]; appearance.TimestampColor = values[24]; appearance.SuccessfulMessageStatusColor = values[25];
                 MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
                 ApplyAppearanceSettings();
                 Application.RequestStop();
@@ -5142,7 +5259,7 @@ namespace MeshTerminal
             ApplyChatListSelectionColors();
             if (_logoFrame != null) { _logoFrame.Border.BorderBrush = logoFrame; _logoFrame.Border.Background = background; _logoFrame.SetNeedsDisplay(); }
             ApplyLogoTextColorScheme();
-            _messages.BackgroundColor = background; _messages.NormalTextColor = text; _messages.OutgoingColor = sent; _messages.IncomingColor = received; _messages.EmojiTextColor = emojiText; _messages.DaySeparatorColor = daySeparator;
+            _messages.BackgroundColor = background; _messages.NormalTextColor = text; _messages.OutgoingColor = sent; _messages.IncomingColor = received; _messages.EmojiTextColor = emojiText; _messages.DaySeparatorColor = daySeparator; _messages.FailedStatusColor = ParseColor(appearance.FailedMessageStatusColor, Color.Red); _messages.SenderNameColor = ParseColor(appearance.SenderNameColor, Color.Gray); _messages.TimestampColor = ParseColor(appearance.TimestampColor, Color.Gray); _messages.SuccessfulStatusColor = ParseColor(appearance.SuccessfulMessageStatusColor, Color.Green);
             if (_nodeMap != null) { _nodeMap.NodeColor = mapNode; _nodeMap.ClusterColor = mapCluster; _nodeMap.GridColor = mapGrid; _nodeMap.SetNeedsDisplay(); }
             _input.ColorScheme = inputScheme;
             _status.ColorScheme = statusScheme;
@@ -5340,6 +5457,7 @@ namespace MeshTerminal
         private static void StopExternalServicesWithTimeout(TimeSpan timeout)
         {
             var stops = new List<Task>();
+            if (_mqttClients != null) stops.Add(StartStop(() => _mqttClients.StopAsync()));
             if (_telnetServers != null) stops.Add(StartStop(() => _telnetServers.StopAsync()));
             if (_telegramGateways != null) stops.Add(StartStop(delegate { return _telegramGateways.StopAsync(); }));
             if (_mesh != null) stops.Add(StartStop(delegate { return _mesh.DisconnectAsync(); }));
@@ -5350,6 +5468,7 @@ namespace MeshTerminal
         private static void StopExternalServicesWithProgress(TimeSpan timeout, Stopwatch elapsed)
         {
             var stops = new List<KeyValuePair<string, Task>>();
+            if (_mqttClients != null) stops.Add(new KeyValuePair<string, Task>("MQTT clients", StartStop(() => _mqttClients.StopAsync())));
             if (_telnetServers != null) stops.Add(new KeyValuePair<string, Task>("Telnet servers", StartStop(() => _telnetServers.StopAsync())));
             if (_telegramGateways != null) stops.Add(new KeyValuePair<string, Task>("Telegram gateways", Task.Run(async delegate { await StartStop(delegate { return _telegramGateways.StopAsync(); }).ConfigureAwait(false); })));
             if (_mesh != null) stops.Add(new KeyValuePair<string, Task>("mesh connection", Task.Run(async delegate { await StartStop(delegate { return _mesh.DisconnectAsync(); }).ConfigureAwait(false); })));

@@ -384,7 +384,7 @@ namespace MeshTerminal
         {
             if (!pathOnly) _shapeHitCells.Clear();
             var pathColors = new Dictionary<string, Color>();
-            foreach (var point in _overlayPoints.Where(item => item.IsPathOverlay == pathOnly && item.ReferenceLatitude.HasValue && item.ReferenceLongitude.HasValue && !String.Equals(item.Shape, "Point", StringComparison.OrdinalIgnoreCase)))
+            foreach (var point in MapOverlayPriority.Shapes(_overlayPoints.Where(item => item.IsPathOverlay == pathOnly && item.ReferenceLatitude.HasValue && item.ReferenceLongitude.HasValue && !String.Equals(item.Shape, "Point", StringComparison.OrdinalIgnoreCase))))
             {
                 int x1, y1, x2, y2;
                 Project(point.Latitude, point.Longitude, width, height, out x1, out y1);
@@ -465,7 +465,7 @@ namespace MeshTerminal
             foreach (var marker in _markers)
                 for (var column = marker.X - marker.Label.Length / 2 - 1; column <= marker.X + marker.Label.Length / 2 + 1; column++) occupied.Add(marker.Y + ":" + column);
             var index = 0;
-            foreach (var point in _overlayPoints.Where(point => !point.IsPathOverlay).OrderBy(item => String.Equals(item.Shape, "Point", StringComparison.OrdinalIgnoreCase) ? 0 : 1))
+            foreach (var point in MapOverlayPriority.Labels(_overlayPoints.Where(point => !point.IsPathOverlay)))
             {
                 int x, y;
                 Project(point.Latitude, point.Longitude, width, height, out x, out y);

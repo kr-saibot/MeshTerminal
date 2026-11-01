@@ -26,13 +26,13 @@ namespace MeshTerminal
             chooser.Add(list); chooser.AddButton(open); chooser.AddButton(cancel); if (!targetNode.HasValue) Application.Run(chooser);
             if (selected < 0 || selected >= nodes.Count) return;
             var node = nodes[selected];
-            var dialog = new Dialog("Repeater administration: " + node.LongName, 100, 30);
+            var dialog = new Dialog("Repeater administration: " + node.LongName, 100, 33);
             var loginFrame = new FrameView("Login") { X = 1, Y = 0, Width = Dim.Fill(2), Height = 7 };
             var shortcutFrame = new FrameView("Command buttons") { X = Pos.AnchorEnd(27), Y = 12, Width = 26, Height = 11 };
             var password = new TextField("") { X = 16, Y = 0, Width = 35, Secret = true };
             var login = new Button("Log in") { X = 53, Y = 0 };
             var status = new Label("Log in with the repeater administrator password. Passwords are saved only when explicitly selected.") { X = 0, Y = 4, Width = Dim.Fill() };
-            var output = new TextView { X = 1, Y = 12, Width = Dim.Fill(29), Height = 11, ReadOnly = true, WordWrap = true, AllowsTab = false };
+            var output = new TextView { X = 1, Y = 12, Width = Dim.Fill(29), Height = 14, ReadOnly = true, WordWrap = true, AllowsTab = false };
             var command = new TextField("") { X = 11, Y = 10, Width = Dim.Fill(13) };
             var send = new Button("Send") { X = Pos.AnchorEnd(11), Y = 10, Enabled = false };
             var quick = new CommandDropdown { X = 1, Y = 8, Width = 66, Height = 1 };
@@ -75,10 +75,11 @@ namespace MeshTerminal
             };
             if (_settings.RepeaterQuickCommands == null) _settings.RepeaterQuickCommands = new string[6];
             var shortcuts = new Button[6];
-            var clearOutput = new Button("Clear output") { X = 1, Y = 24 };
-            var copyOutput = new Button("Copy output") { X = Pos.Right(clearOutput) + 2, Y = 24 };
+            var clearOutput = new Button("Clear output") { X = 1, Y = 27 };
+            var copyOutput = new Button("Copy output") { X = Pos.Right(clearOutput) + 2, Y = 27 };
             copyOutput.Clicked += () => CopyTextWithFallback(output.Text.ToString(), "Repeater output copied.");
             clearOutput.Clicked += () => { output.Text = ""; output.TopRow = 0; output.SetNeedsDisplay(); };
+            var refreshStatus = new Button("Refresh status") { X = Pos.Right(copyOutput) + 2, Y = 27, Enabled = false };
             var editShortcuts = new Button("Edit buttons") { X = Pos.Center(), Y = 8 };
             Action refreshShortcuts = () => { for (int i = 0; i < 6; i++) { var value = i < _settings.RepeaterQuickCommands.Length ? _settings.RepeaterQuickCommands[i] : ""; shortcuts[i].Text = String.IsNullOrWhiteSpace(value) ? (i + 1) + ": (empty)" : value; shortcuts[i].Enabled = send.Enabled && !String.IsNullOrWhiteSpace(value); } };
             editShortcuts.Clicked += () =>
@@ -103,7 +104,19 @@ namespace MeshTerminal
             };
             var close = new Button("Close", true); close.Clicked += delegate { Application.RequestStop(); };
             bool closed = false, busy = false, authorized = false;
-            Action<bool> setBusy = value => { busy = value; login.Enabled = !value; password.Enabled = !value; remember.Enabled = !value; forget.Enabled = !value; send.Enabled = !value && authorized; run.Enabled = !value && authorized; command.Enabled = !value; quick.Enabled = !value; for (int i = 0; i < 6; i++) shortcuts[i].Enabled = !value && authorized && i < _settings.RepeaterQuickCommands.Length && !String.IsNullOrWhiteSpace(_settings.RepeaterQuickCommands[i]); };
+            Action<bool> setBusy = value => { busy = value; refreshStatus.Enabled = !value && authorized; login.Enabled = !value; password.Enabled = !value; remember.Enabled = !value; forget.Enabled = !value; send.Enabled = !value && authorized; run.Enabled = !value && authorized; command.Enabled = !value; quick.Enabled = !value; for (int i = 0; i < 6; i++) shortcuts[i].Enabled = !value && authorized && i < _settings.RepeaterQuickCommands.Length && !String.IsNullOrWhiteSpace(_settings.RepeaterQuickCommands[i]); };
+            refreshStatus.Clicked += () =>
+            {
+                if (busy || !authorized) return;
+                setBusy(true); status.Text = "Reading repeater status...";
+                Task.Run(async () =>
+                {
+                    string result;
+                    try { result = (await _mesh.RequestMeshCoreRepeaterStatusAsync(node.Number)).ToString(); }
+                    catch (Exception ex) { result = "Status request failed: " + ex.Message + "\n"; }
+                    Ui(() => { if (closed) return; output.Text += result + "\n"; output.MoveEnd(); status.Text = "Ready."; setBusy(false); });
+                });
+            };
             Action<string> execute = text =>
             {
                 if (busy || !authorized || String.IsNullOrWhiteSpace(text)) return;
@@ -147,7 +160,7 @@ namespace MeshTerminal
                 bool savePassword = remember.Checked; if (!savePassword) { showingSavedPassword = false; password.Secret = true; password.Text = ""; } authorized = false; setBusy(true); status.Text = "Logging in...";
                 Task.Run(async delegate
                 {
-                    string result;
+                    string result; string repeaterStatus = null;
                     try { await _mesh.LoginMeshCoreRepeaterAsync(node.Number, secret); authorized = true; result = "Login accepted. Administrator commands are available.";
                         try
                         {
@@ -156,10 +169,13 @@ namespace MeshTerminal
                             if (saved != null) _settings.RepeaterCredentials.Add(saved);
                             MeshtasticSettingsStore.Save("meshtastic-settings.xml", _settings);
                         }
-                        catch (Exception ex) { result += " Password settings could not be saved: " + ex.Message; } }
+                        catch (Exception ex) { result += " Password settings could not be saved: " + ex.Message; }
+                        try { repeaterStatus = (await _mesh.RequestMeshCoreRepeaterStatusAsync(node.Number)).ToString(); }
+                        catch (Exception ex) { repeaterStatus = "Status request failed: " + ex.Message + "\n"; }
+                    }
                     catch (Exception ex) { result = "Login failed: " + ex.Message; }
                     finally { secret = null; }
-                    Ui(delegate { if (closed) return; status.Text = result; if (authorized && savePassword && _settings.RepeaterCredentials.Any(c => String.Equals(c.PublicKey, node.Id, StringComparison.OrdinalIgnoreCase))) showSavedPassword(); setBusy(false); if (authorized) command.SetFocus(); });
+                    Ui(delegate { if (closed) return; status.Text = result; if (repeaterStatus != null) { output.Text += repeaterStatus + "\n"; output.MoveEnd(); } if (authorized && savePassword && _settings.RepeaterCredentials.Any(c => String.Equals(c.PublicKey, node.Id, StringComparison.OrdinalIgnoreCase))) showSavedPassword(); setBusy(false); if (authorized) command.SetFocus(); });
                 });
             };
             send.Clicked += delegate { execute(command.Text.ToString()); };
@@ -173,7 +189,7 @@ namespace MeshTerminal
             loginFrame.Add(new Label("Admin password:") { X = 0, Y = 0 }, password, login, remember, forget, status);
             shortcutFrame.Add(editShortcuts);
             dialog.Add(loginFrame, shortcutFrame, quick, run, help, output,
-                new Label("Command:") { X = 1, Y = 10 }, command, send, clearOutput, copyOutput);
+                new Label("Command:") { X = 1, Y = 10 }, command, send, clearOutput, copyOutput, refreshStatus);
             var scrollbar = new ScrollBarView(output, true, false) { AutoHideScrollBars = false };
             scrollbar.ChangedPosition += () => { output.TopRow = scrollbar.Position; output.SetNeedsDisplay(); };
             output.DrawContent += args => { scrollbar.Size = output.Lines; scrollbar.Position = output.TopRow; scrollbar.Refresh(); };

@@ -6,18 +6,39 @@
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../src/MeshTerminal/UnixTerminalColors.cs" Link="UnixTerminalColors.cs" />
+    <Compile Include="../../src/MeshTerminal/TerminalPalette.cs" Link="TerminalPalette.cs" />
+    <Compile Include="../../src/MeshTerminal.Host/TerminalOutputSanitizer.cs" Link="TerminalOutputSanitizer.cs" />
+    <Compile Include="../../src/MeshTerminal/MapSymbolCatalog.cs" Link="MapSymbolCatalog.cs" />
     <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+    <Compile Include="../../src/MeshTerminal/MessageClipboard.cs" Link="MessageClipboard.cs" />
+    <PackageReference Include="Terminal.Gui" Version="1.18.1" />
+    <Compile Include="../../src/MeshTerminal/MessageTextInsertion.cs" Link="MessageTextInsertion.cs" />
     <Reference Include="System.Xml.Linq" />
     <None Include="../../src/MeshTerminal/emoji-blocks-full.xml" Link="emoji-blocks-full.xml" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../src/MeshTerminal/emoji-blocks-12line-full.xml" Link="emoji-blocks-12line-full.xml" CopyToOutputDirectory="PreserveNewest" />
     <Compile Include="../../src/MeshTerminal/DialogDefaultPolicy.cs" Link="DialogDefaultPolicy.cs" />
     <Compile Include="../../src/MeshTerminal/CommunicationLogBuffer.cs" Link="CommunicationLogBuffer.cs" />
     <Compile Include="../../src/MeshTerminal/ChannelChatCatalog.cs" Link="ChannelChatCatalog.cs" />
+    <Compile Include="../../src/MeshTerminal/MessageResend.cs" Link="MessageResend.cs" />
+    <Compile Include="../../src/MeshTerminal/ChessProtocol.cs" Link="ChessProtocol.cs" />
+    <Compile Include="../../src/MeshTerminal/ChessHistory.cs" Link="ChessHistory.cs" />
+    <Compile Include="../../src/MeshTerminal/ChessBlockPieces.cs" Link="ChessBlockPieces.cs" />
+    <Compile Include="../../src/MeshTerminal/ChessPresentation.cs" Link="ChessPresentation.cs" />
+    <Compile Include="../../src/MeshTerminal/ListViewScrollBar.cs" Link="ListViewScrollBar.cs" />
+    <Compile Include="../../src/MeshTerminal/HostQrBridge.cs" Link="HostQrBridge.cs" />
+    <Compile Include="../../src/MeshTerminal.Host/ScreenQrReader.cs" Link="ScreenQrReader.cs" />
+    <Compile Include="../../src/MeshTerminal/ChatHeaderStyles.cs" Link="ChatHeaderStyles.cs" />
+    <Compile Include="../../src/MeshTerminal/LogoActivityCycle.cs" Link="LogoActivityCycle.cs" />
+    <Compile Include="../../src/MeshTerminal/ChessBoardView.cs" Link="ChessBoardView.cs" />
+    <Compile Include="../../src/MeshTerminal/SharedMapObjectProtocol.cs" Link="SharedMapObjectProtocol.cs" />
     <Compile Include="../../src/MeshTerminal/MessageContentParser.cs" Link="MessageContentParser.cs" />
     <Compile Include="../../src/MeshTerminal/DatabaseWriteQueue.cs" Link="DatabaseWriteQueue.cs" />
     <Compile Include="../../src/MeshTerminal/MapOverlay.cs" Link="MapOverlay.cs" />
     <Compile Include="../../src/MeshTerminal/MeshCorePathMap.cs" Link="MeshCorePathMap.cs" />
     <Reference Include="System.Web" />
+    <Reference Include="System.Web.Extensions" />
     <Compile Include="../../src/MeshTerminal.Client/LinuxBleConnection.cs" Link="LinuxBleConnection.cs" />
     <PackageReference Include="Tmds.DBus" Version="0.95.1" /><PackageReference Include="Tmds.DBus.Protocol" Version="0.95.1" />
     <Compile Include="../../src/MeshTerminal.Client/BlueZDbus.cs" Link="BlueZDbus.cs" />

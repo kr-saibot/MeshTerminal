@@ -11,7 +11,7 @@ namespace MeshTerminal.Host
             Font12 = 0x1E20, Font14 = 0x1E30, Font16 = 0x1E40, Font18 = 0x1E50,
             StartMinimized = 0x1E60, StartWithWindows = 0x1E70, DarkMode = 0x1E80,
             SelectBellSound = 0x1E90, ClearBellSound = 0x1EA0,
-            CopyScreenshot = 0x1EC0, SelectProgramIcon = 0x1ED0,
+            CopyScreenshot = 0x1EC0, SelectProgramIcon = 0x1ED0, ScanQrArea = 0x1EE0, ScanQrScreen = 0x1EF0,
             MinimizeToTray = 0x1EB0;
 
         [DllImport("user32.dll")]
@@ -26,6 +26,8 @@ namespace MeshTerminal.Host
             AppendMenu(menu, MfSeparator, UIntPtr.Zero, null);
             AppendMenu(menu, MfString, (UIntPtr)SelectClient, "MeshTerminal.exe auswählen …");
             AppendMenu(menu, MfString, (UIntPtr)SelectProgramIcon, "Programm-Icon auswählen …");
+            AppendMenu(menu, MfString, (UIntPtr)ScanQrArea, "QR-Code aus Bildschirmbereich …");
+            AppendMenu(menu, MfString, (UIntPtr)ScanQrScreen, "QR-Codes auf allen Bildschirmen …");
             AppendMenu(menu, MfString, (UIntPtr)CopyScreenshot, "Terminal-Screenshot in Zwischenablage");
             AppendMenu(menu, MfString, (UIntPtr)SelectBellSound, "Alarm-Audiodatei auswählen …");
             if (!String.IsNullOrWhiteSpace(AppSettings.BellSoundPath))
@@ -50,6 +52,8 @@ namespace MeshTerminal.Host
 
         public static bool IsSelectClientCommand(IntPtr command) { return command.ToInt32() == SelectClient; }
         public static bool IsSelectProgramIconCommand(IntPtr command) { return command.ToInt32() == SelectProgramIcon; }
+        public static bool IsScanQrAreaCommand(IntPtr command) { return command.ToInt32() == ScanQrArea; }
+        public static bool IsScanQrScreenCommand(IntPtr command) { return command.ToInt32() == ScanQrScreen; }
         public static bool IsCopyScreenshotCommand(IntPtr command) { return command.ToInt32() == CopyScreenshot; }
         public static bool IsStartMinimizedCommand(IntPtr command) { return command.ToInt32() == StartMinimized; }
         public static bool IsMinimizeToTrayCommand(IntPtr command) { return command.ToInt32() == MinimizeToTray; }

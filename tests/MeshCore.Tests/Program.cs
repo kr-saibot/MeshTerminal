@@ -9,7 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using MeshTerminal.Client;
 
-internal static class Program
+internal static partial class Program
 {
     private static int Main(string[] args)
     {
@@ -18,7 +18,8 @@ internal static class Program
             if (args.Length >= 2 && (args[0] == "--ble-admin-read" || args[0] == "--ble-admin-verify")) BleAdminReadProbe.Run(args[1], args[0] == "--ble-admin-verify").GetAwaiter().GetResult();
             else if (args.Contains("--ble-devices")) { using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15))) { var devices = MeshtasticClient.GetBluetoothDevicesAsync(MeshProtocol.MeshCore, timeout.Token).GetAwaiter().GetResult(); Console.WriteLine("Paired Bluetooth devices: " + devices.Count); foreach (var device in devices) Console.WriteLine(device.Name); } }
             else if (args.Length >= 2 && args[0] == "--port") ProbeAsync(args[1], args.Contains("--telemetry"), args.Contains("--channels")).GetAwaiter().GetResult();
-            else { RenameCompatibilityTests.Run(); RepeaterDialogTests.Run(); CommunicationLogFilterTests.Run(); CommunicationLogTests.Run(); TelnetEchoTests.RunAsync().GetAwaiter().GetResult(); ArchivedChannelChatTests.Run(); GatewayConfigurationTests.Run(); LocPositionTests.Run(); MeshCoreHashtagTests.Run(); ChannelDraftTests.Run(); SharedLinkImportTests.Run(); MessageOrderingTests.Run(); TelnetServerTests.RunAsync().GetAwaiter().GetResult(); MessageContentTests.Run(); DeferredNodePersistenceTests.Run(); PathMapTests.Run(); MeshCoreTelemetryPaddingTests.Run(); MeshCoreHopTests.Run(); TelegramSenderTests.Run(); NodeReceptionTests.Run(); MeshCoreContactTimeoutTests.RunAsync().GetAwaiter().GetResult(); BluetoothTests.RunAsync().GetAwaiter().GetResult(); MapMarkerTests.Run(); SharingTests.Run(); BluetoothChannelTests.RunAsync().GetAwaiter().GetResult(); ChannelTests.RunAsync().GetAwaiter().GetResult(); TestAsync().GetAwaiter().GetResult(); }
+            else if (args.Contains("--mqtt-tests")) MqttTests.RunAsync().GetAwaiter().GetResult();
+            else { MqttSystemStatusTests.Run(); NodeAnnouncementTests.Run(); MqttTests.RunAsync().GetAwaiter().GetResult(); TerminalPaletteTests.Run(); TestMessageResendAsync().GetAwaiter().GetResult(); MapSymbolTests.Run(); ChessTests.Run(); ChessBlockTests.Run(); NodeListScrollBarTests.Run(); HostQrTests.RunAsync().GetAwaiter().GetResult(); SharedMapMessageTests.Run(); MessageInsertionTests.Run(); RenameCompatibilityTests.Run(); RepeaterDialogTests.Run(); RepeaterStatusTests.Run(); ChatHeaderStyleTests.Run(); LogoActivityTests.Run(); CommunicationLogFilterTests.Run(); CommunicationLogTests.Run(); TelnetEchoTests.RunAsync().GetAwaiter().GetResult(); ArchivedChannelChatTests.Run(); GatewayConfigurationTests.Run(); LocPositionTests.Run(); MeshCoreHashtagTests.Run(); ChannelDraftTests.Run(); SharedLinkImportTests.Run(); MessageOrderingTests.Run(); TelnetServerTests.RunAsync().GetAwaiter().GetResult(); MessageContentTests.Run(); DeferredNodePersistenceTests.Run(); PathMapTests.Run(); MapOverlayPriorityTests.Run(); MeshCoreTelemetryPaddingTests.Run(); MeshCoreHopTests.Run(); TelegramSenderTests.Run(); NodeReceptionTests.Run(); MeshCoreContactTimeoutTests.RunAsync().GetAwaiter().GetResult(); MeshCoreRetryTests.RunAsync().GetAwaiter().GetResult(); BluetoothTests.RunAsync().GetAwaiter().GetResult(); MapMarkerTests.Run(); SharingTests.Run(); BluetoothChannelTests.RunAsync().GetAwaiter().GetResult(); ChannelTests.RunAsync().GetAwaiter().GetResult(); TestAsync().GetAwaiter().GetResult(); }
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
@@ -80,6 +81,8 @@ internal static class Program
         using (var store = MeshtasticMessageStore.CreateSqlite(Path.Combine(runtime, "messages.db")))
         using (var client = new MeshtasticClient { Protocol = MeshProtocol.MeshCore, MaximumConnectionAttempts = 1 })
         {
+            var nodeAnnouncements = new System.Collections.Concurrent.ConcurrentQueue<NodeAnnouncementEventArgs>();
+            client.NodeAnnouncementReceived += (sender, e) => nodeAnnouncements.Enqueue(e);
             var communicationFrames = new System.Collections.Concurrent.ConcurrentQueue<CommunicationFrameEventArgs>();
             client.CommunicationFrame += (sender, frame) => communicationFrames.Enqueue(frame);
             var settingsFile = Path.Combine(runtime, "gateway-settings.xml");
@@ -136,6 +139,10 @@ internal static class Program
             Check(client.Device.RoutingHashLengthBytes == 3, "Protocol v10 reports 3-byte routing hashes");
             await client.RefreshRadioStatisticsAsync(timeout.Token);
             Check(client.Device.NoiseFloorDbm == -114, "Radio noise floor decoded as signed int16 dBm");
+            client.EnablePacketStatisticsPolling=true;
+            await client.RefreshRadioStatisticsAsync(timeout.Token);
+            Check(client.Device.RadioReceivedPackets==4000000000u&&client.Device.RadioSentPackets==123&&client.Device.RadioReceiveErrors==7,"Packet counters requested with official GET_STATS subtype 2");
+            client.EnablePacketStatisticsPolling=false;
             Check(syncProgress.Any(line => line == "Attempt 2 - Loading nodes: 1 / 3"), "Retried contacts show current attempt and progress even for retained nodes");
             Check(retryQuestions == 1, "Stalled contact transfer asks before restarting");
             Check(radio.ContactRequests == 2, "A stalled transfer retries after confirmation and completes without an extra full transfer");
@@ -210,7 +217,7 @@ internal static class Program
             var other = client.Nodes.Single(node => node.LongName == "Bob");
             Check(contact.Number != other.Number, "Keys with equal 32-bit prefixes remain distinct");
             Check(contact.Id.Length == 64 && Math.Abs(contact.Latitude.Value - 52.123456) < 0.0000001 && Math.Abs(contact.Longitude.Value - 13.123456) < 0.0000001, "Contact key and location offsets");
-            Check(client.GetMaximumTextPayloadBytes(true) == 148 && client.GetMaximumTextPayloadBytes(false) == 160, "UTF-8 group prefix limit");
+            Check(client.GetMaximumTextPayloadBytes(true) == 148 && client.GetMaximumTextPayloadBytes(false) == 158, "UTF-8 group prefix limit");
             var roomNode = client.Nodes.Single(node => node.MeshCoreContactType == 3);
             store.AddOrUpdateNode(contact);
             store.AddOrUpdateNode(roomNode);
@@ -235,6 +242,11 @@ internal static class Program
             Check(remoteTelemetry.From == contact.Number && Math.Abs(remoteTelemetry.Telemetry.EnvironmentMetrics.RelativeHumidity - 45) < 0.001, "Remote telemetry matches response tag");
             store.AddTelemetry(remoteTelemetry);
             Check(store.GetTelemetry(contact.Number).Single(item => item.Type == "MeshCore").Type == "MeshCore" && store.GetTelemetry(contact.Number).Single(item => item.Type == "MeshCore").RawTelemetry.Contains("Ch 0: Temperature -5.5"), "Native telemetry raw channels persisted");
+            var ping = await client.CheckMeshCoreReachabilityAsync(contact.Number, timeout.Token);
+            Check(ping.TotalMilliseconds == 1 && radio.DirectText == "Ping (MeshTerminal)", "Companion reachability waits for matching ACK and reports radio round-trip time");
+            var statusPing = await client.CheckMeshCoreReachabilityAsync(roomNode.Number, timeout.Token);
+            Check(statusPing >= TimeSpan.Zero, "Server reachability uses a matching status response");
+            try { await client.CheckMeshCoreReachabilityAsync(123456, timeout.Token); throw new Exception("Unknown ping contact accepted"); } catch (InvalidOperationException) { }
             var directId = await client.SendTextWithIdAsync(contact.Number, "Grüße", cancellationToken: timeout.Token);
             await WaitForAsync(() => client.GetMessageDelivery(directId) != null && client.GetMessageDelivery(directId).State == MessageDeliveryState.Delivered, timeout.Token);
             Check(radio.DirectText == "Grüße" && radio.DirectPrefix.SequenceEqual(FakeRadio.AliceKey.Take(6)), "Direct send encoding and immediate ACK correlation");
@@ -271,6 +283,7 @@ internal static class Program
             Check(store.GetDirectMessages(roomNode.Number).Single().SenderName == "Author 01020304", "Room author survives SQLite storage");
             var reopened = MeshtasticMessageStore.CreateSqlite(Path.Combine(runtime, "messages.db"));
             Check(reopened.GetOrCreateMeshCoreIdentity(contact.Id) == contact.Number, "Identity mapping survives reopening");
+            Check(nodeAnnouncements.Count==0,"Initial synchronization and local advert commands do not emit received announcements");
             var nodesBeforeRefresh = client.Nodes.Count;
             var nodeUpdates = 0;
             client.NodeUpdated += (sender, e) => { if (e.Node.Number == contact.Number) Interlocked.Increment(ref nodeUpdates); };
@@ -281,12 +294,15 @@ internal static class Program
             Check(client.Nodes.Single(node => node.Number == contact.Number).LastHeardUtc > DateTime.UtcNow.AddSeconds(-5), "Live advert uses local reception time");
             Check(client.Nodes.Single(node => node.Number == contact.Number).LastRssi == -95 && client.Nodes.Single(node => node.Number == contact.Number).LastSnr == -3, "Live advert associates RSSI/SNR with the advertised contact" );
             Check(client.Nodes.Single(node => node.Number == contact.Number).LongName == "Alice updated", "Short advert reloads existing contact name");
+            await WaitForAsync(()=>nodeAnnouncements.Count==1,timeout.Token);
+            Check(!nodeAnnouncements.Single().IsNew&&nodeAnnouncements.Single().Node.User.LongName=="Alice updated"&&nodeAnnouncements.Single().Rssi==-95&&nodeAnnouncements.Single().Node.HopsAway==2,"Short live advert emits one complete event after metadata refresh");
             Check(Math.Abs(client.Nodes.Single(node => node.Number == contact.Number).Latitude.Value - 53.123456) < 0.0000001, "Short advert reloads position");
             var updatesBeforePath = Volatile.Read(ref nodeUpdates);
             radio.ContactPush = 0x81;
             await client.SendAdvertAsync(false, timeout.Token);
             await WaitForAsync(() => Volatile.Read(ref nodeUpdates) > updatesBeforePath, timeout.Token);
             Check(client.Nodes.Count == nodesBeforeRefresh, "Path update preserves contact identity without duplication");
+            Check(nodeAnnouncements.Count==1,"Path-only notification does not emit an advert");
             radio.ChannelCount = 40;
             await client.RequestFullStateAsync(timeout.Token);
             Check(client.ChannelSlotCount == 40, "MeshCore reports all 40 channel slots");
@@ -318,6 +334,8 @@ internal static class Program
             await radio.PushUnstoredContactAsync(unknownKey);
             await WaitForAsync(() => client.Nodes.Any(n => n.Id == unknownId), timeout.Token);
             Check(client.IsMeshCoreContactSaved(unknownId) == false, "Unstored full advert is not a device contact");
+            await WaitForAsync(()=>nodeAnnouncements.Any(e=>e.Node.User.Id==unknownId),timeout.Token);
+            Check(nodeAnnouncements.Single(e=>e.Node.User.Id==unknownId).IsNew,"Full PC-only advert emits a new-node event");
             var unknownNode = client.Nodes.Single(n => n.Id == unknownId);
             try { await client.SendTextWithIdAsync(unknownNode.Number, "not stored", cancellationToken: timeout.Token); throw new Exception("PC-only direct message accepted"); } catch (InvalidOperationException) { }
             try { await client.SaveMeshCoreContactAsync(unknownId, "reject contact", token: timeout.Token); throw new Exception("Full contact table accepted"); } catch (IOException ex) { Check(ex.Message.Contains("contact list is full") && ex.Message.Contains("Remove"), "Full device table provides actionable explanation"); }
@@ -330,6 +348,11 @@ internal static class Program
             try { await client.LoginMeshCoreRepeaterAsync(unknownNode.Number, "deny", timeout.Token); throw new Exception("Denied repeater login accepted"); } catch (UnauthorizedAccessException) { }
             try { await client.LoginMeshCoreRepeaterAsync(unknownNode.Number, "guest", timeout.Token); throw new Exception("Guest administrator accepted"); } catch (UnauthorizedAccessException) { }
             await client.LoginMeshCoreRepeaterAsync(unknownNode.Number, "admin", timeout.Token);
+            int receivedStatusCount = 0; MeshCoreRepeaterStatus receivedStatus = null;
+            client.MeshCoreRepeaterStatusReceived += value => { receivedStatus = value; Interlocked.Increment(ref receivedStatusCount); };
+            var repeaterStatus = await client.RequestMeshCoreRepeaterStatusAsync(unknownNode.Number, timeout.Token);
+            Check(receivedStatusCount == 1 && receivedStatus.NodeNumber == unknownNode.Number && receivedStatus.NoiseFloorDbm == -117, "Repeater status event is raised once for the correct known contact");
+            Check(repeaterStatus.NoiseFloorDbm == -117 && repeaterStatus.LastSnrDb == -3.25f && repeaterStatus.NodeNumber == unknownNode.Number, "Remote repeater status ignores unrelated responses and decodes radio statistics");
             var cliMessageCount = received.Count;
             Check(await client.SendMeshCoreRepeaterCommandAsync(unknownNode.Number, "ver", timeout.Token) == "Test repeater firmware", "CLI replies match sender, message type and echoed request tag");
             Check(received.Count == cliMessageCount, "CLI replies are not chat messages");
@@ -444,8 +467,11 @@ internal static class Program
                     BitConverter.GetBytes(_latitude).CopyTo(self, 36); BitConverter.GetBytes(_longitude).CopyTo(self, 40);
                     await FrameAsync(stream, self); break;
                 case 56:
-                    Check(command.Length == 2 && command[1] == 1, "Radio stats request");
-                    var stats = new byte[14]; stats[0] = 24; stats[1] = 1; stats[2] = 142; stats[3] = 255; await FrameAsync(stream, stats); break;
+                    Check(command.Length==2&&(command[1]==1||command[1]==2),"Radio / packet stats request");
+                    var stats=new byte[command[1]==1?14:30];stats[0]=24;stats[1]=command[1];
+                    if(command[1]==1) {stats[2]=142;stats[3]=255;}
+                    else {BitConverter.GetBytes(4000000000u).CopyTo(stats,2);BitConverter.GetBytes(123u).CopyTo(stats,6);BitConverter.GetBytes(7u).CopyTo(stats,26);}
+                    await FrameAsync(stream,stats);break;
                 case 20: await FrameAsync(stream, new byte[] { 12 }.Concat(BitConverter.GetBytes(BatteryMillivolts)).ToArray()); break;
                 case 22:
                     Check(command[1] == 3, "Negotiated protocol version");
@@ -536,7 +562,14 @@ internal static class Program
                     if (DirectText == "truncated") { await FrameAsync(stream, new byte[] { 6, 1 }); break; }
                     await FrameAsync(stream, new byte[] { 0x83 });
                     await FrameAsync(stream, new byte[] { 6, 1, 1, 2, 3, 4, 0x10, 0x27, 0, 0 });
+                    await FrameAsync(stream, new byte[] { 0x82, 9, 2, 3, 4, 99, 0, 0, 0 });
                     await FrameAsync(stream, new byte[] { 0x82, 1, 2, 3, 4, 1, 0, 0, 0 }); break;
+                case 27:
+                    await FrameAsync(stream, new byte[] { 6, 1, 1, 2, 3, 4, 0xE8, 3, 0, 0 });
+                    var status = RepeaterStatusTests.Frame(command.Skip(1).Take(6).ToArray());
+                    var unrelatedStatus = (byte[])status.Clone(); unrelatedStatus[2] ^= 0xFF;
+                    await FrameAsync(stream, unrelatedStatus);
+                    await FrameAsync(stream, status); break;
                 case 3:
                     ChannelText = Encoding.UTF8.GetString(command, 7, command.Length - 7);
                     if (ChannelText == "timeout") break;

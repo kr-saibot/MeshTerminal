@@ -15,7 +15,22 @@ internal static class MessageContentTests
         var channelTarget = MessageContentParser.Find("Join (\"" + channelLink + "\").").Single();
         Check(channelTarget.IsMeshCoreChannel && channelTarget.Url == channelLink, "MeshCore channel links are recognized with surrounding punctuation");
         Check(MessageContentParser.Find("meshcore://unknown/path").Count == 0, "Unrecognized MeshCore URI actions are not exposed");
-        Check(MessageContentParser.Find(null).Count == 0, "Empty message");
+        var nodes = new[]
+        {
+            new MeshTerminal.Client.StoredMeshNode { NodeNumber = 1, LongName = "DM2TK Mobil" },
+            new MeshTerminal.Client.StoredMeshNode { NodeNumber = 2, LongName = "DM2TK Mobil 4" },
+            new MeshTerminal.Client.StoredMeshNode { NodeNumber = 3, LongName = "DM2TK Mobil 4" },
+            new MeshTerminal.Client.StoredMeshNode { NodeNumber = 4, LongName = "Base+(North)" }
+        };
+        var mention = MessageContentParser.Find("Hello dm2tk mobil 4, see Base+(North)!", nodes);
+        Check(mention.Count == 2 && mention[0].NodeNumbers.SequenceEqual(new uint[] { 2, 3 }) && mention[1].NodeNumbers.Single() == 4, "Node names: longest match, case, duplicate selection and regex characters");
+        Check(MessageContentParser.Find("XDM2TK Mobil 4suffix", nodes).All(t => t.NodeNumbers == null || !t.NodeNumbers.Contains(2)), "No partial node name matches");
+        Check(MessageContentParser.Find("https://example.org/DM2TK Mobil 4", nodes).All(t => t.NodeNumbers == null), "No node matches overlapping a link");
+        var north = new MessageContentTarget { Latitude = 1, Longitude = 0 };
+        Check(north.PositionRelation(0, 0).Contains("111.2 km") && north.PositionRelation(0, 0).Contains("0° N"), "GPS distance and bearing are from own position to target");
+        Check(north.PositionRelation(null, 0).Contains("unavailable"), "Missing own GPS is explicitly unavailable");
+        Check(north.PositionRelation(1, 0).Contains("same position"), "Same point has no artificial direction");
+        Check(MessageContentParser.Find(null, nodes).Count == 0, "Empty message");
         Console.WriteLine("Message content tests passed: web URLs, punctuation, coordinates and invalid ranges.");
     }
     private static void Check(bool condition, string message) { if (!condition) throw new Exception(message); }

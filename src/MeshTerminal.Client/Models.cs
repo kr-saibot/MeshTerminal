@@ -110,6 +110,7 @@ namespace MeshTerminal.Client
         }
         public uint PacketId { get; private set; }
         public MessageDeliveryState State { get; private set; }
+        public string Detail { get; internal set; }
         public Routing.Types.Error Error { get; private set; }
     }
 
@@ -126,6 +127,10 @@ namespace MeshTerminal.Client
         public string DeviceClockSyncStatus { get; internal set; }
         public int? RoutingHashLengthBytes { get; internal set; }
         public int? NoiseFloorDbm { get; internal set; }
+        public uint? RadioReceivedPackets { get; internal set; }
+        public uint? RadioSentPackets { get; internal set; }
+        public uint? RadioReceiveErrors { get; internal set; }
+        public DateTime? RadioStatisticsReadUtc { get; internal set; }
         public double? MeshCoreBatteryVoltage { get; internal set; }
         public byte? MeshCoreProtocolVersion { get; internal set; }
         public string HardwareName { get; internal set; }

@@ -1,3 +1,5 @@
+param([switch] $DocumentationOnly)
+
 $ErrorActionPreference = "Stop"
 
 # This is the canonical build destination. Do not change it without updating AGENTS.md.
@@ -46,6 +48,30 @@ function Copy-BuildFiles([string] $Source, [string] $Destination) {
     }
 }
 
+function Copy-ProtocolDocuments([string[]] $Destinations) {
+    $protocolDocuments = @(Get-ChildItem -LiteralPath $RepositoryRoot -File | Where-Object {
+        $_.Name -match '(?i)(protocol|protokoll).*\.md$|^CHESS\.md$|^MAP-OVERLAY-PRIORITY\.md$'
+    })
+    foreach ($destination in $Destinations) {
+        $protocolTarget = Join-Path $destination 'Protocols'
+        New-Item -ItemType Directory -Path $protocolTarget -Force | Out-Null
+        foreach ($document in $protocolDocuments) {
+            Copy-Item -LiteralPath $document.FullName -Destination (Join-Path $protocolTarget $document.Name) -Force
+        }
+    }
+}
+
+# Updating documentation does not require closing a running client or host.
+if ($DocumentationOnly) {
+    foreach ($staging in @($WindowsStaging, $LinuxStaging, $HostStaging)) {
+        if (-not (Test-Path -LiteralPath $staging -PathType Container)) { throw 'Build once before updating documentation only.' }
+    }
+    Copy-ProtocolDocuments @($WindowsStaging, $LinuxStaging, $WindowsTarget, $LinuxTarget)
+    & (Join-Path $PSScriptRoot 'Update-ReleasePackaging.ps1') -BuildRoot $BuildRoot -StagingRoot $StagingRoot
+    Write-Host 'Protocol documentation and ZIP file inventories updated for Windows and Linux.'
+    exit 0
+}
+
 Push-Location $RepositoryRoot
 try {
     Reset-StagingDirectory $WindowsStaging
@@ -74,6 +100,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "MeshCore test build failed." }
     & (Join-Path $TestsStaging "MeshCore.Tests.exe")
     if ($LASTEXITCODE -ne 0) { throw "MeshCore protocol tests failed." }
+
+    Copy-ProtocolDocuments @($WindowsStaging, $LinuxStaging)
 
     # Copying with -Force replaces old program files but deliberately does not
     # delete runtime data already present in the destinations. In particular,
@@ -104,6 +132,9 @@ try {
         $legacyProgram = Join-Path (Join-Path $WindowsTarget 'Host') $name
         if (Test-Path -LiteralPath $legacyProgram) { Remove-Item -LiteralPath $legacyProgram -Force }
     }
+
+    # Ship the packer and a clean file inventory from staging, not runtime folders.
+    & (Join-Path $PSScriptRoot 'Update-ReleasePackaging.ps1') -BuildRoot $BuildRoot -StagingRoot $StagingRoot
 
     Write-Host ""
     Write-Host "Builds completed successfully:"

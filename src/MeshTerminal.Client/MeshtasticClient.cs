@@ -474,6 +474,7 @@ namespace MeshTerminal.Client
                             _meshCore.FrameTraffic = (direction, raw, payload) => ReportCommunicationFrame(MeshProtocol.MeshCore, transport.Kind, direction, raw, payload);
                             _meshCore.FrameSent = delegate { lock (_gate) { _sentFrameCount++; _lastSentUtc = DateTime.UtcNow; } };
                             _meshCore.DeliveryChanged = UpdateMeshCoreDelivery;
+                            _meshCore.DeliveryAttempt = UpdateMeshCoreAttempt;
                         }
                         SetState(ConnectionState.Connected, null);
                         Debug("Transport open; starting heartbeat and RX reader.");
@@ -639,7 +640,11 @@ namespace MeshTerminal.Client
             {
                 case FromRadio.PayloadVariantOneofCase.MyInfo:
                     Device.MyNode = radio.MyInfo; UpdateLocalNode(); Raise(DeviceInfoUpdated, EventArgs.Empty); break;
-                case FromRadio.PayloadVariantOneofCase.NodeInfo: UpdateNode(radio.NodeInfo); break;
+                case FromRadio.PayloadVariantOneofCase.NodeInfo:
+                    var newLiveNode=!_nodes.ContainsKey(radio.NodeInfo.Num)&&State==ConnectionState.Connected&&(_configComplete==null||_configComplete.Task.IsCompleted);
+                    UpdateNode(radio.NodeInfo);
+                    if(newLiveNode)AnnounceNode(_nodes[radio.NodeInfo.Num],true,DateTime.UtcNow);
+                    break;
                 case FromRadio.PayloadVariantOneofCase.Channel: UpdateChannel(radio.Channel); break;
                 case FromRadio.PayloadVariantOneofCase.Config:
                     if (radio.Config.PayloadVariantCase == Config.PayloadVariantOneofCase.Lora) { Device.LoRaConfig = radio.Config.Lora.Clone(); Raise(DeviceInfoUpdated, EventArgs.Empty); }
@@ -703,12 +708,18 @@ namespace MeshTerminal.Client
             }
             else if (data.Portnum == PortNum.NodeinfoApp)
             {
-                MeshNode node; if (_nodes.TryGetValue(packet.From, out node)) { node.Value.User = User.Parser.ParseFrom(data.Payload); Raise(NodeUpdated, new NodeEventArgs(node)); }
+                MeshNode node;var isNew=!_nodes.TryGetValue(packet.From,out node)||node.Value.User==null;
+                var user=User.Parser.ParseFrom(data.Payload);
+                if(node==null) { UpdateNode(new NodeInfo { Num=packet.From,User=user });node=_nodes[packet.From]; }
+                else { node.Value.User=user;Raise(NodeUpdated,new NodeEventArgs(node)); }
+                node.UpdateRadioMetrics(packet.RxRssi,packet.RxSnr);
+                if(packet.HopStart>0&&packet.HopStart>=packet.HopLimit)node.Value.HopsAway=packet.HopStart-packet.HopLimit;
+                AnnounceNode(node,isNew,DateTime.UtcNow);
             }
             else if (data.Portnum == PortNum.TelemetryApp)
             {
                 var telemetry = Telemetry.Parser.ParseFrom(data.Payload);
-                if (Device.MyNode != null && packet.From == Device.MyNode.MyNodeNum && telemetry.LocalStats != null) { Device.NoiseFloorDbm = telemetry.LocalStats.NoiseFloor == 0 ? (int?)null : telemetry.LocalStats.NoiseFloor; Raise(DeviceInfoUpdated, EventArgs.Empty); }
+                if (Device.MyNode != null && packet.From == Device.MyNode.MyNodeNum && telemetry.LocalStats != null) { Device.NoiseFloorDbm = telemetry.LocalStats.NoiseFloor == 0 ? (int?)null : telemetry.LocalStats.NoiseFloor; Device.RadioReceivedPackets=telemetry.LocalStats.NumPacketsRx; Device.RadioSentPackets=telemetry.LocalStats.NumPacketsTx; Device.RadioReceiveErrors=telemetry.LocalStats.NumPacketsRxBad; Device.RadioStatisticsReadUtc=DateTime.UtcNow; Raise(DeviceInfoUpdated, EventArgs.Empty); }
                 MeshNode node; if (_nodes.TryGetValue(packet.From, out node) && telemetry.DeviceMetrics != null) { node.Value.DeviceMetrics = telemetry.DeviceMetrics; Raise(NodeUpdated, new NodeEventArgs(node)); }
                 Raise(TelemetryReceived, new MeshTelemetryEventArgs(new MeshTelemetry(packet, telemetry)));
             }

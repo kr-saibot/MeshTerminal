@@ -10,7 +10,7 @@ namespace MeshTerminal.Client
     // Companion protocol v3, USB/TCP framing. Commands have no request IDs,
     // so keep exactly one outstanding command, including message polling.
     internal sealed class NodeSynchronizationSkippedException : Exception { }
-    internal sealed class MeshCoreSession
+    internal sealed partial class MeshCoreSession
     {
         private readonly Stream _stream;
         private readonly Action _close;
@@ -44,11 +44,12 @@ namespace MeshTerminal.Client
             lock (_gate) return _contactDeadline != null && _response != null &&
                 _response.TrySetException(new NodeSynchronizationSkippedException());
         }
-        public async Task<byte[]> CommandAsync(byte[] payload, byte[] expected, CancellationToken token, Action<byte[]> accepted = null, bool keepConnectionOnTimeout = false)
+        public async Task<byte[]> CommandAsync(byte[] payload, byte[] expected, CancellationToken token, Action<byte[]> accepted = null, bool keepConnectionOnTimeout = false, Func<bool> shouldSend = null)
         {
             await _commands.WaitAsync(token).ConfigureAwait(false);
             try
             {
+                if (shouldSend != null && !shouldSend()) return null;
                 var completion = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
                 lock (_gate)
                 {
@@ -108,6 +109,7 @@ namespace MeshTerminal.Client
                     _onFrame(frame);
                     if (frame[0] == 0x82 && frame.Length >= 9)
                     {
+                        ConfirmRetryAck(ReadUInt32(frame, 1));
                         uint packet;
                         if (_ackPackets.TryRemove(ReadUInt32(frame, 1), out packet) && DeliveryChanged != null)
                             DeliveryChanged(packet, MessageDeliveryState.Delivered);
@@ -134,6 +136,7 @@ namespace MeshTerminal.Client
             catch (Exception ex)
             {
                 _closed.Cancel();
+                StopRetrySends();
                 foreach (var pending in _ackPackets.ToArray())
                 {
                     uint ignored;

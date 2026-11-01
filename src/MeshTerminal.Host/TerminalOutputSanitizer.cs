@@ -49,12 +49,8 @@ namespace MeshTerminal.Host
 
         private static HashSet<char> CreateAllowedSymbols()
         {
-            var result = new HashSet<char> { '\u221a', '\u2302' };
-            // Preserve every symbol offered by the MeshTerminal map symbol picker.
-            foreach (var symbol in "␀☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼")
-                result.Add(symbol);
-            AddRange(result, '\u2295', '\u22a1');
-            AddRange(result, '\u29e8', '\u29f3');
+            var result = new HashSet<char> { '\u221a', '\uFE0E' };
+            foreach (var symbol in MapSymbolCatalog.Symbols) result.Add(symbol[0]);
             AddRange(result, '\u2500', '\u259f');
             AddRange(result, '\u25a0', '\u25ff');
             return result;

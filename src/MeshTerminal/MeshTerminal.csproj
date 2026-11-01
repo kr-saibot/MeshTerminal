@@ -9,9 +9,9 @@
     <Product>MeshTerminal</Product>
     <Title>MeshTerminal</Title>
     <Description>Windows and Linux terminal client for Meshtastic and MeshCore with chat, maps, telemetry, repeater administration and gateways.</Description>
-    <Version>1.4.0</Version>
-    <AssemblyVersion>1.4.0.0</AssemblyVersion>
-    <FileVersion>1.4.0.0</FileVersion>
+    <Version>2.1.0</Version>
+    <AssemblyVersion>2.1.0.0</AssemblyVersion>
+    <FileVersion>2.1.0.0</FileVersion>
     <Configurations>Debug;Release;Linux</Configurations>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Linux'">
@@ -31,6 +31,7 @@
     <ProjectReference Include="..\MeshTerminal.Client\MeshTerminal.Client.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <None Update="terminal-profiles\*" CopyToOutputDirectory="PreserveNewest" />
     <None Update="logo\*.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Update="map\*.xml" CopyToOutputDirectory="PreserveNewest" />
     <None Update="osm\*.mbtiles" CopyToOutputDirectory="PreserveNewest" />
@@ -43,7 +44,9 @@
     <None Include="..\..\LICENSE-BluetoothLE.txt" Link="LICENSE-BluetoothLE.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\LICENSE-Tmds-DBus.txt" Link="LICENSE-Tmds-DBus.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\LICENSE-QRCoder.txt" Link="LICENSE-QRCoder.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE-MQTTnet.txt" Link="LICENSE-MQTTnet.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\THIRD-PARTY-NOTICES.md" Link="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\RELEASE-NOTES-2.1.0.md" Link="RELEASE-NOTES-2.1.0.md" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\README.md" Link="README.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>

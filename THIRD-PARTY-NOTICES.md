@@ -7,7 +7,9 @@ The following components are used by the source code and/or distributed builds.
 | --- | --- | --- | --- |
 | Meshtastic Protobuf definitions | included source | GPL-3.0 | https://github.com/meshtastic/protobufs |
 | Google.Protobuf | 3.25.8 | BSD-3-Clause | https://github.com/protocolbuffers/protobuf |
+| MQTTnet | 4.3.7.1207 | MIT | https://github.com/dotnet/MQTTnet |
 | QRCoder | 1.6.0 | MIT | https://github.com/codebude/QRCoder |
+| ZXing.Net (Windows host QR reader) | 0.16.11 | Apache-2.0 | https://github.com/micjahn/ZXing.Net |
 | InTheHand.BluetoothLE | 4.0.45 | MIT | https://github.com/inthehand/32feet |
 | Tmds.DBus | 0.95.1 | MIT | https://github.com/tmds/Tmds.DBus |
 | Terminal.Gui | 1.18.1 | MIT | https://github.com/gui-cs/Terminal.Gui |
@@ -22,3 +24,5 @@ protobuf definitions. `LICENSE-QRCoder.txt` contains the QRCoder MIT license.
 When publishing binary release archives, include this file, `LICENSE`, and the
 license/notice files supplied with any third-party binary packages included in
 the archive.
+
+`LICENSE-MQTTnet.txt` contains the MQTTnet MIT license.

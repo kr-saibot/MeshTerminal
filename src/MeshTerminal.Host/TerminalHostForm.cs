@@ -9,7 +9,7 @@ using EasyWindowsTerminalControl;
 
 namespace MeshTerminal.Host
 {
-    internal sealed class TerminalHostForm : Form, IMessageFilter
+    internal sealed partial class TerminalHostForm : Form, IMessageFilter
     {
         private const int WmMouseWheel = 0x020A;
         private const int WmNcButtonDown = 0x00A1;
@@ -41,6 +41,7 @@ namespace MeshTerminal.Host
             if (AppSettings.StartMinimized && !AppSettings.MinimizeToTray)
                 WindowState = FormWindowState.Minimized;
 
+            Environment.SetEnvironmentVariable(MeshTerminal.HostQrBridge.EnvironmentKey, _qrPipeName);
             var executable = MeshTerminalLocator.Resolve(args, this);
             _terminal = new EasyTerminalControl
             {
@@ -142,6 +143,8 @@ namespace MeshTerminal.Host
                     return;
                 }
 
+                if (TerminalSystemMenu.IsScanQrAreaCommand(message.WParam)) { ScanScreenQr(false); return; }
+                if (TerminalSystemMenu.IsScanQrScreenCommand(message.WParam)) { ScanScreenQr(true); return; }
                 if (TerminalSystemMenu.IsCopyScreenshotCommand(message.WParam))
                 {
                     QueueTerminalScreenshot();
@@ -317,6 +320,8 @@ namespace MeshTerminal.Host
                 RestoreFromTray();
                 QueueTerminalScreenshot();
             });
+            menu.Items.Add("QR-Code aus Bildschirmbereich …", null, delegate { ScanScreenQr(false); });
+            menu.Items.Add("QR-Codes auf allen Bildschirmen …", null, delegate { ScanScreenQr(true); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Beenden", null, delegate
             {

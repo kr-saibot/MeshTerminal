@@ -13,9 +13,10 @@ namespace MeshTerminal
             Meshtastic.Protobufs.Position position;
             if (!LocMessagePosition.TryParse(message.Text, out position)) return;
             var positionNode = message.Protocol == MeshProtocol.MeshCore ? _store.ResolveMeshCorePositionNode(message.From) : message.From;
+            if (_mqttClients?.HasTelemetryClients == true) PublishMqttTelemetry(MqttTelemetry.From(positionNode, position, receivedUtc));
             if (_settings.StorePositionData && (!_settings.StorePositionFavoritesOnly || IsFavoriteNode(positionNode)))
             {
-                _store.AddPosition(positionNode, position, receivedUtc);
+                _store.AddPosition(positionNode, position, receivedUtc, false);
                 RefreshTelemetryViews(positionNode, true);
             }
             if (!_settings.Map.ReceivePositionMarkers) return;

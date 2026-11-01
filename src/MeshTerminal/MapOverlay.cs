@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Xml.Serialization;
 
 namespace MeshTerminal
@@ -29,6 +30,8 @@ namespace MeshTerminal
         [XmlAttribute("referenceLongitude")] public string ReferenceLongitudeXml { get { return ReferenceLongitude.HasValue ? ReferenceLongitude.Value.ToString("R", CultureInfo.InvariantCulture) : null; } set { double parsed; ReferenceLongitude = Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) ? (double?)parsed : null; } }
         public bool ShouldSerializeReferenceLatitudeXml() { return ReferenceLatitude.HasValue; }
         public bool ShouldSerializeReferenceLongitudeXml() { return ReferenceLongitude.HasValue; }
+        [XmlElement("Priority")] public long? Priority { get; set; }
+        public bool ShouldSerializePriority() { return Priority.HasValue; }
         public double Latitude { get; set; }
         public double Longitude { get; set; }
         public string ShortName { get; set; }
@@ -44,6 +47,20 @@ namespace MeshTerminal
         [XmlIgnore] public int? TelemetryAltitude { get; set; }
         [XmlIgnore] public int EffectiveFillDensity { get { return Math.Max(0, Math.Min(9, FillDensity > 0 ? FillDensity : Filled ? 1 : 0)); } }
         public MapOverlayPoint() { Uuid = ""; Creator = ""; Shape = "Point"; FillSymbol = "*"; ShortName = ""; Description = ""; Color = "Green"; Selectable = true; }
+    }
+
+    internal static class MapOverlayPriority
+    {
+        // Keep legacy order for ties and for overlays without priorities.
+        internal static IEnumerable<MapOverlayPoint> Labels(IEnumerable<MapOverlayPoint> points)
+        {
+            return points.OrderByDescending(p => p.Priority.HasValue).ThenByDescending(p => p.Priority.GetValueOrDefault())
+                .ThenBy(p => String.Equals(p.Shape, "Point", StringComparison.OrdinalIgnoreCase) ? 0 : 1);
+        }
+        internal static IEnumerable<MapOverlayPoint> Shapes(IEnumerable<MapOverlayPoint> points)
+        {
+            return points.OrderBy(p => p.Priority.HasValue).ThenBy(p => p.Priority.GetValueOrDefault());
+        }
     }
 
     internal sealed class MapOverlayFile

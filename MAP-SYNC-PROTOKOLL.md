@@ -25,10 +25,10 @@ Direktnachrichten, Nachrichten auf anderen Kanalindizes und eigene zurückempfan
 Das Präfix ist exakt und unterscheidet Groß-/Kleinschreibung. Unmittelbar danach folgt die Versionsnummer, ohne zusätzliches Trennzeichen:
 
 ```text
-///MAP+1|UUID|LAT|LON|COLOR|SHAPE|FILL|NAME_B64|DESCRIPTION_B64|FILL_SYMBOL_B64|REF_LAT|REF_LON
+///MAP+1|UUID|LAT|LON|COLOR|SHAPE|FILL|NAME_B64|DESCRIPTION_B64|FILL_SYMBOL_B64|REF_LAT|REF_LON|PRIORITY
 ```
 
-Nach Entfernen von `///MAP+` müssen genau zwölf durch `|` getrennte Felder vorliegen. Leere Felder bleiben beim Zerlegen erhalten. Insbesondere dürfen die beiden abschließenden Referenzfelder bei Punkten nicht weggelassen werden.
+Nach Entfernen von `///MAP+` werden dreizehn durch `|` getrennte Felder gesendet. Das letzte Feld PRIORITY enthält eine vorzeichenbehaftete ganze Dezimalzahl (64 Bit) oder bleibt ohne Priorität leer. Ältere Nachrichten mit zwölf Feldern bleiben lesbar. Es wird keine neue Versionsnummer eingeführt. Leere Felder bleiben beim Zerlegen erhalten. Insbesondere dürfen die beiden Referenzfelder vor PRIORITY bei Punkten nicht weggelassen werden.
 
 | Index | Feld | Format und Bedeutung |
 | --- | --- | --- |
@@ -44,6 +44,7 @@ Nach Entfernen von `///MAP+` müssen genau zwölf durch `|` getrennte Felder vor
 | 9 | FILL_SYMBOL_B64 | Füllsymbol, ebenso kodiert; Empfang übernimmt es ohne Trim |
 | 10 | REF_LAT | Referenz-Breitengrad; für Linien, Rechtecke und Kreise erforderlich |
 | 11 | REF_LON | Referenz-Längengrad; für Linien, Rechtecke und Kreise erforderlich |
+| 12 | PRIORITY | Vorzeichenbehaftete 64-Bit-Dezimalzahl; leer bedeutet keine Priorität. Höhere Werte gewinnen bei überlappenden Overlay-Einträgen. Neue Objekte verwenden standardmäßig 100. |
 
 ### Koordinaten und Textkodierung
 
@@ -90,17 +91,17 @@ Flächenfüllung wird für Rechtecke und Kreise verwendet. Linien werden als Kon
 Kurzname `A`, Beschreibung `Test`, Füllsymbol `*`, Farbe Green, Position 52.5/13.4:
 
 ```text
-///MAP+1|00112233445566778899aabbccddeeff|52.5|13.4|2|0|0|QQ|VGVzdA|Kg||
+///MAP+1|00112233445566778899aabbccddeeff|52.5|13.4|2|0|0|QQ|VGVzdA|Kg|||100
 ```
 
-Die letzten beiden Felder sind leer. `QQ` dekodiert zu `A`, `VGVzdA` zu `Test` und `Kg` zu `*`.
+Die beiden Referenzfelder sind leer; das letzte Feld setzt die Priorität auf 100. `QQ` dekodiert zu `A`, `VGVzdA` zu `Test` und `Kg` zu `*`.
 
 ### Beispiel: gefülltes Rechteck
 
 Kurzname `R`, leere Beschreibung, Farbe BrightYellow, Füllwert 2 und Referenz 52.51/13.42:
 
 ```text
-///MAP+1|112233445566778899aabbccddeeff00|52.5|13.4|e|2|2|Ug||Kg|52.51|13.42
+///MAP+1|112233445566778899aabbccddeeff00|52.5|13.4|e|2|2|Ug||Kg|52.51|13.42|100
 ```
 
 ## Empfang und lokale Speicherung
@@ -216,3 +217,4 @@ Alert-Ausgaben für Nachrichten mit diesem Präfix, einschließlich MAP+, MAP- u
 MAPPOS+. Die Nachrichten bleiben gespeichert und werden weiterhin ausgewertet.
 Für wiederholte Signaltöne und Logo-Blinken werden diese Nachrichten aus der
 Alert-Zählung ausgeschlossen. Diese Option ist standardmäßig deaktiviert.
+Neue Kartenobjekte erhalten standardmäßig Priorität 100. Der Dialog merkt sich den zuletzt gültigen Wert in den Einstellungen. Die Priorität wird lokal und beim Teilen gespeichert und in beiden Detailansichten angezeigt.

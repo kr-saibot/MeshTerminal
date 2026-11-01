@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Linq;
 using System.Windows;
 using System.Windows.Controls.Primitives;
 using System.Windows.Media;
@@ -38,13 +39,8 @@ namespace MeshTerminal.Host
                 DefaultForeground = 0x00C0C0C0,
                 DefaultSelectionBackground = 0x00808080,
                 CursorStyle = CursorStyle.BlinkingBlockDefault,
-                ColorTable = new uint[]
-                {
-                    0x00000000, 0x00000080, 0x00008000, 0x00008080,
-                    0x00800000, 0x00800080, 0x00808000, 0x00C0C0C0,
-                    0x00808080, 0x000000FF, 0x0000FF00, 0x0000FFFF,
-                    0x00FF0000, 0x00FF00FF, 0x00FFFF00, 0x00FFFFFF
-                }
+                // TerminalTheme uses COLORREF (BGR), the shared palette stores RGB.
+                ColorTable = TerminalPalette.Rgb.Select(rgb => ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | (rgb >> 16)).ToArray()
             };
         }
     }

@@ -8,6 +8,8 @@ namespace MeshTerminal.Client
     public sealed partial class MeshtasticClient
     {
         private MeshCoreSession _clockSynchronizedSession;
+        private MeshCoreSession _packetStatisticsUnsupportedSession;
+        public bool EnablePacketStatisticsPolling { get; set; }
         private async Task<uint> ReadMeshCoreClockAsync(MeshCoreSession session, CancellationToken token)
         {
             var reply = await session.CommandAsync(new byte[] { 5 }, new byte[] { 9 }, token).ConfigureAwait(false);
@@ -47,6 +49,17 @@ namespace MeshTerminal.Client
         {
             if (!IsConnected || Protocol != MeshProtocol.MeshCore || Device.MeshCoreProtocolVersion.GetValueOrDefault() < 8 || _loadingMeshCoreContacts) return;
             await _meshCore.CommandAsync(new byte[] { 56, 1 }, new byte[] { 24 }, token).ConfigureAwait(false);
+            var session=_meshCore;
+            if(EnablePacketStatisticsPolling&&!ReferenceEquals(session,_packetStatisticsUnsupportedSession))
+            {
+                try { await session.CommandAsync(new byte[] {56,2},new byte[] {24},token).ConfigureAwait(false); }
+                catch(System.IO.IOException error)
+                {
+                    _packetStatisticsUnsupportedSession=session;
+                    Device.RadioReceivedPackets=null;Device.RadioSentPackets=null;Device.RadioReceiveErrors=null;
+                    Debug("MeshCore packet counters unavailable: "+error.Message);
+                }
+            }
         }
         public async Task RefreshOwnDeviceInfoAsync(CancellationToken cancellationToken = default(CancellationToken))
         {

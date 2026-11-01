@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Collections.Generic;
 using System.Linq;
@@ -66,6 +66,10 @@ namespace MeshTerminal.Client
         public string MapClusterColor { get; set; }
         public string MapGridColor { get; set; }
         public string DaySeparatorColor { get; set; }
+        public string FailedMessageStatusColor { get; set; } = "Red";
+        public string SenderNameColor { get; set; } = "Gray";
+        public string TimestampColor { get; set; } = "Gray";
+        public string SuccessfulMessageStatusColor { get; set; } = "Green";
 
         public MeshtasticAppearanceSettings()
         {
@@ -84,6 +88,8 @@ namespace MeshTerminal.Client
         public bool AutomaticRotation { get; set; }
         public bool ShowSelectedEmoji { get; set; }
         public bool AnimateTallLogos { get; set; }
+        public bool AnimateOnLoRaTraffic { get; set; }
+        public bool FlashOnDeviceFrames { get; set; }
         public bool AnimationPingPong { get; set; }
         public int RotationIntervalSeconds { get; set; }
         public int TallLogoFrameIntervalMilliseconds { get; set; }
@@ -228,6 +234,7 @@ namespace MeshTerminal.Client
         public bool ReceivePositionMarkers { get; set; } = true;
         public bool ConfirmPositionMarkerPlacement { get; set; } = true;
         public bool PositionMarkerUseGps { get; set; }
+        public long MapItemPriority { get; set; } = 100;
         public bool MapPointSharingEnabled { get; set; }
         public bool ReceiveSharedMapPointDeletions { get; set; }
         public bool CenterMapOnReceivedSharedPoint { get; set; }
@@ -257,6 +264,8 @@ namespace MeshTerminal.Client
         public bool StorePositionFavoritesOnly { get; set; }
         public bool EnableSerialTrafficLog { get; set; }
         public bool CommunicationLogLoRaOnly { get; set; }
+        public bool ChessUseLetters { get; set; }
+        public string ChessDisplayMode { get; set; }
         public int CommunicationLogCapacity { get; set; } = 500;
         public MeshtasticAlertSettings Alerts { get; set; }
         public MeshtasticAppearanceSettings Appearance { get; set; }
@@ -267,6 +276,7 @@ namespace MeshTerminal.Client
         public List<TelegramGatewaySettings> TelegramGateways { get; set; }
         public List<MeshtasticHttpBotSettings> HttpBots { get; set; }
         public List<TelnetServerSettings> TelnetServers { get; set; }
+        public List<MqttClientSettings> MqttClients { get; set; } = new List<MqttClientSettings>();
 
         public MeshtasticApplicationSettings()
         {
@@ -308,6 +318,7 @@ namespace MeshTerminal.Client
                 if (settings.Logo.InnerHeight < 1) settings.Logo.InnerHeight = 1;
                 if (settings.ChatBots == null) settings.ChatBots = new List<MeshtasticChatBotSettings>();
                 NormalizeChatBots(settings);
+                if (settings.MqttClients == null) settings.MqttClients = new List<MqttClientSettings>();
                 if (settings.TelnetServers == null) settings.TelnetServers = new List<TelnetServerSettings>();
             if (settings.HttpBots == null) settings.HttpBots = new List<MeshtasticHttpBotSettings>(); NormalizeHttpBots(settings);
                 EnsureTelegramGateways(settings);
@@ -343,7 +354,8 @@ namespace MeshTerminal.Client
             if (settings.Logo.InnerHeight < 1) settings.Logo.InnerHeight = 1;
             if (settings.ChatBots == null) settings.ChatBots = new List<MeshtasticChatBotSettings>();
             NormalizeChatBots(settings);
-            if (settings.TelnetServers == null) settings.TelnetServers = new List<TelnetServerSettings>();
+            if (settings.MqttClients == null) settings.MqttClients = new List<MqttClientSettings>();
+                if (settings.TelnetServers == null) settings.TelnetServers = new List<TelnetServerSettings>();
             if (settings.HttpBots == null) settings.HttpBots = new List<MeshtasticHttpBotSettings>(); NormalizeHttpBots(settings);
             EnsureTelegramGateways(settings);
             Validate(settings);
@@ -374,6 +386,10 @@ namespace MeshTerminal.Client
             if (String.IsNullOrWhiteSpace(appearance.MapNodeColor)) appearance.MapNodeColor = "BrightCyan";
             if (String.IsNullOrWhiteSpace(appearance.MapClusterColor)) appearance.MapClusterColor = "BrightMagenta";
             if (String.IsNullOrWhiteSpace(appearance.MapGridColor)) appearance.MapGridColor = "DarkGray";
+            if (String.IsNullOrWhiteSpace(appearance.FailedMessageStatusColor)) appearance.FailedMessageStatusColor = "Red";
+            if (String.IsNullOrWhiteSpace(appearance.TimestampColor)) appearance.TimestampColor = "Gray";
+            if (String.IsNullOrWhiteSpace(appearance.SuccessfulMessageStatusColor)) appearance.SuccessfulMessageStatusColor = "Green";
+            if (String.IsNullOrWhiteSpace(appearance.SenderNameColor)) appearance.SenderNameColor = "Gray";
             if (String.IsNullOrWhiteSpace(appearance.DaySeparatorColor)) appearance.DaySeparatorColor = "DarkGray";
         }
 
