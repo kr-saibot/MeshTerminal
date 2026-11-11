@@ -9,6 +9,12 @@ internal static class MapSymbolTests
     private static void Check(bool value, string message) { if (!value) throw new Exception("Map symbols: " + message); }
     internal static void Run()
     {
+        // ConPTY uses BS for a one-column cursor move. Replacing it with a space
+        // advances the cursor instead and makes Left/Backspace visibly jump right.
+        var cursorOutput = "\b\u001b[3;7H\u001b[?25h\r\n\t".ToCharArray();
+        Span<char> cursorSpan = cursorOutput.AsSpan();
+        TerminalOutputSanitizer.Sanitize(ref cursorSpan);
+        Check(new string(cursorOutput) == "\b\u001b[3;7H\u001b[?25h\r\n\t", "Host preserves ConPTY cursor movement and terminal controls");
         var replacements = new Dictionary<string, string> { { "♥", "[:heart:]" }, { "♟", "[:pawn:]" }, { "😀", "[:smile:]" } };
         Func<string, bool> emoji = element => element.Any(c => c > 255);
         foreach (var symbol in MapSymbolCatalog.Symbols)

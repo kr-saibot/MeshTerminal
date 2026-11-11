@@ -1,4 +1,4 @@
-param([switch] $DocumentationOnly)
+param([switch] $DocumentationOnly, [switch] $CursorProbe)
 
 $ErrorActionPreference = "Stop"
 
@@ -70,6 +70,16 @@ if ($DocumentationOnly) {
     & (Join-Path $PSScriptRoot 'Update-ReleasePackaging.ps1') -BuildRoot $BuildRoot -StagingRoot $StagingRoot
     Write-Host 'Protocol documentation and ZIP file inventories updated for Windows and Linux.'
     exit 0
+}
+
+if ($CursorProbe) {
+    $probeProject = Join-Path $RepositoryRoot 'tests\Cursor.Probe\Cursor.Probe.csproj'
+    $probeOutput = Join-Path $StagingRoot 'CursorProbe'
+    dotnet build $probeProject --configuration Release -p:OutputPath="$probeOutput\"
+    if ($LASTEXITCODE -ne 0) { throw 'Cursor probe build failed.' }
+    & (Join-Path $probeOutput 'Cursor.Probe.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'Cursor probe failed.' }
+    return
 }
 
 Push-Location $RepositoryRoot

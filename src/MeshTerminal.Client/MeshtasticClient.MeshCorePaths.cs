@@ -9,6 +9,7 @@ namespace MeshTerminal.Client
     public sealed class MeshCorePathStep
     {
         public string Name { get; internal set; }
+        public float? SnrDb { get; internal set; }
         public double? Latitude { get; internal set; }
         public double? Longitude { get; internal set; }
     }
@@ -19,9 +20,43 @@ namespace MeshTerminal.Client
         public string Outgoing { get; internal set; }
         public string IncomingAdvert { get; internal set; }
         public DateTime? AdvertReceivedUtc { get; internal set; }
+        public MeshCorePathSnapshot OutgoingSnapshot { get; internal set; }
+        public MeshCorePathSnapshot IncomingSnapshot { get; internal set; }
+        public bool OutgoingCached { get; internal set; }
+        public bool IncomingCached { get; internal set; }
+        public void UseSavedFallback(MeshCoreNodePaths saved)
+        {
+            if(saved==null) return;
+            if(OutgoingSnapshot==null && saved.OutgoingSnapshot!=null)
+            { OutgoingSteps=saved.OutgoingSteps; OutgoingSnapshot=saved.OutgoingSnapshot; OutgoingCached=true; }
+            if(IncomingSnapshot==null && saved.IncomingSnapshot!=null)
+            { IncomingAdvertSteps=saved.IncomingAdvertSteps; IncomingSnapshot=saved.IncomingSnapshot; IncomingCached=true; AdvertReceivedUtc=saved.AdvertReceivedUtc; }
+        }
     }
     public sealed partial class MeshtasticClient
     {
+        public event EventHandler<MeshCorePathSnapshot> MeshCorePathObserved;
+        private MeshCorePathSnapshot ObserveMeshCorePath(byte[] key, bool incoming, byte encoded, byte[] bytes, DateTime? advertUtc=null)
+        {
+            var count=DecodeMeshCoreHops(encoded);
+            if(!count.HasValue || bytes.Length<count.Value*((encoded>>6)+1) || String.IsNullOrWhiteSpace(Device.NodeId)) return null;
+            var snapshot=new MeshCorePathSnapshot { DeviceIdentity=Device.NodeId,TargetIdentity=Hex(key,0,32),Incoming=incoming,EncodedPath=encoded,Path=bytes.Take((int)count.Value*((encoded>>6)+1)).ToArray(),ObservedUtc=DateTime.UtcNow,AdvertReceivedUtc=advertUtc };
+            Raise(MeshCorePathObserved,snapshot);
+            return snapshot;
+        }
+        public MeshCoreNodePaths RestoreMeshCoreNodePaths(uint number, MeshCorePathSnapshot outgoing, MeshCorePathSnapshot incoming)
+        {
+            var nodes=Nodes.ToArray(); var target=nodes.FirstOrDefault(n=>n.Number==number);
+            var self=new MeshCorePathStep { Name=Device.NodeName??"This device",Latitude=Device.Latitude,Longitude=Device.Longitude };
+            var peer=new MeshCorePathStep { Name=target?.LongName??outgoing?.TargetIdentity??incoming?.TargetIdentity??"Node",Latitude=target?.Latitude,Longitude=target?.Longitude };
+            return new MeshCoreNodePaths {
+                OutgoingSnapshot=outgoing,IncomingSnapshot=incoming,OutgoingCached=outgoing!=null,IncomingCached=incoming!=null,
+                OutgoingSteps=outgoing==null?null:DecodeMeshCorePathSteps(outgoing.EncodedPath,outgoing.Path,nodes,self,peer),
+                IncomingAdvertSteps=incoming==null?null:DecodeMeshCorePathSteps(incoming.EncodedPath,incoming.Path,nodes,peer,self),
+                AdvertReceivedUtc=incoming?.AdvertReceivedUtc
+            };
+        }
+
         internal static string DescribeMeshCorePath(byte encoded, byte[] data, IEnumerable<MeshNode> nodes, string start, string end)
         {
             var count = DecodeMeshCoreHops(encoded);
@@ -66,7 +101,7 @@ namespace MeshTerminal.Client
                     var previous = steps[index - 1]; var current = steps[index];
                     var distance = GetDistanceMeters(previous.Latitude, previous.Longitude, current.Latitude, current.Longitude);
                     var label = distance.HasValue ? (distance.Value < 1000 ? Math.Round(distance.Value).ToString(System.Globalization.CultureInfo.InvariantCulture) + " m" : (distance.Value / 1000).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " km") : null;
-                    lines.Add("↓" + (label == null ? "" : "  " + label));
+                    lines.Add("↓" + (label == null ? "" : "  " + label) + (current.SnrDb.HasValue ? "  SNR " + current.SnrDb.Value.ToString("0.##",System.Globalization.CultureInfo.InvariantCulture) + " dB" : ""));
                 }
                 lines.Add(steps[index].Name);
             }
@@ -89,6 +124,7 @@ namespace MeshTerminal.Client
                 var contact = await session.CommandAsync(new byte[] { 30 }.Concat(key).ToArray(), new byte[] { 3 }, token).ConfigureAwait(false);
                 RequireMeshCoreLength(contact, 100);
                 if (Hex(contact, 1, 32) != Hex(key, 0, 32)) throw new InvalidDataException("Contact reply belongs to another node.");
+                result.OutgoingSnapshot = ObserveMeshCorePath(key, false, contact[35], contact.Skip(36).Take(64).ToArray());
                 result.OutgoingSteps = DecodeMeshCorePathSteps(contact[35], contact.Skip(36).Take(64).ToArray(), nodes, selfStep, targetStep);
                 result.Outgoing = DescribeMeshCorePath(contact[35], contact.Skip(36).Take(64).ToArray(), nodes, self, name);
             }
@@ -101,6 +137,7 @@ namespace MeshTerminal.Client
                 result.IncomingAdvert = DescribeMeshCorePath(advert[5], advert.Skip(6).ToArray(), nodes, name, self);
                 var timestamp = MeshCoreSession.ReadUInt32(advert, 1);
                 if (timestamp != 0) result.AdvertReceivedUtc = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(timestamp);
+                result.IncomingSnapshot = ObserveMeshCorePath(key,true,advert[5],advert.Skip(6).ToArray(),result.AdvertReceivedUtc);
             }
             catch (IOException ex) { result.IncomingAdvert = "Not available: " + ex.Message; }
             return result;

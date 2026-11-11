@@ -33,6 +33,7 @@ namespace MeshTerminal
             var battery = d.BatteryLevel.HasValue ? (d.BatteryLevel.Value > 100 ? "External power" : d.BatteryLevel.Value + " %") : "Not available";
             if (voltage.HasValue) battery = (_mesh.Protocol == MeshProtocol.MeshCore ? "" : battery + ", ") + voltage.Value.ToString("0.000", CultureInfo.InvariantCulture) + " V";
             text.AppendLine("Battery: " + battery);
+            text.AppendLine(TxUtilizationDisplay.Details(d.TxUtilization,_mesh.IsConnected));
             if (_mesh.Protocol == MeshProtocol.MeshCore)
             {
                 text.AppendLine("Device time (last read): " + (_mesh.IsConnected && d.DeviceClockUtc.HasValue ? d.DeviceClockUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz") : "Not available"));

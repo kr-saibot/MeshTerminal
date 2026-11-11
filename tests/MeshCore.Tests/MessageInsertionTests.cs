@@ -1,5 +1,7 @@
 using System;
 using MeshTerminal;
+using MeshTerminal.Client;
+using System.Linq;
 using Terminal.Gui;
 internal static class MessageInsertionTests
 {
@@ -17,6 +19,18 @@ internal static class MessageInsertionTests
             catch (InvalidOperationException) { handled = true; }
             Check(handled, "Clipboard failures return to caller instead of crashing a background thread");
         }
+        var mentions=MessageMentions.RecentNames(new[] {
+            new StoredMeshMessage { Direction=MessageDirection.Incoming,FromNode=1,SenderName="Alice",OccurredUtc=DateTime.UtcNow.AddYears(1) },
+            new StoredMeshMessage { Direction=MessageDirection.Incoming,FromNode=2,SenderName="Mobile 4",OccurredUtc=DateTime.UtcNow },
+            new StoredMeshMessage { Direction=MessageDirection.Outgoing,FromNode=3,SenderName="You" },
+            new StoredMeshMessage { Direction=MessageDirection.Incoming,FromNode=4 },
+            new StoredMeshMessage { Direction=MessageDirection.Incoming,FromNode=1,SenderName="Alice",OccurredUtc=DateTime.MinValue },
+            new StoredMeshMessage { Direction=MessageDirection.Incoming,FromNode=99,SenderName="Own echo" },
+            new StoredMeshMessage { Direction=MessageDirection.Incoming,FromNode=5,SenderName="Grüße 😀" },
+            new StoredMeshMessage { Direction=MessageDirection.Incoming,FromNode=6 }
+        },n=>n==4?"Meshtastic contact":null,99);
+        Check(mentions.SequenceEqual(new[] {"Grüße 😀","Alice","Meshtastic contact","Mobile 4"}),"Mention list uses latest reception order, unique names, contact fallback and excludes own/unknown senders");
+        Check(MessageMentions.RecentNames(new StoredMeshMessage[0],n=>null,null).Count==0,"Empty chat has no mention entries");
         Application.Init(new FakeDriver());
         try
         {
@@ -37,6 +51,9 @@ internal static class MessageInsertionTests
             Check(input.Text.ToString().Replace("\r\n", "\n") == "abcdefghijklmnopqr😀stuvwxyz", "Insert into a wrapped visual row at the original text position");
             for (int i = 0; i < 30; i++) MessageTextInsertion.Insert(input, "😀");
             Check(input.Text.ToString().Replace("\r\n", "\n").Contains("😀😀😀"), "Repeated emoji insertion must not corrupt the wrap model");
+            input.Text="Hi !";input.CursorPosition=new Point(3,0);
+            MessageTextInsertion.Insert(input,"@Mobile 4");
+            Check(input.Text.ToString().Replace("\r\n","\n")=="Hi @Mobile 4!","Mention inserts the complete username at the selected cursor position");
             input.Text = "AB"; input.CursorPosition = new Point(1, 0);
             MessageTextInsertion.Insert(input, MessageClipboard.CleanText("x\t😀\0\r\ny"));
             Check(input.Text.ToString().Replace("\r\n", "\n") == "Ax    😀\nyB", "Cleaned clipboard inserts safely in wrapped input");

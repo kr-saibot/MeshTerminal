@@ -783,7 +783,7 @@ namespace MeshTerminal
             _store = MeshtasticMessageStore.CreateSqlite(_settings.Connection.Protocol == MeshProtocol.MeshCore ? "meshcore-messages.db" : "meshtastic-messages.db");
             _store.Initialize();
             _databaseWrites = new DatabaseWriteQueue();
-            _lastKnownUnreadCount = _store.CountNewMessages(_settings.Alerts.SuppressMapMessageAlerts);
+            _lastKnownUnreadCount = CountAlertMessages();
             _mesh = new MeshtasticClient();
             _mesh.Protocol = _settings.Connection.Protocol;
             if (_settings.Connection.Protocol == MeshProtocol.MeshCore) _store.EnableDeferredMeshCoreIdentities();
@@ -795,6 +795,7 @@ namespace MeshTerminal
             _store.MessageStored += PublishMqttMessage;
             _store.PositionStored += PublishMqttTelemetry;
             Application.Init();
+            WindowsCursorRefresh.Install();
             InitializeDesktopNotifications();
             BuildUi();
             StartHostQrBridge();
@@ -1032,10 +1033,16 @@ namespace MeshTerminal
             Frames.Add(_logoFrame);
             _channelsFrame = new FrameView("Channels [F1]") { X = 0, Y = GetLogoOuterHeight(), Width = sidebarOuterWidth, Height = 10 };
             Frames.Add(_channelsFrame);
-            _channelList = new ListView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
+            _channelList = new ChatMuteListView { IsMuted = i => i >= 0 && i < ChannelChats.Count && IsChatMuted(false, ChannelChats[i].Id), X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
             _channelList.SelectedItemChanged += delegate(ListViewItemEventArgs e) { if (!_refreshingChatLists && e.Item >= 0 && e.Item < ChannelChats.Count) { _nodeStartedChat = false; _selected = ChannelChats[e.Item]; ShowSelectedChat(); } };
             _channelList.KeyPress += e =>
             {
+                if (e.KeyEvent.Key == (Key)'m' || e.KeyEvent.Key == (Key)'M')
+                {
+                    var muteIndex = _channelList.SelectedItem;
+                    if (muteIndex >= 0 && muteIndex < ChannelChats.Count) ToggleChatMute(ChannelChats[muteIndex]);
+                    e.Handled = true; return;
+                }
                 if (e.KeyEvent.Key == Key.CursorDown && ChannelChats.Count > 0 && _channelList.SelectedItem >= ChannelChats.Count - 1 && DirectChats.Count > 0)
                 {
                     e.Handled = true;
@@ -1069,10 +1076,16 @@ namespace MeshTerminal
             _channelsFrame.Add(_channelList);
             _directChatsFrame = new FrameView("Direct chats [F2]") { X = 0, Y = Pos.Bottom(_channelsFrame), Width = sidebarOuterWidth, Height = Dim.Fill() };
             Frames.Add(_directChatsFrame);
-            _directList = new ListView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
+            _directList = new ChatMuteListView { IsMuted = i => i >= 0 && i < DirectChats.Count && IsChatMuted(true, DirectChats[i].Id), X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
             _directList.SelectedItemChanged += delegate(ListViewItemEventArgs e) { if (!_refreshingChatLists && e.Item >= 0 && e.Item < DirectChats.Count) { _nodeStartedChat = false; _selected = DirectChats[e.Item]; ShowSelectedChat(); } };
             _directList.KeyPress += e =>
             {
+                if (e.KeyEvent.Key == (Key)'m' || e.KeyEvent.Key == (Key)'M')
+                {
+                    var muteIndex = _directList.SelectedItem;
+                    if (muteIndex >= 0 && muteIndex < DirectChats.Count) ToggleChatMute(DirectChats[muteIndex]);
+                    e.Handled = true; return;
+                }
                 if (e.KeyEvent.Key == Key.CursorDown && DirectChats.Count > 0 && _directList.SelectedItem >= DirectChats.Count - 1 && ChannelChats.Count > 0)
                 {
                     e.Handled = true;
@@ -1106,13 +1119,16 @@ namespace MeshTerminal
             _directChatsFrame.Add(_directList);
             _nodeInfoFrame = new FrameView("Chat / node info") { X = sidebarOuterWidth + 1, Y = 0, Width = Dim.Fill(), Height = 5 };
             Frames.Add(_nodeInfoFrame);
-            _header = new Label("Select a chat") { X = 0, Y = 0, Width = Dim.Fill(14) };
+            _header = new Label("Select a chat") { X = 0, Y = 0, Width = Dim.Fill(26) };
             _latestTelemetry = new Label("") { X = 0, Y = 1, Width = Dim.Fill() };
             _nodeConnectionInfo = new Label("") { X = 0, Y = 2, Width = Dim.Fill() };
             var chatInfo = new Button("Info") { X = Pos.AnchorEnd(8), Y = 0 };
+            _chatMuteButton = new Button("Mute") { X = Pos.AnchorEnd(20), Y = 0, Width = 10, Enabled = false };
+            _chatMuteButton.Clicked += delegate { if (_selected != null) ToggleChatMute(_selected); };
+            MainButtons.Add(_chatMuteButton);
             MainButtons.Add(chatInfo);
             chatInfo.Clicked += ShowCurrentChatNodeDetails;
-            _nodeInfoFrame.Add(_header, _latestTelemetry, _nodeConnectionInfo, chatInfo);
+            _nodeInfoFrame.Add(_header, _latestTelemetry, _nodeConnectionInfo, _chatMuteButton, chatInfo);
             _messagesFrame = new FrameView("Messages") { X = sidebarOuterWidth + 1, Y = Pos.Bottom(_nodeInfoFrame), Width = Dim.Fill(), Height = Dim.Fill(5) };
             Frames.Add(_messagesFrame);
             _messages = new ChatTranscriptView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
@@ -1228,6 +1244,7 @@ namespace MeshTerminal
             ApplyAppearanceSettings();
             ApplyLogoSettings();
             InstallReadOnInteractionHandlers();
+            Application.MainLoop.AddTimeout(TimeSpan.FromSeconds(10), loop => { if(Volatile.Read(ref _shutdownStarted)!=0) return false; QueueRepeaterMonitoring(); return true; });
             Application.MainLoop.AddTimeout(TimeSpan.FromSeconds(1), delegate(MainLoop loop) { if (Volatile.Read(ref _shutdownStarted) != 0) return false; UpdateStatus(); UpdateMapGpsPosition(); CheckRepeatingAlertBeep(); UpdateLogoBlink(); RotateLogoIfDue(); if (_nodeMap != null) _nodeMap.RefreshPositionMarkerInfo(); return true; });
         }
 
@@ -1273,6 +1290,8 @@ namespace MeshTerminal
             _mesh.NodeDiscovered += delegate(object sender, NodeEventArgs e) { if (Volatile.Read(ref _bufferNodeSynchronization) != 0) return; Save(delegate { _store.AddOrUpdateNode(e.Node); Ui(QueueNodePageRefresh); }, "node:" + e.Node.Number.ToString(CultureInfo.InvariantCulture)); };
             _mesh.NodeUpdated += delegate(object sender, NodeEventArgs e) { if (Volatile.Read(ref _bufferNodeSynchronization) != 0) return; Save(delegate { _store.AddOrUpdateNode(e.Node); Ui(QueueNodePageRefresh); }, "node:" + e.Node.Number.ToString(CultureInfo.InvariantCulture)); };
             _mesh.MeshCoreDeviceContactsChanged += delegate { Ui(() => { QueueNodePageRefresh(); }); };
+            _mesh.TracerouteReceived += (sender, trace) => Save(() => _store.SaveTraceroute(trace));
+            _mesh.MeshCorePathObserved += (sender, path) => Save(() => _store.SaveMeshCorePath(path), "meshcore-path:" + path.DeviceIdentity + ":" + path.TargetIdentity + ":" + path.Incoming);
             _mesh.MeshCoreRoomsChanged += delegate { Ui(delegate { RefreshChats(); UpdateStatus(); }); };
             _mesh.MessageReceived += delegate(object sender, MeshMessageEventArgs e)
             {
@@ -1307,6 +1326,7 @@ namespace MeshTerminal
             };
             _mesh.MeshCoreRepeaterStatusReceived += status =>
             {
+                if (_repeaterMonitorCollecting.ContainsKey(status.NodeNumber)) return;
                 if (_mqttClients?.HasTelemetryClients == true) PublishMqttTelemetry(MqttTelemetry.From(status));
                 if (!_settings.StoreTelemetryData) return;
                 Save(() =>
@@ -1645,6 +1665,7 @@ namespace MeshTerminal
 
         private static void ShowSelectedChat()
         {
+            UpdateChatMuteButton();
             ApplyChatListSelectionColors();
             if (_selected == null) { _header.Text = "No chat selected"; _latestTelemetry.Text = ""; _nodeConnectionInfo.Text = ""; _messages.SetMessages(new StoredMeshMessage[0], FormatMessage); return; }
             _header.Text = BuildChatHeader(_selected);
@@ -2176,7 +2197,7 @@ namespace MeshTerminal
                 "\nF           Next/newer stored position" +
                 "\nR           Previous/older stored position" +
                 "\n1-6         Toggle overlays 1 through 6" +
-                "\n7           Toggle MeshCore path layer (FROM yellow / TO white)" +
+                "\n7           Toggle path layer (FROM yellow / TO white)" +
                 "\n8           Toggle offline background map" +
                 "\n9           Toggle position history" +
                 "\n0           Toggle known nodes" +
@@ -2253,7 +2274,7 @@ namespace MeshTerminal
                 }));
             }
             if (_mesh.Protocol == MeshProtocol.MeshCore || TemporaryMeshCorePaths.Count > 0)
-                items.Add(MapLayerMenuItem("MeshCore paths (FROM yellow / TO white)", "7", _temporaryMeshCorePathsVisible && TemporaryMeshCorePaths.Count > 0, () => ToggleMapOverlayByNumber(6), () => TemporaryMeshCorePaths.Count > 0));
+                items.Add(MapLayerMenuItem("Paths (FROM yellow / TO white)", "7", _temporaryMeshCorePathsVisible && TemporaryMeshCorePaths.Count > 0, () => ToggleMapOverlayByNumber(6), () => TemporaryMeshCorePaths.Count > 0));
             if (_nodeMap != null && _nodeMap.HasBackgroundMap)
                 items.Add(MapLayerMenuItem("Offline background map", "8", _settings.Map.ShowBackgroundMap, ToggleBackgroundMapFromMap));
             items.Add(MapLayerMenuItem("Position history", "9", _settings.Map.PositionTrackVisible && _settings.Map.PositionTrackNodeNumber.HasValue, TogglePositionHistoryFromMap, () => _settings.Map.PositionTrackNodeNumber.HasValue));
@@ -2597,7 +2618,7 @@ namespace MeshTerminal
 
         private static void ToggleMapOverlayByNumber(int index)
         {
-            if (index == 6) { _temporaryMeshCorePathsVisible = !_temporaryMeshCorePathsVisible; RefreshMapOverlays(); ShowBriefMapPopup("MeshCore path layer " + (_temporaryMeshCorePathsVisible ? "enabled" : "disabled")); return; }
+            if (index == 6) { _temporaryMeshCorePathsVisible = !_temporaryMeshCorePathsVisible; RefreshMapOverlays(); ShowBriefMapPopup("Path layer " + (_temporaryMeshCorePathsVisible ? "enabled" : "disabled")); return; }
             if (index < 0 || index >= 8) return;
             if (index >= MapOverlayFiles.Count)
             {
@@ -3526,6 +3547,7 @@ namespace MeshTerminal
         {
             var values = new List<string>();
             if (telemetry.BatteryLevel.HasValue) values.Add("Battery: " + telemetry.BatteryLevel.Value + "%");
+            if (telemetry.NeighborCount.HasValue) values.Add("Neighbors: " + telemetry.NeighborCount.Value);
             if (telemetry.NoiseFloorDbm.HasValue) values.Add("Noise floor: " + telemetry.NoiseFloorDbm.Value + " dBm");
             if (telemetry.LastRssiDbm.HasValue) values.Add("Repeater RSSI: " + telemetry.LastRssiDbm.Value + " dBm");
             if (telemetry.LastSnrDb.HasValue) values.Add("Repeater SNR: " + telemetry.LastSnrDb.Value.ToString("0.##", CultureInfo.InvariantCulture) + " dB");
@@ -3550,6 +3572,7 @@ namespace MeshTerminal
             var telemetry = TelemetryItems[index];
             var values = new List<string>();
             if (telemetry.BatteryLevel.HasValue) values.Add("Battery: " + telemetry.BatteryLevel.Value + "%");
+            if (telemetry.NeighborCount.HasValue) values.Add("Neighbors: " + telemetry.NeighborCount.Value);
             if (telemetry.NoiseFloorDbm.HasValue) values.Add("Noise floor: " + telemetry.NoiseFloorDbm.Value + " dBm");
             if (telemetry.LastRssiDbm.HasValue) values.Add("Repeater RSSI: " + telemetry.LastRssiDbm.Value + " dBm");
             if (telemetry.LastSnrDb.HasValue) values.Add("Repeater SNR: " + telemetry.LastSnrDb.Value.ToString("0.##", CultureInfo.InvariantCulture) + " dB");
@@ -3837,6 +3860,7 @@ namespace MeshTerminal
                 "\nHops: " + (node.HopsAway.HasValue ? node.HopsAway.Value.ToString() : "not available");
             var buttons = new List<string> { "Start chat", "Telemetry", "Position history", node.IsFavorite ? "Remove favorite" : "Add favorite", "Copy GPS", "Delete" };
             if (_mesh.Protocol == MeshProtocol.MeshCore) { text += "\nDevice contact: " + MeshCoreContactStatus(node) + "\nType: " + MeshCoreNodeType(node); buttons.Add("Paths"); buttons.Add("Save to device"); buttons.Add("Remove from device"); }
+            else buttons.Add("Traceroute");
             int serviceButton = -1;
             var serviceType = _mesh.Protocol == MeshProtocol.MeshCore ? MeshCoreNodeType(node) : "";
             if (serviceType == "Repeater" || serviceType == "Roomserver") { serviceButton = buttons.Count; buttons.Add(serviceType == "Repeater" ? "Repeater admin" : "Room login"); }
@@ -3851,6 +3875,7 @@ namespace MeshTerminal
             else if (selectedButton == 2) ShowNodePositionHistory(node);
             else if (selectedButton == 3) { _store.SetNodeFavorite(node.NodeNumber, !node.IsFavorite); RefreshNodePage(); }
             else if (selectedButton == 4) CopyNodePositionToClipboard(node);
+            else if (selectedButton == 6 && _mesh.Protocol == MeshProtocol.Meshtastic) ShowMeshtasticTraceroute(node);
             else if (selectedButton == 6 && _mesh.Protocol == MeshProtocol.MeshCore) ShowMeshCoreNodePaths(node);
             else if (selectedButton == 7 && _mesh.Protocol == MeshProtocol.MeshCore) EditMeshCoreContact(node);
             else if (selectedButton == 8 && _mesh.Protocol == MeshProtocol.MeshCore) RemoveMeshCoreDeviceContact(node);
@@ -4883,11 +4908,13 @@ namespace MeshTerminal
         private static void NotifyAlertStateChanged(MeshMessage message)
         {
             int unreadCount;
-            try { unreadCount = _store.CountNewMessages(_settings.Alerts.SuppressMapMessageAlerts); }
+            try { unreadCount = CountAlertMessages(); }
             catch { return; }
 
             var becameFullyRead = message == null && unreadCount == 0 && _lastKnownUnreadCount > 0;
             _lastKnownUnreadCount = unreadCount;
+
+            if (message != null && IsChatMuted(message.IsDirectMessage, message.IsChannelMessage ? message.ChannelIndex.GetValueOrDefault() : message.From)) return;
 
             if (message != null && _settings.Alerts.SuppressMapMessageAlerts &&
                 (message.Text ?? "").StartsWith("///MAP", StringComparison.Ordinal)) return;
@@ -4949,7 +4976,7 @@ namespace MeshTerminal
             var shouldBlink = false;
             if (_settings != null && _settings.Alerts != null && _settings.Alerts.BlinkLogoForUnreadMessages && _store != null)
             {
-                try { shouldBlink = _store.CountNewMessages(_settings.Alerts.SuppressMapMessageAlerts) > 0; }
+                try { shouldBlink = CountAlertMessages() > 0; }
                 catch { return; } // Preserve the current display on a transient database error.
             }
             if (shouldBlink) _logoColorsSwapped = !_logoColorsSwapped;
@@ -4978,7 +5005,7 @@ namespace MeshTerminal
             _nextRepeatedAlertCheckUtc = now.AddSeconds(_settings.Alerts.RepeatBeepIntervalSeconds);
             try
             {
-                if (_store.CountNewMessages(_settings.Alerts.SuppressMapMessageAlerts) > 0) PlayAlertBeep();
+                if (CountAlertMessages() > 0) PlayAlertBeep();
             }
             catch { }
         }
@@ -5361,7 +5388,7 @@ namespace MeshTerminal
                 var remaining = Math.Max(0, (int)Math.Ceiling((nextReconnectUtc.Value - DateTime.UtcNow).TotalSeconds));
                 reconnectStatus = " | reconnect in " + remaining.ToString(CultureInfo.InvariantCulture) + "s";
             }
-            _status.Text = " F10 Menu | " + DateTime.Now.ToString("HH:mm:ss") + " | " + _mesh.Protocol + " | Connection: " + connectionState + reconnectStatus + " | " + (info.Transport ?? "No connection") + " | Node: " + (String.IsNullOrWhiteSpace(device.NodeName) ? "-" : device.NodeName) + " | Battery: " + (_mesh.Protocol == MeshProtocol.MeshCore ? (_mesh.IsConnected && device.MeshCoreBatteryVoltage.HasValue ? device.MeshCoreBatteryVoltage.Value.ToString("0.00", CultureInfo.InvariantCulture) + " V" : "-") : (device.BatteryLevel.HasValue ? device.BatteryLevel.Value + "%" : "-")) + " | NF: " + (_mesh.IsConnected && device.NoiseFloorDbm.HasValue ? device.NoiseFloorDbm.Value + " dBm" : "-") + " | GPS: " + position;
+            _status.Text = " F10 Menu | " + DateTime.Now.ToString("HH:mm:ss") + " | Connection: " + connectionState + reconnectStatus + " | " + (info.Transport == "Bluetooth LE" ? "BLE" : info.Transport ?? "No connection") + " | Node: " + (String.IsNullOrWhiteSpace(device.NodeName) ? "-" : device.NodeName) + " | Bat: " + (_mesh.Protocol == MeshProtocol.MeshCore ? (_mesh.IsConnected && device.MeshCoreBatteryVoltage.HasValue ? device.MeshCoreBatteryVoltage.Value.ToString("0.00", CultureInfo.InvariantCulture) + " V" : "-") : (device.BatteryLevel.HasValue ? device.BatteryLevel.Value + "%" : "-")) + " | NF: " + (_mesh.IsConnected && device.NoiseFloorDbm.HasValue ? device.NoiseFloorDbm.Value + " dBm" : "-") + " | " + TxUtilizationDisplay.Compact(device.TxUtilization,_mesh.IsConnected) + " | GPS: " + position;
             _status.SetNeedsDisplay();
         }
         private static string DisplayNodeName(uint number)
@@ -5456,6 +5483,7 @@ namespace MeshTerminal
 
         private static void StopExternalServicesWithTimeout(TimeSpan timeout)
         {
+            _repeaterMonitorStop.Cancel();
             var stops = new List<Task>();
             if (_mqttClients != null) stops.Add(StartStop(() => _mqttClients.StopAsync()));
             if (_telnetServers != null) stops.Add(StartStop(() => _telnetServers.StopAsync()));
@@ -5467,6 +5495,7 @@ namespace MeshTerminal
 
         private static void StopExternalServicesWithProgress(TimeSpan timeout, Stopwatch elapsed)
         {
+            _repeaterMonitorStop.Cancel();
             var stops = new List<KeyValuePair<string, Task>>();
             if (_mqttClients != null) stops.Add(new KeyValuePair<string, Task>("MQTT clients", StartStop(() => _mqttClients.StopAsync())));
             if (_telnetServers != null) stops.Add(new KeyValuePair<string, Task>("Telnet servers", StartStop(() => _telnetServers.StopAsync())));

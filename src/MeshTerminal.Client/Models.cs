@@ -126,6 +126,7 @@ namespace MeshTerminal.Client
         public DateTime? DeviceClockReadAtUtc { get; internal set; }
         public string DeviceClockSyncStatus { get; internal set; }
         public int? RoutingHashLengthBytes { get; internal set; }
+        public TxUtilizationSnapshot TxUtilization { get; internal set; }
         public int? NoiseFloorDbm { get; internal set; }
         public uint? RadioReceivedPackets { get; internal set; }
         public uint? RadioSentPackets { get; internal set; }

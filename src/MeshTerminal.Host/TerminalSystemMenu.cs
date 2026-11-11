@@ -12,7 +12,7 @@ namespace MeshTerminal.Host
             StartMinimized = 0x1E60, StartWithWindows = 0x1E70, DarkMode = 0x1E80,
             SelectBellSound = 0x1E90, ClearBellSound = 0x1EA0,
             CopyScreenshot = 0x1EC0, SelectProgramIcon = 0x1ED0, ScanQrArea = 0x1EE0, ScanQrScreen = 0x1EF0,
-            MinimizeToTray = 0x1EB0;
+            MinimizeToTray = 0x1EB0, CopySelection = 0x1F00;
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetSystemMenu(IntPtr window, bool revert);
@@ -28,6 +28,7 @@ namespace MeshTerminal.Host
             AppendMenu(menu, MfString, (UIntPtr)SelectProgramIcon, "Programm-Icon auswählen …");
             AppendMenu(menu, MfString, (UIntPtr)ScanQrArea, "QR-Code aus Bildschirmbereich …");
             AppendMenu(menu, MfString, (UIntPtr)ScanQrScreen, "QR-Codes auf allen Bildschirmen …");
+            AppendMenu(menu, MfString, (UIntPtr)CopySelection, "Markierten Text kopieren\tStrg+Umschalt+C");
             AppendMenu(menu, MfString, (UIntPtr)CopyScreenshot, "Terminal-Screenshot in Zwischenablage");
             AppendMenu(menu, MfString, (UIntPtr)SelectBellSound, "Alarm-Audiodatei auswählen …");
             if (!String.IsNullOrWhiteSpace(AppSettings.BellSoundPath))
@@ -54,6 +55,7 @@ namespace MeshTerminal.Host
         public static bool IsSelectProgramIconCommand(IntPtr command) { return command.ToInt32() == SelectProgramIcon; }
         public static bool IsScanQrAreaCommand(IntPtr command) { return command.ToInt32() == ScanQrArea; }
         public static bool IsScanQrScreenCommand(IntPtr command) { return command.ToInt32() == ScanQrScreen; }
+        public static bool IsCopySelectionCommand(IntPtr command) { return command.ToInt32() == CopySelection; }
         public static bool IsCopyScreenshotCommand(IntPtr command) { return command.ToInt32() == CopyScreenshot; }
         public static bool IsStartMinimizedCommand(IntPtr command) { return command.ToInt32() == StartMinimized; }
         public static bool IsMinimizeToTrayCommand(IntPtr command) { return command.ToInt32() == MinimizeToTray; }

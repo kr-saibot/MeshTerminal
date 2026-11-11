@@ -643,6 +643,7 @@ namespace MeshTerminal.Client
                 case FromRadio.PayloadVariantOneofCase.NodeInfo:
                     var newLiveNode=!_nodes.ContainsKey(radio.NodeInfo.Num)&&State==ConnectionState.Connected&&(_configComplete==null||_configComplete.Task.IsCompleted);
                     UpdateNode(radio.NodeInfo);
+                    if(Device.MyNode!=null && radio.NodeInfo.Num==Device.MyNode.MyNodeNum && radio.NodeInfo.DeviceMetrics?.HasAirUtilTx==true) { RecordReportedTxUtilization(radio.NodeInfo.DeviceMetrics.AirUtilTx);Raise(DeviceInfoUpdated,EventArgs.Empty); }
                     if(newLiveNode)AnnounceNode(_nodes[radio.NodeInfo.Num],true,DateTime.UtcNow);
                     break;
                 case FromRadio.PayloadVariantOneofCase.Channel: UpdateChannel(radio.Channel); break;
@@ -691,7 +692,8 @@ namespace MeshTerminal.Client
             if (packet.PayloadVariantCase != MeshPacket.PayloadVariantOneofCase.Decoded) { Debug("RX packet ignored: not decoded."); return; }
             var data = packet.Decoded;
             Debug("RX decoded port: " + data.Portnum + ", payload bytes=" + data.Payload.Length);
-            if (data.Portnum == PortNum.RoutingApp) { Debug("RX routing response."); HandleRoutingResponse(data); return; }
+            if (data.Portnum == PortNum.TracerouteApp) { HandleTraceroute(packet); return; }
+            if (data.Portnum == PortNum.RoutingApp) { HandleTracerouteRouting(packet); Debug("RX routing response."); HandleRoutingResponse(data); return; }
             if (data.Portnum == PortNum.TextMessageApp)
             {
                 var message = new MeshMessage(packet, data.Payload.ToStringUtf8());
@@ -719,6 +721,11 @@ namespace MeshTerminal.Client
             else if (data.Portnum == PortNum.TelemetryApp)
             {
                 var telemetry = Telemetry.Parser.ParseFrom(data.Payload);
+                if(Device.MyNode!=null && packet.From==Device.MyNode.MyNodeNum)
+                {
+                    if(telemetry.LocalStats!=null) RecordReportedTxUtilization(telemetry.LocalStats.AirUtilTx);
+                    else if(telemetry.DeviceMetrics?.HasAirUtilTx==true) RecordReportedTxUtilization(telemetry.DeviceMetrics.AirUtilTx);
+                }
                 if (Device.MyNode != null && packet.From == Device.MyNode.MyNodeNum && telemetry.LocalStats != null) { Device.NoiseFloorDbm = telemetry.LocalStats.NoiseFloor == 0 ? (int?)null : telemetry.LocalStats.NoiseFloor; Device.RadioReceivedPackets=telemetry.LocalStats.NumPacketsRx; Device.RadioSentPackets=telemetry.LocalStats.NumPacketsTx; Device.RadioReceiveErrors=telemetry.LocalStats.NumPacketsRxBad; Device.RadioStatisticsReadUtc=DateTime.UtcNow; Raise(DeviceInfoUpdated, EventArgs.Empty); }
                 MeshNode node; if (_nodes.TryGetValue(packet.From, out node) && telemetry.DeviceMetrics != null) { node.Value.DeviceMetrics = telemetry.DeviceMetrics; Raise(NodeUpdated, new NodeEventArgs(node)); }
                 Raise(TelemetryReceived, new MeshTelemetryEventArgs(new MeshTelemetry(packet, telemetry)));
@@ -727,6 +734,8 @@ namespace MeshTerminal.Client
 
         private void HandleQueueStatus(QueueStatus status)
         {
+            PendingTraceroute trace;
+            if(status.Res!=0 && _traceroutes.TryGetValue(status.MeshPacketId,out trace)) trace.Completion.TrySetException(new IOException("Traceroute rejected by the device queue (code "+status.Res+")."));
             bool awaitingAck;
             if (_pendingDeliveries.TryGetValue(status.MeshPacketId, out awaitingAck))
             {
@@ -788,7 +797,7 @@ namespace MeshTerminal.Client
                             {
                                 nextRadioStatisticsUtc = DateTime.UtcNow.AddSeconds(5);
                                 try { await RefreshRadioStatisticsAsync(token).ConfigureAwait(false); }
-                                catch (IOException) { radioStatisticsEnabled = false; Device.NoiseFloorDbm = null; }
+                                catch (IOException) { radioStatisticsEnabled = false; Device.NoiseFloorDbm = null; ResetTxUtilization(); }
                             }
                         }
                     }
@@ -875,6 +884,7 @@ namespace MeshTerminal.Client
         private void SetState(ConnectionState state, Exception error)
         {
             var changed = false; lock (_gate) { if (_state != state) { _state = state; changed = true; } }
+            if(changed && state!=ConnectionState.Connected) { StopTraceroutes();ResetTxUtilization(); }
             if (changed) Raise(ConnectionStateChanged, new ConnectionStateChangedEventArgs(state, error));
         }
         // User callbacks run beside the transport reader. One faulty callback must not

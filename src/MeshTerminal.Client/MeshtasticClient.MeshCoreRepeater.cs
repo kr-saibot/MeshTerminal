@@ -30,6 +30,12 @@ namespace MeshTerminal.Client
             return key;
         }
 
+        public bool IsMeshCoreRepeaterAuthorized(uint number)
+        {
+            RepeaterAuthorization auth;
+            return Protocol==MeshProtocol.MeshCore && IsConnected && _repeaterAuthorizations.TryGetValue(number,out auth) && Object.ReferenceEquals(auth.Session,_meshCore);
+        }
+
         public async Task LoginMeshCoreRepeaterAsync(uint number, string password, CancellationToken token = default(CancellationToken))
         {
             await _repeaterOperations.WaitAsync(token).ConfigureAwait(false);

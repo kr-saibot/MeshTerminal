@@ -26,6 +26,8 @@ namespace MeshTerminal.Client
                 RequireMeshCoreLength(reply, 6);
                 var hops = DecodeMeshCoreHops(reply[5]);
                 if (!hops.HasValue || reply.Length < 6 + (reply[5] & 63) * ((reply[5] >> 6) + 1)) return;
+                var timestamp=MeshCoreSession.ReadUInt32(reply,1);
+                ObserveMeshCorePath(key,true,reply[5],reply.Skip(6).ToArray(),timestamp==0?(DateTime?)null:new DateTime(1970,1,1,0,0,0,DateTimeKind.Utc).AddSeconds(timestamp));
                 var identity = Hex(key, 0, 32);
                 _meshCoreAdvertHops[identity] = hops.Value;
                 MeshNode node;

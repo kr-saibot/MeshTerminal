@@ -17,9 +17,9 @@ namespace MeshTerminal
             var cursor = _input.CursorPosition;
             try
             {
-                var dialog = new Dialog("Insert into message", 60, 24);
+                var dialog = new Dialog("Insert into message", 60, 26);
                 int selected = -1;
-                var labels = new[] { "Clipboard contents", "Emojis", "Current position", "MeshCore / Meshtastic channel link", "Contact link", "Date and time", "Map cursor position", "Position marker", "Symbols" };
+                var labels = new[] { "Clipboard contents", "Emojis", "Current position", "MeshCore / Meshtastic channel link", "Contact link", "Date and time", "Map cursor position", "Position marker", "Symbols", "Mention person (@)" };
                 for (int i = 0; i < labels.Length; i++)
                 {
                     int choice = i;
@@ -35,6 +35,11 @@ namespace MeshTerminal
                 {
                     var text = MessageClipboard.Read();
                     InsertEmojiIntoMessage(text);
+                }
+                else if (selected == 9)
+                {
+                    var name=SelectMessageMention();
+                    if(name!=null)InsertEmojiIntoMessage("@"+name);
                 }
                 else if (selected == 1) ShowEmojiPicker();
                 else if (selected == 2)
@@ -85,6 +90,22 @@ namespace MeshTerminal
             catch (Exception ex) { MessageBox.ErrorQuery("Insert into message", ex.Message, "OK"); }
             finally { _input.SetFocus(); }
         }
+        private static string SelectMessageMention()
+        {
+            if(_selected==null) { MessageBox.Query("Mention person","Select a chat first.","OK");return null; }
+            var messages=_selected.Kind==ChatKind.Channel
+                ? _store.GetRecentChannelMessages((int)_selected.Id,1000,false)
+                : _store.GetDirectMessages(_selected.Id);
+            var names=_store.GetNodes().ToDictionary(n=>n.NodeNumber,n=>!String.IsNullOrWhiteSpace(n.LongName)?n.LongName:n.ShortName);
+            foreach(var node in _mesh.Nodes)
+            {
+                var name=!String.IsNullOrWhiteSpace(node.LongName)?node.LongName:node.ShortName;
+                if(!String.IsNullOrWhiteSpace(name))names[node.Number]=name;
+            }
+            var recent=MessageMentions.RecentNames(messages,number=> { string name;return names.TryGetValue(number,out name)?name:null; },_mesh.Device.MyNode==null?(uint?)null:_mesh.Device.MyNode.MyNodeNum);
+            return SelectInsertionValue("Mention person - most recent first",recent.Select(name=>Tuple.Create(name,(Func<string>)(()=>name))).ToList());
+        }
+
         private static string InsertionCoordinates(double latitude, double longitude)
         { return latitude.ToString("F6", CultureInfo.InvariantCulture) + "," + longitude.ToString("F6", CultureInfo.InvariantCulture); }
 
@@ -104,6 +125,7 @@ namespace MeshTerminal
             list.OpenSelectedItem += args => select();
             var cancel = new Button("Cancel", true); cancel.Clicked += () => Application.RequestStop();
             dialog.Add(list); dialog.AddButton(insert); dialog.AddButton(cancel);
+            ListViewScrollBar.Attach(list);
             Application.Run(dialog, HandleTerminalGuiException);
             return result;
         }

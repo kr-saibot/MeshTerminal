@@ -15,7 +15,11 @@ namespace MeshTerminal.Client
                 RelativeHumidity=e!=null&&e.HasRelativeHumidity?(double?)e.RelativeHumidity:null, BarometricPressure=e!=null&&e.HasBarometricPressure?(double?)e.BarometricPressure:null,
                 RawTelemetry=t.MeshCoreRawTelemetry??t.Telemetry.ToString() };
         }
-        public static StoredTelemetry From(MeshCoreRepeaterStatus s) { return new StoredTelemetry { Id=Guid.NewGuid(),NodeNumber=s.NodeNumber,ReceivedAtUtc=s.ReceivedUtc,Type="MeshCore status",Voltage=s.BatteryVoltage,UptimeSeconds=s.UptimeSeconds,NoiseFloorDbm=s.NoiseFloorDbm,LastRssiDbm=s.LastRssiDbm,LastSnrDb=s.LastSnrDb,RawTelemetry=s.ToString() }; }
+        public static StoredTelemetry From(MeshCoreRepeaterStatus s) { return new StoredTelemetry { Id=Guid.NewGuid(),NodeNumber=s.NodeNumber,ReceivedAtUtc=s.ReceivedUtc,Type="MeshCore status",NeighborCount=s.NeighborCount,AdditionalValues=new System.Collections.Generic.Dictionary<string,object> {
+            {"neighbor_count_error",s.NeighborCountError},{"tx_queue_length",s.TxQueueLength},{"received_packets",s.ReceivedPackets},{"sent_packets",s.SentPackets},{"tx_airtime_seconds",s.TxAirtimeSeconds},
+            {"rx_airtime_seconds",s.RxAirtimeSeconds},{"receive_errors",s.ReceiveErrors},{"sent_flood",s.SentFlood},{"sent_direct",s.SentDirect},
+            {"received_flood",s.ReceivedFlood},{"received_direct",s.ReceivedDirect},{"error_flags",s.ErrorFlags},{"direct_duplicates",s.DirectDuplicates},{"flood_duplicates",s.FloodDuplicates}
+        },Voltage=s.BatteryVoltage,UptimeSeconds=s.UptimeSeconds,NoiseFloorDbm=s.NoiseFloorDbm,LastRssiDbm=s.LastRssiDbm,LastSnrDb=s.LastSnrDb,RawTelemetry=s.ToString() }; }
         public static StoredTelemetry From(uint node, Position p, DateTime received)
         {
             var seconds=p.Timestamp!=0?p.Timestamp:p.Time;

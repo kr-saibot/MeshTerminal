@@ -10,6 +10,14 @@ namespace MeshTerminal
     internal static partial class Program
     {
         private static string PadPathText(string text) { return "\n" + String.Join("\n", (text ?? "").Split('\n').Select(line => " " + line)); }
+        private static string TimestampedPath(string text, MeshCorePathSnapshot snapshot, bool cached)
+        {
+            if(snapshot==null) return text??"No saved path available.";
+            var header=(cached?"Saved path":"Device path")+"\nRead (PC): "+snapshot.ObservedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+            if(snapshot.AdvertReceivedUtc.HasValue) header+="\nAdvert (device): "+snapshot.AdvertReceivedUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+            if(cached) header+="\nCurrent path could not be read.";
+            return header+"\n\n"+text;
+        }
         private static void ShowMeshCoreNodePaths(StoredMeshNode node)
         {
             var dialog = new Dialog("MeshCore paths: " + (node.LongName ?? node.NodeId), 110, 30);
@@ -31,11 +39,20 @@ namespace MeshTerminal
                 string to, from, information;
                 try
                 {
-                    var paths = await Task.Run(() => _mesh.GetMeshCoreNodePathsAsync(node.NodeNumber)).ConfigureAwait(false);
-                    readPaths = paths;
-                    to = paths.OutgoingSteps == null ? paths.Outgoing : MeshtasticClient.FormatMeshCorePathVertical(paths.OutgoingSteps);
-                    from = paths.IncomingAdvertSteps == null ? paths.IncomingAdvert : MeshtasticClient.FormatMeshCorePathVertical(paths.IncomingAdvertSteps);
-                    information = paths.AdvertReceivedUtc.HasValue ? "Advert received (device clock): " + paths.AdvertReceivedUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "Stored paths loaded; no fresh route test.";
+                    var savedTo=_store.GetMeshCorePath(_mesh.Device.NodeId,node.NodeId,false);
+                    var savedFrom=_store.GetMeshCorePath(_mesh.Device.NodeId,node.NodeId,true);
+                    var cached=_mesh.RestoreMeshCoreNodePaths(node.NodeNumber,savedTo,savedFrom);
+                    MeshCoreNodePaths paths;
+                    string readError=null;
+                    try { paths=await Task.Run(() => _mesh.GetMeshCoreNodePathsAsync(node.NodeNumber)).ConfigureAwait(false); }
+                    catch(Exception ex) { paths=new MeshCoreNodePaths(); readError=ex.Message; }
+                    if(paths.OutgoingSnapshot!=null) _store.SaveMeshCorePath(paths.OutgoingSnapshot);
+                    if(paths.IncomingSnapshot!=null) _store.SaveMeshCorePath(paths.IncomingSnapshot);
+                    paths.UseSavedFallback(cached);
+                    readPaths=paths;
+                    to=TimestampedPath(paths.OutgoingSteps==null ? paths.Outgoing??readError : MeshtasticClient.FormatMeshCorePathVertical(paths.OutgoingSteps),paths.OutgoingSnapshot,paths.OutgoingCached);
+                    from=TimestampedPath(paths.IncomingAdvertSteps==null ? paths.IncomingAdvert??readError : MeshtasticClient.FormatMeshCorePathVertical(paths.IncomingAdvertSteps),paths.IncomingSnapshot,paths.IncomingCached);
+                    information="Read (PC) is the observation time; stored paths may have changed since then.";
                 }
                 catch (Exception ex) { to = from = ex.Message; information = "Could not read paths."; }
                 Ui(() => { if (closed) return; outgoing.Text = PadPathText(to); incoming.Text = PadPathText(from); loadedPaths = readPaths; map.Enabled = loadedPaths != null; status.Text = information; busy = false; refresh.Enabled = true; });

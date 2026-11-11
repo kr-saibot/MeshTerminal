@@ -19,7 +19,7 @@ internal static partial class Program
             else if (args.Contains("--ble-devices")) { using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15))) { var devices = MeshtasticClient.GetBluetoothDevicesAsync(MeshProtocol.MeshCore, timeout.Token).GetAwaiter().GetResult(); Console.WriteLine("Paired Bluetooth devices: " + devices.Count); foreach (var device in devices) Console.WriteLine(device.Name); } }
             else if (args.Length >= 2 && args[0] == "--port") ProbeAsync(args[1], args.Contains("--telemetry"), args.Contains("--channels")).GetAwaiter().GetResult();
             else if (args.Contains("--mqtt-tests")) MqttTests.RunAsync().GetAwaiter().GetResult();
-            else { MqttSystemStatusTests.Run(); NodeAnnouncementTests.Run(); MqttTests.RunAsync().GetAwaiter().GetResult(); TerminalPaletteTests.Run(); TestMessageResendAsync().GetAwaiter().GetResult(); MapSymbolTests.Run(); ChessTests.Run(); ChessBlockTests.Run(); NodeListScrollBarTests.Run(); HostQrTests.RunAsync().GetAwaiter().GetResult(); SharedMapMessageTests.Run(); MessageInsertionTests.Run(); RenameCompatibilityTests.Run(); RepeaterDialogTests.Run(); RepeaterStatusTests.Run(); ChatHeaderStyleTests.Run(); LogoActivityTests.Run(); CommunicationLogFilterTests.Run(); CommunicationLogTests.Run(); TelnetEchoTests.RunAsync().GetAwaiter().GetResult(); ArchivedChannelChatTests.Run(); GatewayConfigurationTests.Run(); LocPositionTests.Run(); MeshCoreHashtagTests.Run(); ChannelDraftTests.Run(); SharedLinkImportTests.Run(); MessageOrderingTests.Run(); TelnetServerTests.RunAsync().GetAwaiter().GetResult(); MessageContentTests.Run(); DeferredNodePersistenceTests.Run(); PathMapTests.Run(); MapOverlayPriorityTests.Run(); MeshCoreTelemetryPaddingTests.Run(); MeshCoreHopTests.Run(); TelegramSenderTests.Run(); NodeReceptionTests.Run(); MeshCoreContactTimeoutTests.RunAsync().GetAwaiter().GetResult(); MeshCoreRetryTests.RunAsync().GetAwaiter().GetResult(); BluetoothTests.RunAsync().GetAwaiter().GetResult(); MapMarkerTests.Run(); SharingTests.Run(); BluetoothChannelTests.RunAsync().GetAwaiter().GetResult(); ChannelTests.RunAsync().GetAwaiter().GetResult(); TestAsync().GetAwaiter().GetResult(); }
+            else { MqttSystemStatusTests.Run(); TxUtilizationTests.Run(); NodeAnnouncementTests.Run(); MqttTests.RunAsync().GetAwaiter().GetResult(); TerminalPaletteTests.Run(); TerminalOutputBatcherTests.Run(); TestMessageResendAsync().GetAwaiter().GetResult(); MapSymbolTests.Run(); ChessTests.Run(); ChessBlockTests.Run(); NodeListScrollBarTests.Run(); HostQrTests.RunAsync().GetAwaiter().GetResult(); SharedMapMessageTests.Run(); MessageInsertionTests.Run(); RenameCompatibilityTests.Run(); RepeaterDialogTests.Run(); RepeaterStatusTests.Run(); RepeaterMonitoringTests.Run(); ChatHeaderStyleTests.Run(); LogoActivityTests.Run(); CommunicationLogFilterTests.Run(); CommunicationLogTests.Run(); TelnetEchoTests.RunAsync().GetAwaiter().GetResult(); ArchivedChannelChatTests.Run(); ChatMuteTests.Run(); GatewayConfigurationTests.Run(); LocPositionTests.Run(); MeshCoreHashtagTests.Run(); ChannelDraftTests.Run(); SharedLinkImportTests.Run(); MessageOrderingTests.Run(); TelnetServerTests.RunAsync().GetAwaiter().GetResult(); MessageContentTests.Run(); DeferredNodePersistenceTests.Run(); PathMapTests.Run(); StoredMeshCorePathTests.Run(); TracerouteTests.RunAsync().GetAwaiter().GetResult(); MapOverlayPriorityTests.Run(); MeshCoreTelemetryPaddingTests.Run(); MeshCoreHopTests.Run(); TelegramSenderTests.Run(); NodeReceptionTests.Run(); MeshCoreContactTimeoutTests.RunAsync().GetAwaiter().GetResult(); MeshCoreRetryTests.RunAsync().GetAwaiter().GetResult(); BluetoothTests.RunAsync().GetAwaiter().GetResult(); MapMarkerTests.Run(); SharingTests.Run(); BluetoothChannelTests.RunAsync().GetAwaiter().GetResult(); ChannelTests.RunAsync().GetAwaiter().GetResult(); TestAsync().GetAwaiter().GetResult(); }
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
@@ -138,6 +138,7 @@ internal static partial class Program
             await client.RefreshMeshCoreBatteryAsync(timeout.Token);
             Check(client.Device.RoutingHashLengthBytes == 3, "Protocol v10 reports 3-byte routing hashes");
             await client.RefreshRadioStatisticsAsync(timeout.Token);
+            Check(client.Device.TxUtilization!=null&&client.Device.TxUtilization.Estimated&&!client.Device.TxUtilization.Percent.HasValue,"Companion radio statistics start a TX-airtime window without inventing an initial duty cycle");
             Check(client.Device.NoiseFloorDbm == -114, "Radio noise floor decoded as signed int16 dBm");
             client.EnablePacketStatisticsPolling=true;
             await client.RefreshRadioStatisticsAsync(timeout.Token);
@@ -348,6 +349,10 @@ internal static partial class Program
             try { await client.LoginMeshCoreRepeaterAsync(unknownNode.Number, "deny", timeout.Token); throw new Exception("Denied repeater login accepted"); } catch (UnauthorizedAccessException) { }
             try { await client.LoginMeshCoreRepeaterAsync(unknownNode.Number, "guest", timeout.Token); throw new Exception("Guest administrator accepted"); } catch (UnauthorizedAccessException) { }
             await client.LoginMeshCoreRepeaterAsync(unknownNode.Number, "admin", timeout.Token);
+            Check(client.IsMeshCoreRepeaterAuthorized(unknownNode.Number),"Successful login can be reused by a reopened admin dialog");
+            await client.LoginMeshCoreRepeaterAsync(unknownNode.Number,"",timeout.Token);
+            Check(client.IsMeshCoreRepeaterAuthorized(unknownNode.Number),"Password-free ACL resume confirms admin rights");
+            Check(await client.RequestMeshCoreRepeaterNeighborCountAsync(unknownNode.Number,timeout.Token)==12,"Count-only neighbor query matches the binary response tag");
             int receivedStatusCount = 0; MeshCoreRepeaterStatus receivedStatus = null;
             client.MeshCoreRepeaterStatusReceived += value => { receivedStatus = value; Interlocked.Increment(ref receivedStatusCount); };
             var repeaterStatus = await client.RequestMeshCoreRepeaterStatusAsync(unknownNode.Number, timeout.Token);
@@ -358,6 +363,7 @@ internal static partial class Program
             Check(received.Count == cliMessageCount, "CLI replies are not chat messages");
             try { await client.SendMeshCoreRepeaterCommandAsync(unknownNode.Number, "ver\nreboot", timeout.Token); throw new Exception("Multiline CLI accepted"); } catch (ArgumentException) { }
             await client.SendMeshCoreRepeaterCommandAsync(unknownNode.Number, "reboot", timeout.Token);
+            Check(!client.IsMeshCoreRepeaterAuthorized(unknownNode.Number),"Reboot invalidates reusable local authorization");
             try { await client.SendMeshCoreRepeaterCommandAsync(unknownNode.Number, "ver", timeout.Token); throw new Exception("Reboot retained authorization"); } catch (UnauthorizedAccessException) { }
             await client.RemoveMeshCoreContactAsync(unknownId, timeout.Token);
             Check(client.IsMeshCoreContactSaved(unknownId) == false && client.Nodes.Any(n => n.Id == unknownId), "Device deletion retains known PC node identity");
@@ -412,6 +418,7 @@ internal static partial class Program
         public ushort BatteryMillivolts = 4050;
         public uint DeviceClock = 1700000000u;
         public int ClockSets;
+        private bool _adminAclAuthorized;
         public string DirectText;
         public byte[] DirectPrefix;
         public string ChannelText;
@@ -594,8 +601,10 @@ internal static partial class Program
                     {
                         Check(command.Skip(1).Take(32).All(b => b == 77), "Repeater login full public key");
                         var adminPassword = Encoding.UTF8.GetString(command, 33, command.Length - 33);
+                        if(adminPassword=="admin") _adminAclAuthorized=true;
+                        var resumed=String.IsNullOrEmpty(adminPassword)&&_adminAclAuthorized;
                         await FrameAsync(stream, new byte[] { 6, 1, 1, 2, 3, 4, 0xE8, 3, 0, 0 });
-                        var loginReply = new byte[] { (byte)(adminPassword == "deny" ? 0x86 : 0x85), (byte)(adminPassword == "admin" ? 1 : 0) }.Concat(Enumerable.Repeat((byte)77, 6)).Concat(new byte[6]).ToArray();
+                        var loginReply = new byte[] { (byte)(adminPassword == "deny" || (String.IsNullOrEmpty(adminPassword)&&!resumed) ? 0x86 : 0x85), (byte)(adminPassword == "admin" || resumed ? 1 : 0) }.Concat(Enumerable.Repeat((byte)77, 6)).Concat(new byte[6]).ToArray();
                         await FrameAsync(stream, loginReply); break;
                     }
                     Check(command.Skip(1).Take(32).SequenceEqual(RoomKey), "Login full public key");
@@ -620,6 +629,13 @@ internal static partial class Program
                     Array.Copy(Enumerable.Repeat((byte)44, 32).ToArray(), 0, discoveryReply, 10, 32); await FrameAsync(stream, discoveryReply);
                     await FrameAsync(stream, new byte[] { 0 }); break;
                 case 50:
+                    if(command[33]==6)
+                    {
+                        Check(command.Length==44&&command.Skip(1).Take(32).All(b=>b==77)&&command[34]==0&&command[35]==0&&command[36]==0&&command[37]==0&&command[38]==0&&command[39]==6,"Neighbor request version, count-only format, offset, order and full destination key");
+                        await FrameAsync(stream,new byte[]{6,1,9,8,7,6,0xE8,3,0,0});
+                        await FrameAsync(stream,new byte[]{0x8C,0,1,1,1,1,99,0,0,0});
+                        await FrameAsync(stream,new byte[]{0x8C,0,9,8,7,6,12,0,0,0});break;
+                    }
                     Check(command.Skip(1).Take(32).SequenceEqual(AliceKey) && command[33] == 3, "Remote telemetry request type and full public key");
                     await FrameAsync(stream, new byte[] { 6, 1, 9, 8, 7, 6, 0xE8, 3, 0, 0 });
                     await FrameAsync(stream, new byte[] { 0x8C, 0, 1, 1, 1, 1 }.Concat(SensorData()).ToArray()); // unrelated tag must be ignored

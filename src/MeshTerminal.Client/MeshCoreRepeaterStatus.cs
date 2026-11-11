@@ -10,6 +10,8 @@ namespace MeshTerminal.Client
     // RepeaterStats layout from MeshCore examples/simple_repeater/MyMesh.h.
     public sealed class MeshCoreRepeaterStatus
     {
+        public int? NeighborCount { get; set; }
+        public string NeighborCountError { get; set; }
         public uint NodeNumber { get; internal set; }
         public DateTime ReceivedUtc { get; internal set; }
         public double? BatteryVoltage { get; internal set; }
@@ -66,6 +68,7 @@ namespace MeshTerminal.Client
             text.AppendLine("Airtime TX / RX: " + counter(TxAirtimeSeconds) + " / " + counter(RxAirtimeSeconds) + " seconds");
             text.AppendLine("Duplicates direct / flood: " + (DirectDuplicates?.ToString(culture) ?? "-") + " / " + (FloodDuplicates?.ToString(culture) ?? "-"));
             text.AppendLine("Receive errors: " + counter(ReceiveErrors) + " | Error flags: " + (ErrorFlags.HasValue ? "0x" + ErrorFlags.Value.ToString("X4", culture) : "-"));
+            text.AppendLine("Neighbors: " + (NeighborCount.HasValue ? NeighborCount.Value.ToString(culture) : "not available" + (String.IsNullOrEmpty(NeighborCountError) ? "" : " (" + NeighborCountError + ")")));
             return text.ToString();
         }
     }
@@ -81,6 +84,20 @@ namespace MeshTerminal.Client
             MeshNode node;
             if (matches.Length != 1 || !_nodes.TryGetValue(matches[0].Key, out node) || node.MeshCoreContactType != 2) return;
             MeshCoreRepeaterStatusReceived?.Invoke(MeshCoreRepeaterStatus.Parse(frame, node.Number));
+        }
+
+        internal static int ParseMeshCoreNeighborCount(byte[] frame)
+        {
+            if(frame==null||frame.Length<10||frame[0]!=0x8C) throw new InvalidDataException("Truncated MeshCore neighbor-count response.");
+            return frame[6]|(frame[7]<<8);
+        }
+        public async Task<int> RequestMeshCoreRepeaterNeighborCountAsync(uint number,CancellationToken token=default(CancellationToken))
+        {
+            var key=RepeaterKey(number);
+            // Version 0, count 0: return the total without transferring neighbor entries.
+            var command=new byte[]{50}.Concat(key).Concat(new byte[]{6,0,0,0,0,0,6}).Concat(BitConverter.GetBytes(NextUInt())).ToArray();
+            var response=await _meshCore.RemoteRequestAsync(command,(sent,frame)=>frame.Length>=6&&frame[0]==0x8C&&MeshCoreSession.ReadUInt32(frame,2)==MeshCoreSession.ReadUInt32(sent,2),token).ConfigureAwait(false);
+            return ParseMeshCoreNeighborCount(response);
         }
 
         public async Task<MeshCoreRepeaterStatus> RequestMeshCoreRepeaterStatusAsync(uint number, CancellationToken token = default(CancellationToken))

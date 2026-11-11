@@ -30,7 +30,7 @@ namespace MeshTerminal.Host
                     continue;
                 }
 
-                if (current < ' ' && current != '\t' && current != '\r' && current != '\n' && current != '\u001b')
+                if (current < ' ' && current != '\b' && current != '\t' && current != '\r' && current != '\n' && current != '\u001b')
                 {
                     output[index] = ' ';
                     continue;

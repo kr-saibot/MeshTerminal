@@ -260,7 +260,7 @@ namespace MeshTerminal.Client
                     UpdateMeshCoreNode(ownKey, MeshCoreString(frame, 58, frame.Length - 58), ReadMeshCorePosition(frame, 36), 0, 1);
                     break;
                 case 24:
-                    if (frame.Length >= 14 && frame[1] == 1) { var noise = unchecked((short)(frame[2] | (frame[3] << 8))); Device.NoiseFloorDbm = noise == 0 ? (int?)null : noise; Raise(DeviceInfoUpdated, EventArgs.Empty); }
+                    if (frame.Length >= 14 && frame[1] == 1) { var noise = unchecked((short)(frame[2] | (frame[3] << 8))); Device.NoiseFloorDbm = noise == 0 ? (int?)null : noise; RecordMeshCoreTxAirtime(MeshCoreSession.ReadUInt32(frame,6)); Raise(DeviceInfoUpdated, EventArgs.Empty); }
                     if(frame.Length>=10&&frame[1]==2)
                     {
                         Device.RadioReceivedPackets=MeshCoreSession.ReadUInt32(frame,2);
@@ -347,7 +347,8 @@ namespace MeshTerminal.Client
                 await _meshCoreSync.WaitAsync(token).ConfigureAwait(false);
                 acquired = true;
                 if (!ReferenceEquals(session, _meshCore) || !IsConnected) return;
-                await session.CommandAsync(new byte[] { 30 }.Concat(key).ToArray(), new byte[] { 3 }, token).ConfigureAwait(false);
+                var contactReply = await session.CommandAsync(new byte[] { 30 }.Concat(key).ToArray(), new byte[] { 3 }, token).ConfigureAwait(false);
+                if(contactReply.Length>=100 && Hex(contactReply,1,32)==Hex(key,0,32)) ObserveMeshCorePath(key,false,contactReply[35],contactReply.Skip(36).Take(64).ToArray());
                 if(advert) await AnnounceMeshCoreAdvertAsync(session,key,wasNew,receivedUtc??DateTime.UtcNow,token).ConfigureAwait(false);
                 else await RefreshMeshCoreAdvertPathAsync(session, key, token).ConfigureAwait(false);
             }

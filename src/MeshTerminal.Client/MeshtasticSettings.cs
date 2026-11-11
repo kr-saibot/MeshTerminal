@@ -185,8 +185,16 @@ namespace MeshTerminal.Client
     }
 
     /// <summary>Actions that notify the local operating system about unread incoming messages.</summary>
+    public sealed class MutedChatSettings
+    {
+        public MeshProtocol Protocol { get; set; }
+        public bool IsDirect { get; set; }
+        public uint Id { get; set; }
+    }
+
     public sealed class MeshtasticAlertSettings
     {
+        public List<MutedChatSettings> MutedChats { get; set; } = new List<MutedChatSettings>();
         public bool EnableWindowsBeep { get; set; }
         public bool EnableTerminalBell { get; set; }
         public bool EnableDesktopNotifications { get; set; }
@@ -253,6 +261,7 @@ namespace MeshTerminal.Client
     public sealed class MeshtasticApplicationSettings
     {
         public string[] RepeaterQuickCommands { get; set; } = new string[] { "ver", "board", "get name", "get radio", "get tx", "clock" };
+        public List<RepeaterMonitorSettings> RepeaterMonitors { get; set; } = new List<RepeaterMonitorSettings>();
         public List<RepeaterCredential> RepeaterCredentials { get; set; } = new List<RepeaterCredential>();
         public List<LocalChannel> LocalChannels { get; set; } = new List<LocalChannel>();
         public List<ChannelDraft> ChannelDrafts { get; set; } = new List<ChannelDraft>();

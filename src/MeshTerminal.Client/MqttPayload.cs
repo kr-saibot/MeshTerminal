@@ -54,8 +54,9 @@ namespace MeshTerminal.Client
             var values = new Dictionary<string, object> {
                 {"battery_percent",t.BatteryLevel}, {"voltage",t.Voltage}, {"channel_utilization",t.ChannelUtilization}, {"air_util_tx",t.AirUtilTx},
                 {"uptime_seconds",t.UptimeSeconds}, {"temperature_c",t.Temperature}, {"relative_humidity",t.RelativeHumidity}, {"barometric_pressure_hpa",t.BarometricPressure},
-                {"latitude",t.Latitude}, {"longitude",t.Longitude}, {"altitude_m",t.Altitude}, {"noise_floor_dbm",t.NoiseFloorDbm}, {"rssi_dbm",t.LastRssiDbm}, {"snr_db",t.LastSnrDb}
+                {"latitude",t.Latitude}, {"longitude",t.Longitude}, {"altitude_m",t.Altitude}, {"noise_floor_dbm",t.NoiseFloorDbm}, {"rssi_dbm",t.LastRssiDbm}, {"snr_db",t.LastSnrDb}, {"neighbor_count",t.NeighborCount}
             };
+            if(t.AdditionalValues!=null) foreach(var value in t.AdditionalValues) values[value.Key]=value.Value;
             data["telemetry"] = values.Where(p => p.Value != null).ToDictionary(p => p.Key,p => p.Value);
             data["message"] = t.RawTelemetry ?? "";
             return data;

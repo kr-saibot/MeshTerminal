@@ -80,7 +80,7 @@ internal static class MqttTests
             await inject("test/all/send/"+new string('a',64),MqttClientManager.SendTopicPlaceholder,true);
             await inject("test/all/send/"+new string('b',64),MqttClientManager.SendTopicPlaceholder,true);
             var configs=new[] { Settings(port,"channel",MqttBinding.Channel,true),Settings(port,"direct",MqttBinding.DirectNode,true),Settings(port,"all",MqttBinding.AllDirect,true),Settings(port,"telemetry",MqttBinding.Telemetry),Settings(port,"readonly",MqttBinding.Channel),Settings(port,"disabled",MqttBinding.Channel),Settings(port,"otherprotocol",MqttBinding.Channel),Settings(port,"nodes",MqttBinding.AdvertsAndNodes),Settings(port,"newnodes",MqttBinding.AdvertsAndNodes),Settings(port,"favnodes",MqttBinding.AdvertsAndNodes),Settings(port,"system",MqttBinding.SystemStatus) };
-            configs[0].FavoritesOnly=true;configs[5].Enabled=false;configs[6].Protocol=MeshProtocol.Meshtastic;configs[8].OnlyNewNodes=true;configs[9].FavoritesOnly=true;configs[10].StatusIntervalSeconds=5;configs[10].FavoritesOnly=true;
+            configs[3].FavoritesOnly=true;configs[0].FavoritesOnly=true;configs[5].Enabled=false;configs[6].Protocol=MeshProtocol.Meshtastic;configs[8].OnlyNewNodes=true;configs[9].FavoritesOnly=true;configs[10].StatusIntervalSeconds=5;configs[10].FavoritesOnly=true;
             var manager=new MqttClientManager(MeshProtocol.MeshCore,configs,(s,target,text,token)=> { token.ThrowIfCancellationRequested();if(text=="fail")throw new InvalidOperationException("simulated send failure");sent.Enqueue(s.Name+"|"+target+"|"+text);return Task.CompletedTask; },s => new[] { new string('a',64), new string('b',64), new string('a',64) },MqttSystemStatusTests.Sample);
             manager.Start();
             try
@@ -113,6 +113,11 @@ internal static class MqttTests
                 await Until(()=>received.Any(p=>p.Topic=="test/direct/json")&&received.Any(p=>p.Topic=="test/all/json"),"direct subscriptions independent");
                 var t=MqttTelemetry.From(123,new Position { LatitudeI=480000000,LongitudeI=120000000 },DateTime.UtcNow);manager.PublishTelemetry(t,new string('a',64),"DM2TK",true);
                 await Until(()=>received.Any(p=>p.Topic=="test/telemetry/telemetry/latitude"&&p.Payload=="48"),"position telemetry wire export");
+                var monitored=MeshCoreRepeaterStatus.Parse(RepeaterStatusTests.Frame(new byte[6]),123);monitored.NeighborCount=12;
+                manager.PublishTelemetry(MqttTelemetry.From(monitored),new string('a',64),"Repeater",false);
+                await Task.Delay(80);Check(!received.Any(p=>p.Topic=="test/telemetry/telemetry/neighbor_count"),"Repeater monitoring follows the telemetry favorite filter");
+                manager.PublishTelemetry(MqttTelemetry.From(monitored),new string('a',64),"Repeater",true);
+                await Until(()=>received.Any(p=>p.Topic=="test/telemetry/telemetry/neighbor_count"&&p.Payload=="12")&&received.Any(p=>p.Topic=="test/telemetry/telemetry/received_packets"&&p.Payload=="4000000000")&&received.Any(p=>p.Topic=="test/telemetry/json"&&p.Payload.Contains("neighbor_count")&&p.Payload.Contains("received_packets")),"Full repeater status and neighbor total reach real MQTT scalar topics and JSON");
                 await inject("test/channel/send","hello channel",false);await inject("test/direct/send","hello direct",false);await inject("test/all/send","hello all",false);
                 await inject("test/readonly/send","must not send",false);await inject("test/telemetry/send","must not send",false);await inject("test/all/send/"+new string('b',64),"arbitrary target must not send",false);
                 await Until(()=>sent.Count==3,"three explicit sends");await Task.Delay(200);

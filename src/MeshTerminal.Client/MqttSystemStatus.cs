@@ -24,6 +24,11 @@ namespace MeshTerminal.Client
                 {"external_power",level.HasValue?(object)(level>100):null}, {"state",level.HasValue?(level>100?"ExternalPower":"Battery"):voltage.HasValue?"VoltageOnly":"Unknown"} });
             var radio=Available(new Dictionary<string,object> { {"noise_floor_dbm",device.NoiseFloorDbm}, {"rx_packets",device.RadioReceivedPackets}, {"tx_packets",device.RadioSentPackets},
                 {"rx_errors",device.RadioReceiveErrors}, {"statistics_received_at",device.RadioStatisticsReadUtc?.ToUniversalTime().ToString("o")} });
+            if(connected && device.TxUtilization!=null)
+            {
+                var tx=device.TxUtilization;
+                foreach(var value in Available(new Dictionary<string,object> { {"tx_utilization_percent",tx.Percent},{"tx_utilization_window_seconds",tx.WindowSeconds},{"tx_utilization_estimated",tx.Estimated},{"tx_utilization_received_at",tx.ReceivedUtc.ToUniversalTime().ToString("o")} })) radio[value.Key]=value.Value;
+            }
             if(protocol==MeshProtocol.MeshCore)
             {
                 foreach(var p in Available(new Dictionary<string,object> { {"routing_hash_bytes",device.RoutingHashLengthBytes}, {"frequency_mhz",device.RadioFrequencyMHz}, {"bandwidth_khz",device.RadioBandwidthKHz},

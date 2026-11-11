@@ -18,6 +18,7 @@ namespace MeshTerminal.Host
         private const int SysCommandMask = 0xFFF0;
         private readonly EasyTerminalControl _terminal;
         private readonly ElementHost _terminalHost;
+        private TerminalOutputBatcher _terminalOutputBatcher;
         private readonly System.Windows.Media.MediaPlayer _bellPlayer = new System.Windows.Media.MediaPlayer();
         private NotifyIcon _trayIcon;
         private Icon _programIcon;
@@ -50,7 +51,7 @@ namespace MeshTerminal.Host
                 InputCapture = EasyTerminalControl.INPUT_CAPTURE.TabKey | EasyTerminalControl.INPUT_CAPTURE.DirectionKeys,
                 Win32InputMode = true
             };
-            _terminal.ConPTYTerm.InterceptOutputToUITerminal = HandleTerminalOutput;
+            AttachTerminalOutput(_terminal.ConPTYTerm);
 
             _terminalHost = new ElementHost
             {
@@ -59,7 +60,7 @@ namespace MeshTerminal.Host
             };
             Controls.Add(_terminalHost);
             Application.AddMessageFilter(this);
-            Application.AddMessageFilter(new TerminalKeyboardFilter(_terminal, this));
+            Application.AddMessageFilter(new TerminalKeyboardFilter(_terminal, this, () => CopyTerminalSelection(false)));
             TerminalPresentation.HideScrollBar(_terminal);
             if (_terminal.Terminal != null)
                 _terminal.Terminal.Loaded += delegate { TerminalPresentation.HideScrollBar(_terminal); };
@@ -145,6 +146,7 @@ namespace MeshTerminal.Host
 
                 if (TerminalSystemMenu.IsScanQrAreaCommand(message.WParam)) { ScanScreenQr(false); return; }
                 if (TerminalSystemMenu.IsScanQrScreenCommand(message.WParam)) { ScanScreenQr(true); return; }
+                if (TerminalSystemMenu.IsCopySelectionCommand(message.WParam)) { CopyTerminalSelection(true); return; }
                 if (TerminalSystemMenu.IsCopyScreenshotCommand(message.WParam))
                 {
                     QueueTerminalScreenshot();
@@ -270,7 +272,7 @@ namespace MeshTerminal.Host
 
             StopProcessExitTimer();
             var conPty = new TermPTY();
-            conPty.InterceptOutputToUITerminal = HandleTerminalOutput;
+            AttachTerminalOutput(conPty);
             conPty.TermReady += OnTerminalReady;
 
             _terminal.StartupCommandLine = Quote(executable);
@@ -361,6 +363,22 @@ namespace MeshTerminal.Host
             _screenshotTimer.Start();
         }
 
+        private void CopyTerminalSelection(bool showHint)
+        {
+            try
+            {
+                var text = _terminal.Terminal?.GetSelectedText();
+                if (!String.IsNullOrEmpty(text))
+                    Clipboard.SetText(text, TextDataFormat.UnicodeText);
+                else if (showHint)
+                    MessageBox.Show(this, "Zum Markieren die Umschalttaste gedrückt halten und mit der linken Maustaste über den Text ziehen. Danach Strg+Umschalt+C drücken oder diesen Menüpunkt wählen.", "Text kopieren", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Der markierte Text konnte nicht kopiert werden: " + ex.Message, "Zwischenablage", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
         private void CopyTerminalScreenshotToClipboard()
         {
             try
@@ -424,6 +442,28 @@ namespace MeshTerminal.Host
             WindowState = FormWindowState.Minimized;
             BeginInvoke(new Action(delegate { _suppressTrayMinimize = false; }));
         }
+        private void AttachTerminalOutput(TermPTY connection)
+        {
+            // Capture the plain connection on the UI thread. Accessing the WPF
+            // _terminal.ConPTYTerm dependency property from a timer is invalid.
+            var batcher = new TerminalOutputBatcher(
+                text => connection.WriteToUITerminal(text.AsSpan()),
+                error =>
+                {
+                    try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "terminal-output-error.log"), error.ToString()); }
+                    catch { }
+                });
+            var previous = _terminalOutputBatcher;
+            _terminalOutputBatcher = batcher;
+            connection.InterceptOutputToUITerminal = (ref Span<char> output) =>
+            {
+                HandleTerminalOutput(ref output);
+                batcher.Append(output);
+                output = Span<char>.Empty;
+            };
+            previous?.Dispose();
+        }
+
         private void HandleTerminalOutput(ref Span<char> output)
         {
             if (output.IndexOf('\a') >= 0 && IsHandleCreated && DateTime.UtcNow >= _suppressBellUntilUtc)
@@ -598,6 +638,8 @@ namespace MeshTerminal.Host
         {
             if (disposing)
             {
+                _terminalOutputBatcher?.Dispose();
+                _terminalOutputBatcher = null;
                 _bellPlayer.Close();
                 StopStartupTrayTimer();
                 if (_screenshotTimer != null)

@@ -1,6 +1,6 @@
 # MeshTerminal
 
-Current version: **2.1.0**. See [release notes](RELEASE-NOTES-2.1.0.md) for changes since the last published release, 1.4.0.
+Current version: **2.2.0**. See the release notes for [2.2.0](RELEASE-NOTES-2.2.0.md) and [2.1.0](RELEASE-NOTES-2.1.0.md).
 
 MeshTerminal is a terminal application for **Meshtastic and MeshCore** on
 **Windows and Linux**. Chat over LoRa mesh networks, manage nodes and channels,
@@ -67,6 +67,7 @@ administration require the destination to permit the request.
   changed squares are highlighted in brown. Captured pieces and move counts
   appear beside the board. Chess messages also open from the message actions menu.
 - The **Insert** menu includes the map-marker symbol picker, including chess pieces.
+- **Insert > Mention person (@)** lists recent senders in the current chat, newest first and once per name, and inserts `@Name` at the message cursor. The message field regains focus after insertion or cancellation.
 
 - Interactive terminal map with offline raster/vector MBTiles, XML overlays,
   selectable layers, position history, hop/age filters and temporary MeshCore paths.
@@ -181,6 +182,8 @@ also be selected manually from the window system menu.
 
 The host adds the following Windows integration:
 
+- Select terminal text with **Shift + left mouse drag**, then copy with **Ctrl+Shift+C**
+  or **Markierten Text kopieren** in the window system menu (Alt+Space)
 - Configurable terminal font sizes
 - Saved window size, font size, dark title bar and selected fallback client
 - Optional minimized startup and automatic startup with Windows
@@ -506,3 +509,15 @@ Die Aktivitätsanzeige gilt für Meshtastic und MeshCore. LoRa-Verkehr wird aus 
 ### MQTT clients
 
 Settings → MQTT clients manages multiple MQTT brokers for Meshtastic and MeshCore. Bind a client to a channel, a specific direct chat, all direct messages, telemetry, live adverts/new nodes or periodic own-device system status, optionally restricted to favorites. Advert/node clients can additionally publish only newly discovered nodes. Received data is published as text, individual metadata topics and complete JSON. The optional “Allow sending via MQTT” checkbox enables text commands to the selected channel/contact; it is disabled by default. Debug → MQTT client status shows connections, queues and errors. TCP and TLS are supported on Windows and Linux, with independent reconnect and bounded in-memory queues. See [MQTT-PROTOCOL.md](MQTT-PROTOCOL.md) (also shipped in `Protocols`) for topic names and examples. MQTT credentials are stored in the settings file and must be protected accordingly.
+
+On the native Windows console driver, editable text fields position the cursor before repainting, preventing ConPTY from briefly rendering the previous cursor position. The Windows host combines adjacent ConPTY output chunks for up to 8 ms to reduce intermediate redraws in dialogs and maps. Terminal control sequences and output order are preserved; the timer writes through a captured connection without accessing WPF controls. Developers can run `tools\Build-All.ps1 -CursorProbe` for an isolated native cursor regression test with single-line and multiline fields.
+
+In the channel or direct-chat list, press **M** to toggle mute for that chat, or use the **Mute / Unmute** button in the Chat / node info frame. A right-aligned **M** marks muted chats. Mute is saved separately for each protocol and suppresses sound, desktop, HTTP and shell alerts, repeat alerts and unread-logo blinking. Messages and unread counts remain available.
+
+MeshCore TO and FROM paths read from the companion are saved in the message database, separately for each own-device and remote public key. Advert/path-update notifications automatically capture available paths. The path dialog falls back to these saved routes when the device no longer has them. Each direction shows the PC observation time, plus the device-reported advert reception time for FROM when available. These times indicate recorded information, not a fresh route test.
+
+Meshtastic node details provide **Traceroute**: choose the channel and hop limit, then explicitly start a radio request. The last successful result is saved per own node and destination, with a PC reception timestamp. Forward and return paths are shown separately with reported SNR values and known distances; missing return-route data remains unknown. **Show on map** uses layer 7 (TO white, FROM yellow). Requests are limited to one every 30 seconds and time out after two minutes; failures preserve the saved result.
+
+MeshCore repeater administration retains successful authorization while the companion connection is unchanged. **Resume login** checks existing repeater ACL authorization without transmitting a password. Closing the dialog sends no logout. **Monitoring** configures an opt-in, per-own-device/per-repeater status poll (15-minute default), optionally including the total neighbor count via a count-only binary request. Jobs run sequentially, pause while disconnected or synchronizing, and save complete status snapshots as telemetry even if general telemetry storage is disabled. Enabled telemetry MQTT clients also receive the snapshot, with the existing favorite filter, individual metadata topics and JSON. Missing neighbor-count support preserves the remaining status.
+
+Own-device TX airtime utilization appears in Device info and the status bar. Meshtastic uses its reported last-hour `air_util_tx` value; MeshCore estimates a rolling window of up to one hour from the companion TX airtime counter already polled locally. MeshCore first gathers at least one minute of samples; its `~` marker and window length in Device info distinguish the estimate from the device-reported Meshtastic value. Reconnects, counter resets and implausible jumps restart the measurement. System-status MQTT publications also include the value, window, source and sample timestamp.

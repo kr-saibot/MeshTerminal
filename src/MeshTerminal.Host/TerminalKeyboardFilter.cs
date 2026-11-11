@@ -13,11 +13,14 @@ namespace MeshTerminal.Host
 
         private readonly EasyTerminalControl _terminal;
         private readonly Form _owner;
+        private readonly Action _copySelection;
+        private bool _copyKeyDown;
 
-        public TerminalKeyboardFilter(EasyTerminalControl terminal, Form owner)
+        public TerminalKeyboardFilter(EasyTerminalControl terminal, Form owner, Action copySelection)
         {
             _terminal = terminal;
             _owner = owner;
+            _copySelection = copySelection;
         }
 
         public bool PreFilterMessage(ref Message message)
@@ -29,6 +32,17 @@ namespace MeshTerminal.Host
             var isKeyUp = message.Msg == WmKeyUp || message.Msg == WmSysKeyUp;
             if (!isKeyDown && !isKeyUp)
                 return false;
+
+            if ((Keys)message.WParam.ToInt32() == Keys.C)
+            {
+                if (isKeyUp && _copyKeyDown) { _copyKeyDown = false; return true; }
+                if (isKeyDown && Control.ModifierKeys == (Keys.Control | Keys.Shift))
+                {
+                    if (!_copyKeyDown) _copySelection();
+                    _copyKeyDown = true;
+                    return true;
+                }
+            }
 
             string input;
             switch ((Keys)message.WParam.ToInt32())

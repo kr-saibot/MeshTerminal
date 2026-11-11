@@ -8,12 +8,14 @@
   <ItemGroup>
     <Compile Include="../../src/MeshTerminal/UnixTerminalColors.cs" Link="UnixTerminalColors.cs" />
     <Compile Include="../../src/MeshTerminal/TerminalPalette.cs" Link="TerminalPalette.cs" />
+    <Compile Include="../../src/MeshTerminal.Host/TerminalOutputBatcher.cs" Link="TerminalOutputBatcher.cs" />
     <Compile Include="../../src/MeshTerminal.Host/TerminalOutputSanitizer.cs" Link="TerminalOutputSanitizer.cs" />
     <Compile Include="../../src/MeshTerminal/MapSymbolCatalog.cs" Link="MapSymbolCatalog.cs" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Windows.Forms" />
     <Compile Include="../../src/MeshTerminal/MessageClipboard.cs" Link="MessageClipboard.cs" />
     <PackageReference Include="Terminal.Gui" Version="1.18.1" />
+    <Compile Include="../../src/MeshTerminal/MessageMentions.cs" Link="MessageMentions.cs" />
     <Compile Include="../../src/MeshTerminal/MessageTextInsertion.cs" Link="MessageTextInsertion.cs" />
     <Reference Include="System.Xml.Linq" />
     <None Include="../../src/MeshTerminal/emoji-blocks-full.xml" Link="emoji-blocks-full.xml" CopyToOutputDirectory="PreserveNewest" />

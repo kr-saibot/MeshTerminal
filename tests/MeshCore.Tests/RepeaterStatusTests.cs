@@ -21,7 +21,7 @@ internal static class RepeaterStatusTests
     }
     internal static void Run()
     {
-        var frame = Frame(new byte[6]); var status = MeshCoreRepeaterStatus.Parse(frame, 99);
+        var frame = Frame(new byte[6]); var status = MeshCoreRepeaterStatus.Parse(frame, 99); status.NeighborCount=12;
         Check(status.NodeNumber == 99 && status.BatteryVoltage == 4.123 && status.TxQueueLength == 2, "Identity, voltage and queue");
         Check(status.NoiseFloorDbm == -117 && status.LastRssiDbm == -92 && status.LastSnrDb == -3.25f, "Signed noise/RSSI and quarter-dB SNR");
         Check(status.ReceivedPackets == 4000000000u && status.UptimeSeconds == 90061 && status.ErrorFlags == 0x8001, "Unsigned counters and error bitmask");
@@ -33,6 +33,12 @@ internal static class RepeaterStatusTests
         bool rejected = false; try { MeshCoreRepeaterStatus.Parse(frame.Take(15).ToArray(), 99); } catch (InvalidDataException) { rejected = true; }
         Check(rejected, "Truncated core status is rejected");
         Check(status.ToString().Contains("-117 dBm") && status.ToString().Contains("-3.25 dB") && status.ToString().Contains("4000000000"), "Readable status preserves units and full counter values");
+        var neighborFrame=new byte[]{0x8C,0,1,2,3,4,0,0,0,0};
+        Check(MeshtasticClient.ParseMeshCoreNeighborCount(neighborFrame)==0,"Zero neighbors is a valid reported count");
+        neighborFrame[6]=44;neighborFrame[7]=1;
+        Check(MeshtasticClient.ParseMeshCoreNeighborCount(neighborFrame)==300,"Neighbor count is uint16, not a truncated byte");
+        rejected=false;try { MeshtasticClient.ParseMeshCoreNeighborCount(neighborFrame.Take(9).ToArray()); } catch(InvalidDataException) { rejected=true; }
+        Check(rejected,"Truncated neighbor header must not become a zero count");
         var file = Path.Combine(Path.GetTempPath(), "repeater-status-" + Guid.NewGuid().ToString("N") + ".db");
         try
         {
@@ -46,6 +52,7 @@ internal static class RepeaterStatusTests
             {
                 store.Initialize(); var entries = store.GetTelemetry(99); var saved = entries.Single(t => t.Type == "MeshCore status");
                 Check(entries.Count == 2 && saved.NodeNumber == 99 && saved.ReceivedAtUtc == status.ReceivedUtc, "Repeater telemetry preserves node identity and PC reception time across restart");
+                Check(saved.NeighborCount==12 && saved.RawTelemetry.Contains("Neighbors: 12"), "Neighbor total is stored as structured telemetry and readable text");
                 Check(saved.NoiseFloorDbm == -117 && saved.LastRssiDbm == -92 && saved.LastSnrDb == -3.25 && saved.Voltage == 4.123 && saved.UptimeSeconds == 90061, "Radio values, voltage and uptime are structured stored telemetry");
                 Check(saved.RawTelemetry.Contains("4000000000") && saved.RawTelemetry.Contains("0x8001"), "Complete status counters and flags remain in details");
                 Check(entries.Single(t => t.Type != "MeshCore status").NoiseFloorDbm == null, "Unrelated telemetry does not invent radio values");

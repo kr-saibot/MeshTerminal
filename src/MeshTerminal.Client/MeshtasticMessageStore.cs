@@ -31,6 +31,7 @@ namespace MeshTerminal.Client
 
     public sealed class StoredTelemetry
     {
+        public System.Collections.Generic.IDictionary<string,object> AdditionalValues { get; internal set; }
         public Guid Id { get; internal set; }
         public uint NodeNumber { get; internal set; }
         public DateTime ReceivedAtUtc { get; internal set; }
@@ -47,6 +48,7 @@ namespace MeshTerminal.Client
         public double? Latitude { get; internal set; }
         public double? Longitude { get; internal set; }
         public int? Altitude { get; internal set; }
+        public int? NeighborCount { get; internal set; }
         public int? NoiseFloorDbm { get; internal set; }
         public int? LastRssiDbm { get; internal set; }
         public double? LastSnrDb { get; internal set; }
@@ -108,7 +110,7 @@ namespace MeshTerminal.Client
     }
 
     /// <summary>Persists Meshtastic text messages through SQLite or any ADO.NET provider (for example SQL Server).</summary>
-    public sealed class MeshtasticMessageStore : IDisposable
+    public sealed partial class MeshtasticMessageStore : IDisposable
     {
         public event Action<StoredMeshMessage> MessageStored;
         public event Action<StoredTelemetry> PositionStored;
@@ -211,6 +213,11 @@ namespace MeshTerminal.Client
 
         public void Initialize()
         {
+            InitializeTraceroutes();
+            Execute(_sqlite
+                ? "CREATE TABLE IF NOT EXISTS MeshCorePaths (DeviceIdentity TEXT NOT NULL, TargetIdentity TEXT NOT NULL, Incoming INTEGER NOT NULL, EncodedPath INTEGER NOT NULL, Path TEXT NOT NULL, ObservedUtc TEXT NOT NULL, AdvertReceivedUtc TEXT NULL, PRIMARY KEY (DeviceIdentity,TargetIdentity,Incoming))"
+                : "IF OBJECT_ID('MeshCorePaths','U') IS NULL CREATE TABLE MeshCorePaths (DeviceIdentity NVARCHAR(64) NOT NULL, TargetIdentity NVARCHAR(64) NOT NULL, Incoming INT NOT NULL, EncodedPath INT NOT NULL, Path NVARCHAR(128) NOT NULL, ObservedUtc DATETIME2 NOT NULL, AdvertReceivedUtc DATETIME2 NULL, PRIMARY KEY(DeviceIdentity,TargetIdentity,Incoming))", null);
+
             // WAL permits readers (the UI) and writers (incoming packets) to run concurrently.
             // It is persistent per database file and is safe to execute for existing databases.
             if (_sqlite) { Execute("PRAGMA journal_mode=WAL", null); Execute("CREATE TABLE IF NOT EXISTS MeshCoreIdentities (NodeNumber INTEGER PRIMARY KEY AUTOINCREMENT, Identity TEXT NOT NULL UNIQUE)", null); }
@@ -251,6 +258,7 @@ namespace MeshTerminal.Client
             Execute(_sqlite ? "ALTER TABLE MeshtasticTelemetry ADD COLUMN Latitude REAL NULL" : "ALTER TABLE MeshtasticTelemetry ADD Latitude FLOAT NULL", null, ignoreFailure: true);
             Execute(_sqlite ? "ALTER TABLE MeshtasticTelemetry ADD COLUMN Longitude REAL NULL" : "ALTER TABLE MeshtasticTelemetry ADD Longitude FLOAT NULL", null, ignoreFailure: true);
             Execute(_sqlite ? "ALTER TABLE MeshtasticTelemetry ADD COLUMN Altitude INTEGER NULL" : "ALTER TABLE MeshtasticTelemetry ADD Altitude INT NULL", null, ignoreFailure: true);
+            Execute(_sqlite ? "ALTER TABLE MeshtasticTelemetry ADD COLUMN NeighborCount INTEGER NULL" : "ALTER TABLE MeshtasticTelemetry ADD NeighborCount INT NULL", null, ignoreFailure: true);
             Execute(_sqlite ? "ALTER TABLE MeshtasticTelemetry ADD COLUMN NoiseFloorDbm INTEGER NULL" : "ALTER TABLE MeshtasticTelemetry ADD NoiseFloorDbm INT NULL", null, ignoreFailure: true);
             Execute(_sqlite ? "ALTER TABLE MeshtasticTelemetry ADD COLUMN LastRssiDbm INTEGER NULL" : "ALTER TABLE MeshtasticTelemetry ADD LastRssiDbm INT NULL", null, ignoreFailure: true);
             Execute(_sqlite ? "ALTER TABLE MeshtasticTelemetry ADD COLUMN LastSnrDb REAL NULL" : "ALTER TABLE MeshtasticTelemetry ADD LastSnrDb FLOAT NULL", null, ignoreFailure: true);
@@ -311,9 +319,15 @@ namespace MeshTerminal.Client
         public void DeleteChannelMessages(int channelIndex) { Execute("DELETE FROM MeshtasticMessages WHERE Kind='Channel' AND ChannelIndex=@channel", delegate(DbCommand c) { Add(c, "@channel", channelIndex); }); }
         public int CountNewChannelMessages(int channelIndex) { return Count("SELECT COUNT(*) FROM MeshtasticMessages WHERE Kind='Channel' AND ChannelIndex=@channel AND IsNew=1", delegate(DbCommand c) { Add(c, "@channel", channelIndex); }); }
         public int CountNewDirectMessages(uint node) { return Count("SELECT COUNT(*) FROM MeshtasticMessages WHERE Kind='Direct' AND (FromNode=@node OR ToNode=@node) AND IsNew=1", delegate(DbCommand c) { Add(c, "@node", (long)node); }); }
-        public int CountNewMessages(bool excludeMapMessages = false)
+        public int CountNewMessages(bool excludeMapMessages = false, IEnumerable<uint> mutedChannels = null, IEnumerable<uint> mutedDirectChats = null)
         {
-            return Count("SELECT COUNT(*) FROM MeshtasticMessages WHERE IsNew=1" +
+            var channels = (mutedChannels ?? Enumerable.Empty<uint>()).Distinct().ToArray();
+            var directs = (mutedDirectChats ?? Enumerable.Empty<uint>()).Distinct().ToArray();
+            var exclusions = "";
+            // These SQL literals come exclusively from uint values, never user text.
+            if (channels.Length > 0) exclusions += " AND NOT (Kind='Channel' AND ChannelIndex IN (" + String.Join(",", channels) + "))";
+            if (directs.Length > 0) exclusions += " AND NOT (Kind='Direct' AND (CASE WHEN Direction='Outgoing' THEN ToNode ELSE FromNode END) IN (" + String.Join(",", directs) + "))";
+            return Count("SELECT COUNT(*) FROM MeshtasticMessages WHERE IsNew=1" + exclusions +
                 (excludeMapMessages ? " AND (Text IS NULL OR Text NOT LIKE '///MAP%')" : ""), null);
         }
         public void MarkChannelMessagesRead(int channelIndex) { Execute("UPDATE MeshtasticMessages SET IsNew=0 WHERE Kind='Channel' AND ChannelIndex=@channel", delegate(DbCommand c) { Add(c, "@channel", channelIndex); }); }
@@ -394,12 +408,12 @@ namespace MeshTerminal.Client
         {
             if (status == null) throw new ArgumentNullException("status");
             var id = Guid.NewGuid();
-            const string sql = "INSERT INTO MeshtasticTelemetry (Id,NodeNumber,ReceivedAtUtc,Type,Voltage,UptimeSeconds,NoiseFloorDbm,LastRssiDbm,LastSnrDb,RawTelemetry) VALUES (@id,@node,@received,@type,@voltage,@uptime,@noise,@rssi,@snr,@raw)";
+            const string sql = "INSERT INTO MeshtasticTelemetry (Id,NodeNumber,ReceivedAtUtc,Type,Voltage,UptimeSeconds,NoiseFloorDbm,LastRssiDbm,LastSnrDb,NeighborCount,RawTelemetry) VALUES (@id,@node,@received,@type,@voltage,@uptime,@noise,@rssi,@snr,@neighbors,@raw)";
             Execute(sql, c =>
             {
                 Add(c, "@id", IdValue(id)); Add(c, "@node", (long)status.NodeNumber); Add(c, "@received", TimeValue(status.ReceivedUtc)); Add(c, "@type", "MeshCore status");
                 Add(c, "@voltage", status.BatteryVoltage); Add(c, "@uptime", status.UptimeSeconds.HasValue ? (object)(long)status.UptimeSeconds.Value : null);
-                Add(c, "@noise", status.NoiseFloorDbm); Add(c, "@rssi", status.LastRssiDbm); Add(c, "@snr", status.LastSnrDb.HasValue ? (object)(double)status.LastSnrDb.Value : null); Add(c, "@raw", status.ToString());
+                Add(c, "@neighbors", status.NeighborCount); Add(c, "@noise", status.NoiseFloorDbm); Add(c, "@rssi", status.LastRssiDbm); Add(c, "@snr", status.LastSnrDb.HasValue ? (object)(double)status.LastSnrDb.Value : null); Add(c, "@raw", status.ToString());
             });
             return id;
         }
@@ -589,7 +603,7 @@ namespace MeshTerminal.Client
                     {
                         result.Add(new StoredTelemetry
                         {
-                            Id = Guid.Parse(Convert.ToString(reader["Id"])), NodeNumber = Convert.ToUInt32(reader["NodeNumber"]), ReceivedAtUtc = ReadTime(reader["ReceivedAtUtc"]), TelemetryTimeUtc = reader["TelemetryTimeUtc"] == DBNull.Value ? (DateTime?)null : ReadTime(reader["TelemetryTimeUtc"]), Type = Convert.ToString(reader["Type"]), BatteryLevel = reader["BatteryLevel"] == DBNull.Value ? (uint?)null : Convert.ToUInt32(reader["BatteryLevel"]), Voltage = reader["Voltage"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Voltage"]), ChannelUtilization = reader["ChannelUtilization"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["ChannelUtilization"]), AirUtilTx = reader["AirUtilTx"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["AirUtilTx"]), UptimeSeconds = reader["UptimeSeconds"] == DBNull.Value ? (uint?)null : Convert.ToUInt32(reader["UptimeSeconds"]), Temperature = reader["Temperature"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Temperature"]), RelativeHumidity = reader["RelativeHumidity"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["RelativeHumidity"]), BarometricPressure = reader["BarometricPressure"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["BarometricPressure"]), Latitude = reader["Latitude"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Latitude"]), Longitude = reader["Longitude"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Longitude"]), Altitude = reader["Altitude"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["Altitude"]), NoiseFloorDbm = reader["NoiseFloorDbm"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["NoiseFloorDbm"]), LastRssiDbm = reader["LastRssiDbm"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["LastRssiDbm"]), LastSnrDb = reader["LastSnrDb"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["LastSnrDb"]), RawTelemetry = Convert.ToString(reader["RawTelemetry"])
+                            Id = Guid.Parse(Convert.ToString(reader["Id"])), NodeNumber = Convert.ToUInt32(reader["NodeNumber"]), ReceivedAtUtc = ReadTime(reader["ReceivedAtUtc"]), TelemetryTimeUtc = reader["TelemetryTimeUtc"] == DBNull.Value ? (DateTime?)null : ReadTime(reader["TelemetryTimeUtc"]), Type = Convert.ToString(reader["Type"]), BatteryLevel = reader["BatteryLevel"] == DBNull.Value ? (uint?)null : Convert.ToUInt32(reader["BatteryLevel"]), Voltage = reader["Voltage"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Voltage"]), ChannelUtilization = reader["ChannelUtilization"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["ChannelUtilization"]), AirUtilTx = reader["AirUtilTx"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["AirUtilTx"]), UptimeSeconds = reader["UptimeSeconds"] == DBNull.Value ? (uint?)null : Convert.ToUInt32(reader["UptimeSeconds"]), Temperature = reader["Temperature"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Temperature"]), RelativeHumidity = reader["RelativeHumidity"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["RelativeHumidity"]), BarometricPressure = reader["BarometricPressure"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["BarometricPressure"]), Latitude = reader["Latitude"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Latitude"]), Longitude = reader["Longitude"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["Longitude"]), Altitude = reader["Altitude"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["Altitude"]), NeighborCount = reader["NeighborCount"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["NeighborCount"]), NoiseFloorDbm = reader["NoiseFloorDbm"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["NoiseFloorDbm"]), LastRssiDbm = reader["LastRssiDbm"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["LastRssiDbm"]), LastSnrDb = reader["LastSnrDb"] == DBNull.Value ? (double?)null : Convert.ToDouble(reader["LastSnrDb"]), RawTelemetry = Convert.ToString(reader["RawTelemetry"])
                         });
                     }
                     return result;

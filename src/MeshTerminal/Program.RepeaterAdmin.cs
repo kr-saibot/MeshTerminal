@@ -41,6 +41,7 @@ namespace MeshTerminal
             var run = new Button("Run selected") { X = 71, Y = 8, Enabled = false };
             var help = new Button("Help") { X = 87, Y = 8 };
             var remember = new CheckBox("Save password on this computer") { X = 1, Y = 2 };
+            var resume = new Button("Resume login") { X=53,Y=2 };
             var forget = new Button("Forget password") { X = 65, Y = 0 };
             if (_settings.RepeaterCredentials == null) _settings.RepeaterCredentials = new System.Collections.Generic.List<RepeaterCredential>();
             var credential = _settings.RepeaterCredentials.FirstOrDefault(c => String.Equals(c.PublicKey, node.Id, StringComparison.OrdinalIgnoreCase));
@@ -103,8 +104,17 @@ namespace MeshTerminal
                 editor.AddButton(save); editor.AddButton(cancelEdit); Application.Run(editor);
             };
             var close = new Button("Close", true); close.Clicked += delegate { Application.RequestStop(); };
-            bool closed = false, busy = false, authorized = false;
-            Action<bool> setBusy = value => { busy = value; refreshStatus.Enabled = !value && authorized; login.Enabled = !value; password.Enabled = !value; remember.Enabled = !value; forget.Enabled = !value; send.Enabled = !value && authorized; run.Enabled = !value && authorized; command.Enabled = !value; quick.Enabled = !value; for (int i = 0; i < 6; i++) shortcuts[i].Enabled = !value && authorized && i < _settings.RepeaterQuickCommands.Length && !String.IsNullOrWhiteSpace(_settings.RepeaterQuickCommands[i]); };
+            bool closed = false, busy = false, authorized = _mesh.IsMeshCoreRepeaterAuthorized(node.Number);
+            if(authorized) status.Text="Previous administrator login retained for this device connection.";
+            Action<bool> setBusy = value => { busy = value; resume.Enabled = !value; refreshStatus.Enabled = !value && authorized; login.Enabled = !value; password.Enabled = !value; remember.Enabled = !value; forget.Enabled = !value; send.Enabled = !value && authorized; run.Enabled = !value && authorized; command.Enabled = !value; quick.Enabled = !value; for (int i = 0; i < 6; i++) shortcuts[i].Enabled = !value && authorized && i < _settings.RepeaterQuickCommands.Length && !String.IsNullOrWhiteSpace(_settings.RepeaterQuickCommands[i]); };
+            var monitoring=new Button("Monitoring") { X=Pos.Right(refreshStatus)+2,Y=27 };
+            monitoring.Clicked+=()=>ShowRepeaterMonitoring(node);
+            resume.Clicked+=async ()=> {
+                if(busy) return;authorized=false;setBusy(true);status.Text="Resuming authorization through the repeater ACL...";
+                try { await _mesh.LoginMeshCoreRepeaterAsync(node.Number,"");Ui(()=> { if(!closed) { authorized=true;status.Text="Administrator authorization resumed without a password."; } }); }
+                catch(Exception ex) { Ui(()=> { if(!closed) status.Text="Resume failed; log in with the password: "+ex.Message; }); }
+                finally { Ui(()=> { if(!closed) setBusy(false); }); }
+            };
             refreshStatus.Clicked += () =>
             {
                 if (busy || !authorized) return;
@@ -186,15 +196,16 @@ namespace MeshTerminal
                     else execute(entry.PreparedText);
                 } };
             command.KeyPress += args => { if (args.KeyEvent.Key == Key.Enter) { args.Handled = true; execute(command.Text.ToString()); } };
-            loginFrame.Add(new Label("Admin password:") { X = 0, Y = 0 }, password, login, remember, forget, status);
+            loginFrame.Add(new Label("Admin password:") { X = 0, Y = 0 }, password, login, remember, resume, forget, status);
             shortcutFrame.Add(editShortcuts);
             dialog.Add(loginFrame, shortcutFrame, quick, run, help, output,
-                new Label("Command:") { X = 1, Y = 10 }, command, send, clearOutput, copyOutput, refreshStatus);
+                new Label("Command:") { X = 1, Y = 10 }, command, send, clearOutput, copyOutput, refreshStatus, monitoring);
             var scrollbar = new ScrollBarView(output, true, false) { AutoHideScrollBars = false };
             scrollbar.ChangedPosition += () => { output.TopRow = scrollbar.Position; output.SetNeedsDisplay(); };
             output.DrawContent += args => { scrollbar.Size = output.Lines; scrollbar.Position = output.TopRow; scrollbar.Refresh(); };
             dialog.AddButton(close);
             dialog.Ready += () => { if (showingSavedPassword) showSavedPassword(); };
+            setBusy(false);
             try { Application.Run(dialog); }
             finally { closed = true; password.Text = ""; }
         }
